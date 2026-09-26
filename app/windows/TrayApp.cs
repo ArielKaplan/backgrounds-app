@@ -16,6 +16,7 @@ namespace Backgrounds
         readonly NotifyIcon tray;
         readonly Dictionary<string, WallpaperHost> hosts = new Dictionary<string, WallpaperHost>();
         readonly Timer tick = new Timer { Interval = 1000 };
+        readonly Timer updateTimer = new Timer { Interval = 3600 * 1000 };
         bool locked, desktopReady;
         public bool OnBattery { get; private set; }
 
@@ -46,12 +47,34 @@ namespace Backgrounds
             Apply();
             tick.Start();
 
+            // Updates: check shortly after start, then hourly (it only goes to the network once a day).
+            Updater.CleanupOldFiles();
+            Updater.Shared.Changed += () => SettingsForm.PushState();
+            tray.BalloonTipClicked += (s, e) => SettingsForm.ShowSingle("update");
+            Later(10000, () => MaybeCheckForUpdate());
+            updateTimer.Tick += (s, e) => MaybeCheckForUpdate();
+            updateTimer.Start();
+
             if (!Store.Shared.Settings.ContainsKey("launchedBefore"))
             {
                 Store.Shared.Settings["launchedBefore"] = true;
                 Store.Shared.Save();
                 SettingsForm.ShowSingle();
             }
+        }
+
+        async void MaybeCheckForUpdate()
+        {
+            var store = Store.Shared;
+            if (!Updater.Configured || !store.AutoUpdateCheck) return;
+            if (DateTime.TryParse(store.Get("lastUpdateCheck") as string, null, System.Globalization.DateTimeStyles.RoundtripKind, out var last)
+                && DateTime.UtcNow - last.ToUniversalTime() < TimeSpan.FromHours(23)) return;
+            if (!await Updater.Shared.Check()) return;
+            string v = Updater.Shared.LatestVersion;
+            if (store.Get("updateAutoInstall") is bool auto && auto) { await Updater.Shared.Install(); return; }
+            if (store.Get("notifiedVersion") as string == v) return;      // asked about this version already
+            store.Set("notifiedVersion", v);
+            tray.ShowBalloonTip(15000, "Backgrounds " + v + " is available", "Click to see what's new and install it.", ToolTipIcon.Info);
         }
 
         public static Icon AppIcon(Size size)
@@ -230,6 +253,14 @@ namespace Backgrounds
             var wallpapers = store.Scan();
             var screens = Screens();
 
+            if (Updater.Shared.Status == "available")
+            {
+                var up = new ToolStripMenuItem("Install update " + Updater.Shared.LatestVersion + "…", null, (s, e) => SettingsForm.ShowSingle("update"));
+                up.Font = new Font(up.Font, FontStyle.Bold);
+                menu.Items.Add(up);
+                menu.Items.Add(new ToolStripSeparator());
+            }
+
             ToolStripMenuItem List(string title, ScreenInfo screen)
             {
                 var item = new ToolStripMenuItem(title);
@@ -257,6 +288,11 @@ namespace Backgrounds
             settings.Font = new Font(settings.Font, FontStyle.Bold);
             menu.Items.Add(settings);
             menu.Items.Add("Open wallpapers folder", null, (s, e) => OpenFolder(store.Folder));
+            menu.Items.Add("Check for updates…", null, async (s, e) =>
+            {
+                SettingsForm.ShowSingle("update");
+                await Updater.Shared.Check();
+            });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Quit Backgrounds", null, (s, e) => Quit());
         }
@@ -282,6 +318,7 @@ namespace Backgrounds
         public void Quit()
         {
             tick.Stop();
+            updateTimer.Stop();
             foreach (var h in hosts.Values) h.Dispose();
             hosts.Clear();
             tray.Visible = false;

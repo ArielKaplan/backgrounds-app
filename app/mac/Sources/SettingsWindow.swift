@@ -8,7 +8,12 @@ final class SettingsWindowController: NSObject, WKScriptMessageHandler, NSWindow
     private var window: NSWindow?
     private var webView: WKWebView?
 
-    func show() {
+    private var focus: String?
+
+    /// `focus`: "update" opens the page on the update section.
+    func show(focus: String? = nil) {
+        self.focus = focus
+        if let f = focus, window != nil { send(["event": "focus", "data": f]) }
         if window == nil { build() }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -93,6 +98,13 @@ final class SettingsWindowController: NSObject, WKScriptMessageHandler, NSWindow
         switch cmd {
         case "getState":
             reply(.success(Self.state()))
+            if let f = focus { focus = nil; send(["event": "focus", "data": f]) }
+        case "checkForUpdates":
+            Updater.shared.check()             // progress arrives as "state" events
+            reply(.success(Updater.shared.stateJSON()))
+        case "installUpdate":
+            Updater.shared.install()
+            reply(.success(Updater.shared.stateJSON()))
         case "setSettings":
             guard let s = args["settings"] as? [String: Any] else { reply(.failure(BridgeError(errorDescription: "bad settings"))); return }
             store.settings = s
@@ -171,6 +183,7 @@ final class SettingsWindowController: NSObject, WKScriptMessageHandler, NSWindow
             "settings": store.settings,
             "launchAtLogin": LoginItem.isEnabled,
             "onBattery": WallpaperManager.shared.onBattery,
+            "update": Updater.shared.stateJSON(),
         ]
     }
 }

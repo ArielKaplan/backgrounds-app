@@ -15,6 +15,12 @@ namespace Backgrounds
         {
             using (var mutex = new Mutex(true, MutexName, out bool first))
             {
+                if (!first && Array.IndexOf(args, "--updated") >= 0)
+                {
+                    // Started by the updater: wait for the old version to quit.
+                    try { first = mutex.WaitOne(TimeSpan.FromSeconds(30)); }
+                    catch (AbandonedMutexException) { first = true; }
+                }
                 if (!first)
                 {
                     // Already running: ask that copy to open its settings window, then leave.

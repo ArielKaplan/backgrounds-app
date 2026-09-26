@@ -107,6 +107,13 @@
   #general > div { width: 100%; max-width: 680px; }
   #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 7px 14px; border-radius: 8px; opacity: 0; transition: .2s; pointer-events: none; font-size: 12px; max-width: 80%; }
   #toast.on { opacity: .92; transform: translateX(-50%); }
+  #banner { display: none; align-items: center; gap: 12px; padding: 9px 16px; background: var(--accent-soft); border-bottom: 1px solid var(--line); }
+  #banner.on { display: flex; }
+  #banner .t { font-weight: 600; }
+  #banner .n { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+  .notes { white-space: pre-wrap; font-size: 12px; color: var(--muted); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 0 0 10px; max-height: 160px; overflow: auto; user-select: text; -webkit-user-select: text; }
+  progress { width: 160px; accent-color: var(--accent); }
+  .err { color: var(--danger); }
   #fatal { display: none; padding: 40px; text-align: center; color: var(--muted); }
 </style>
 </head>
@@ -121,6 +128,11 @@
   <span class="pill" id="status">…</span>
   <button class="btn" id="pause">Pause</button>
 </header>
+<div id="banner" role="status">
+  <span class="t" id="banner-title"></span><span class="n" id="banner-notes"></span>
+  <button class="btn small" id="banner-more">What's new</button>
+  <button class="btn small primary" id="banner-install">Install &amp; Restart</button>
+</div>
 <main>
   <section class="view on" id="wallpapers">
     <nav id="list" aria-label="Wallpapers"></nav>
@@ -142,6 +154,14 @@
         <div class="help">Stops animating while a maximized or full-screen window hides the wallpaper.</div></div>
       <div class="row"><label class="l" for="g-battery">Pause on battery</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-battery"><span></span></label></div>
         <div class="help">Freezes the wallpaper on its last frame while the computer is unplugged.</div></div>
+    </div>
+    <div class="card" id="updates">
+      <h3>Updates</h3>
+      <div class="row"><div>Version</div><div class="ctl"><b id="u-current"></b><span class="muted" id="u-status"></span></div></div>
+      <div id="u-available"></div>
+      <div class="row"><label class="l" for="g-autoupdate">Check automatically</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-autoupdate"><span></span></label></div>
+        <div class="help">Once a day. Nothing is installed without asking you.</div></div>
+      <div class="actions"><button class="btn" id="u-check">Check for Updates</button><span class="muted" id="u-last"></span></div>
     </div>
     <div class="card">
       <h3>Wallpapers folder</h3>
@@ -276,7 +296,7 @@ function normalizeSettings(s) {
   if (!s.screens || typeof s.screens !== 'object') s.screens = {};
   if (!s.params || typeof s.params !== 'object') s.params = {};
   // Native code may round-trip booleans as 1/0.
-  for (const k of ['pauseWhenCovered', 'pauseOnBattery']) s[k] = typeof s[k] === 'number' ? !!s[k] : typeof s[k] === 'boolean' ? s[k] : true;
+  for (const k of ['pauseWhenCovered', 'pauseOnBattery', 'autoUpdateCheck']) s[k] = typeof s[k] === 'number' ? !!s[k] : typeof s[k] === 'boolean' ? s[k] : true;
   s.paused = !!s.paused;
   if (s.wallpaper === undefined) s.wallpaper = null;
   return s;
@@ -308,7 +328,7 @@ function applyState(st, opts = {}) {
   const settingsChanged = !prev || prev.settings !== st.settings;
   S = st; normalizeSettings(S.settings);
   if (!selected || !wpById(selected)) selected = settings().wallpaper && wpById(settings().wallpaper) ? settings().wallpaper : (S.wallpapers[0] && S.wallpapers[0].id);
-  renderHeader(); renderList(); renderGeneral();
+  renderHeader(); renderList(); renderGeneral(); renderUpdate();
   const busy = document.activeElement && $('#detail').contains(document.activeElement) && document.activeElement.tagName !== 'BUTTON';
   if (wallpapersChanged || (settingsChanged && !(opts.quiet && busy))) renderDetail();
 }
@@ -502,13 +522,62 @@ function renderGeneral() {
   $('#folder').title = S.folder || '';
   $('#version').textContent = 'Backgrounds ' + (S.version || '') + ' · ' + (S.platform === 'mac' ? 'macOS' : S.platform === 'windows' ? 'Windows' : S.platform || '');
 }
-function renderAll() { renderHeader(); renderList(); renderGeneral(); renderDetail(); }
+function renderAll() { renderHeader(); renderList(); renderGeneral(); renderUpdate(); renderDetail(); }
+
+// ------------------------------------------------------------------ updates
+function fmtWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso); if (isNaN(d)) return '';
+  const mins = Math.round((Date.now() - d) / 60000);
+  if (mins < 2) return 'Checked just now';
+  if (mins < 60) return 'Checked ' + mins + ' minutes ago';
+  if (mins < 48 * 60) return 'Checked ' + Math.round(mins / 60) + ' hours ago';
+  return 'Checked ' + d.toLocaleDateString();
+}
+function renderUpdate() {
+  const u = S.update || { status: 'disabled', current: S.version };
+  const busy = ['checking', 'downloading', 'installing'].includes(u.status);
+  $('#u-current').textContent = u.current || S.version || '';
+  const st = {
+    disabled: 'Updates aren\u2019t set up in this build.', idle: '', checking: 'Checking\u2026',
+    upToDate: 'You\u2019re up to date.', available: 'Version ' + u.latest + ' is available.',
+    downloading: 'Downloading ' + (u.latest || '') + '\u2026 ' + (u.progress || 0) + '%', installing: 'Installing \u2014 Backgrounds will restart\u2026',
+    error: '',
+  }[u.status] || '';
+  $('#u-status').textContent = st ? ' \u00b7 ' + st : '';
+  const av = $('#u-available'); av.textContent = '';
+  if (u.error) av.append(h('div', { class: 'note err' }, u.error));
+  if (u.status === 'available' || u.status === 'downloading' || u.status === 'installing') {
+    if (u.notes) av.append(h('div', { class: 'notes' }, u.notes));
+    av.append(h('div', { class: 'actions' },
+      u.status === 'downloading' ? h('progress', { max: 100, value: u.progress || 0 }) :
+      h('button', { class: 'btn primary', disabled: busy, onclick: installUpdate }, 'Install ' + u.latest + ' & Restart')));
+  }
+  $('#u-check').disabled = busy || u.status === 'disabled';
+  $('#u-last').textContent = fmtWhen(u.lastCheck);
+  $('#g-autoupdate').checked = settings().autoUpdateCheck;
+  $('#g-autoupdate').disabled = u.status === 'disabled';
+  // banner on every tab
+  const show = u.status === 'available' || u.status === 'downloading' || u.status === 'installing';
+  $('#banner').classList.toggle('on', show);
+  if (show) {
+    $('#banner-title').textContent = u.status === 'available' ? 'Backgrounds ' + u.latest + ' is available' : st;
+    $('#banner-notes').textContent = (u.notes || '').replace(/\s*\n\s*/g, ' \u00b7 ');
+    $('#banner-install').style.display = u.status === 'available' ? '' : 'none';
+    $('#banner-more').style.display = u.status === 'available' ? '' : 'none';
+  }
+}
+function installUpdate() {
+  Bridge.call('installUpdate').then(u => { if (u) { S.update = u; renderUpdate(); } }).catch(fail);
+}
+function showTab(name) {
+  for (const u of document.querySelectorAll('[role=tab]')) u.setAttribute('aria-selected', String(u.dataset.view === name));
+  for (const v of document.querySelectorAll('.view')) v.classList.toggle('on', v.id === name);
+}
+function focusUpdates() { showTab('general'); $('#updates').scrollIntoView({ block: 'start' }); }
 
 // ------------------------------------------------------------------ wiring
-for (const t of document.querySelectorAll('[role=tab]')) t.addEventListener('click', () => {
-  for (const u of document.querySelectorAll('[role=tab]')) u.setAttribute('aria-selected', String(u === t));
-  for (const v of document.querySelectorAll('.view')) v.classList.toggle('on', v.id === t.dataset.view);
-});
+for (const t of document.querySelectorAll('[role=tab]')) t.addEventListener('click', () => showTab(t.dataset.view));
 for (const b of $('#arrangement').children) b.addEventListener('click', () => {
   const s = settings();
   if (b.dataset.v === 'perScreen' && s.arrangement !== 'perScreen') for (const sc of S.screens) if (s.screens[sc.id] === undefined) s.screens[sc.id] = s.wallpaper;
@@ -524,6 +593,11 @@ $('#f-open').onclick = () => Bridge.call('openFolder').catch(fail);
 $('#f-change').onclick = () => Bridge.call('chooseFolder').then(st => { if (st) { applyState(st); toast('Folder changed'); } }).catch(fail);
 $('#f-restore').onclick = () => Bridge.call('restoreBuiltins').then(r => { applyState(r.state, { keepSettings: true }); toast(r.added.length ? 'Added: ' + r.added.join(', ') : 'All built-in wallpapers are already there'); }).catch(fail);
 $('#f-reload').onclick = () => Bridge.call('reload', {}).then(st => { if (st) applyState(st, { keepSettings: true }); toast('Reloaded'); }).catch(fail);
+$('#u-check').onclick = () => Bridge.call('checkForUpdates').then(u => { if (u) { S.update = u; renderUpdate(); } }).catch(fail);
+$('#g-autoupdate').onchange = e => { settings().autoUpdateCheck = e.target.checked; save(); };
+$('#banner-install').onclick = installUpdate;
+$('#banner-more').onclick = focusUpdates;
+Bridge.on('focus', f => { if (f === 'update') focusUpdates(); });
 $('#quit').onclick = () => Bridge.call('quit').catch(fail);
 document.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 'w') Bridge.call('closeSettings').catch(() => {}); });
 Bridge.on('state', st => applyState(st, { quiet: true }));

@@ -143,8 +143,18 @@ namespace Backgrounds
             {
                 creating = false;
                 Log.Write("WebView2 failed: " + e);
+                // e.g. right after an update, while the previous version's browser processes are still exiting:
+                // start over with a fresh environment a few seconds later (a few times).
+                if (controller == null && !disposed && ++failures <= 5)
+                {
+                    env = null; envTask = null;
+                    var t = new Timer { Interval = 3000 * failures };
+                    t.Tick += (o, a) => { t.Stop(); t.Dispose(); if (!disposed && controller == null) _ = Navigate(fullHash); };
+                    t.Start();
+                }
             }
         }
+        int failures;
         string pendingHash;
 
         static string EscapePath(string rel)

@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 
 /// A wallpaper found in the wallpapers folder: a sub-folder with an index.html, or a loose .html file.
 struct Wallpaper {
@@ -32,6 +33,8 @@ final class Store {
     private let configURL: URL
     private(set) var folder: URL
     var settings: [String: Any]
+    /// Native-only state kept next to the settings (update check times, known built-in wallpapers, ...).
+    private(set) var extra: [String: Any] = [:]
 
     static var defaultFolder: URL {
         FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first!
@@ -55,12 +58,15 @@ final class Store {
             folder = Store.defaultFolder
         }
         settings = cfg["settings"] as? [String: Any] ?? [:]
+        extra = cfg.filter { $0.key != "folder" && $0.key != "settings" }
 
         // First run (or the folder was deleted): create it and copy in the built-in wallpapers.
         if !fm.fileExists(atPath: folder.path) {
             try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
             _ = restoreBuiltins()
         }
+        // After an app update: bring in new built-in wallpapers and update the unedited copies.
+        if extra["syncedVersion"] as? String != Updater.currentVersion { syncBuiltins() }
         if settings["wallpaper"] == nil, let first = scan().first(where: { $0.id == "Aquarium" }) ?? scan().first {
             settings["wallpaper"] = first.id
         }
@@ -68,7 +74,9 @@ final class Store {
     }
 
     func save() {
-        let cfg: [String: Any] = ["folder": folder.path, "settings": settings]
+        var cfg = extra
+        cfg["folder"] = folder.path
+        cfg["settings"] = settings
         if let data = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: configURL, options: .atomic)
         }
@@ -79,6 +87,11 @@ final class Store {
         save()
     }
 
+    func setExtra(_ key: String, _ value: Any?) {
+        extra[key] = value
+        save()
+    }
+
     /// Copies built-in wallpapers that are missing from the folder. Never overwrites the user's copies.
     @discardableResult
     func restoreBuiltins() -> [String] {
@@ -86,13 +99,103 @@ final class Store {
         let fm = FileManager.default
         try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
         var added: [String] = []
-        let items = (try? fm.contentsOfDirectory(at: src, includingPropertiesForKeys: nil)) ?? []
-        for item in items.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+        var known = knownBuiltins()
+        for item in Self.bundledFolders() {
             let dest = folder.appendingPathComponent(item.lastPathComponent)
+            known.insert(item.lastPathComponent)
             if fm.fileExists(atPath: dest.path) { continue }
             if (try? fm.copyItem(at: item, to: dest)) != nil { added.append(item.lastPathComponent) }
         }
+        extra["knownBuiltins"] = Array(known).sorted()
+        save()
         return added
+    }
+
+    private static func bundledFolders() -> [URL] {
+        guard let src = bundledWallpapers else { return [] }
+        let items = (try? FileManager.default.contentsOfDirectory(at: src, includingPropertiesForKeys: [.isDirectoryKey],
+                                                                 options: [.skipsHiddenFiles])) ?? []
+        return items.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// Built-in wallpapers this user has been given before (so one they deleted isn't brought back).
+    private func knownBuiltins() -> Set<String> {
+        if let list = extra["knownBuiltins"] as? [String] { return Set(list) }
+        // Upgrading from 1.0.0, which didn't record this: whatever built-ins are in the folder now.
+        return Set(Self.bundledFolders().map { $0.lastPathComponent }
+            .filter { FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) })
+    }
+
+    /// After an update: adds new built-in wallpapers, and replaces copies the user never edited (every file
+    /// matches some version we shipped, per wallpaper-history.json) with the new version. Edited copies and
+    /// built-ins the user deleted are left alone.
+    @discardableResult
+    func syncBuiltins() -> [String] {
+        let fm = FileManager.default
+        var changed: [String] = []
+        let history = Self.loadHistory()
+        var known = knownBuiltins()
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        for src in Self.bundledFolders() {
+            let name = src.lastPathComponent
+            let dest = folder.appendingPathComponent(name)
+            defer { known.insert(name) }
+            if !fm.fileExists(atPath: dest.path) {
+                if !known.contains(name), (try? fm.copyItem(at: src, to: dest)) != nil { changed.append(name + " (new)") }
+                continue
+            }
+            let files = Self.files(in: src)
+            let unedited = files.allSatisfy { rel in
+                let mine = dest.appendingPathComponent(rel)
+                guard fm.fileExists(atPath: mine.path), let h = Self.fingerprint(mine) else { return true }   // new file
+                return h == Self.fingerprint(src.appendingPathComponent(rel)) || (history[name + "/" + rel]?.contains(h) ?? false)
+            }
+            guard unedited else { NSLog("Backgrounds: keeping edited wallpaper \(name)"); continue }
+            var any = false
+            for rel in files {
+                let from = src.appendingPathComponent(rel), to = dest.appendingPathComponent(rel)
+                if let a = Self.fingerprint(to), a == Self.fingerprint(from) { continue }
+                try? fm.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? fm.removeItem(at: to)
+                if (try? fm.copyItem(at: from, to: to)) != nil { any = true }
+            }
+            if any { changed.append(name + " (updated)") }
+        }
+        extra["knownBuiltins"] = Array(known).sorted()
+        extra["syncedVersion"] = Updater.currentVersion
+        save()
+        if !changed.isEmpty { NSLog("Backgrounds: synced built-in wallpapers: \(changed.joined(separator: ", "))") }
+        return changed
+    }
+
+    private static func files(in dir: URL) -> [String] {
+        guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
+        var out: [String] = []
+        let base = dir.standardizedFileURL.path
+        for case let url as URL in e where (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            out.append(String(url.standardizedFileURL.path.dropFirst(base.count + 1)))
+        }
+        return out
+    }
+
+    private static func loadHistory() -> [String: Set<String>] {
+        guard let url = Bundle.main.url(forResource: "wallpaper-history", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: [String]] else { return [:] }
+        return obj.mapValues { Set($0) }
+    }
+
+    /// SHA-256 of the content with CRLF normalised to LF (git may check files out either way).
+    static func fingerprint(_ url: URL) -> String? {
+        guard var data = try? Data(contentsOf: url) else { return nil }
+        if data.contains(13) {
+            var out = Data(capacity: data.count)
+            let bytes = [UInt8](data)
+            for i in 0..<bytes.count where !(bytes[i] == 13 && i + 1 < bytes.count && bytes[i + 1] == 10) { out.append(bytes[i]) }
+            data = out
+        }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     func scan() -> [Wallpaper] {
@@ -129,6 +232,7 @@ final class Store {
     }
     var pauseWhenCovered: Bool { settings["pauseWhenCovered"] as? Bool ?? true }
     var pauseOnBattery: Bool { settings["pauseOnBattery"] as? Bool ?? true }
+    var autoUpdateCheck: Bool { settings["autoUpdateCheck"] as? Bool ?? true }
 
     func hash(for wallpaper: String) -> String {
         let params = settings["params"] as? [String: Any]

@@ -21,6 +21,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             SettingsWindowController.shared.pushState()
         }
         WallpaperManager.shared.apply()
+
+        // Updates: check shortly after start, then hourly (it only goes to the network once a day).
+        Updater.shared.onChange = { [weak self] in
+            self?.rebuildMenu()
+            SettingsWindowController.shared.pushState()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.maybeCheckForUpdate() }
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in self?.maybeCheckForUpdate() }
+
         // First launch: open settings so there's something to see besides the wallpaper.
         if !UserDefaults.standard.bool(forKey: "launchedBefore") {
             UserDefaults.standard.set(true, forKey: "launchedBefore")
@@ -37,6 +46,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ note: Notification) {
         WallpaperManager.shared.tearDownAll()
     }
+
+    // MARK: updates
+
+    private func maybeCheckForUpdate() {
+        let store = Store.shared
+        guard Updater.configured, store.autoUpdateCheck else { return }
+        if let s = store.extra["lastUpdateCheck"] as? String, let last = ISO8601DateFormatter().date(from: s),
+           Date().timeIntervalSince(last) < 23 * 3600 { return }
+        Updater.shared.check { newer in
+            guard newer, let v = Updater.shared.latestVersion else { return }
+            if store.extra["updateAutoInstall"] as? Bool == true { Updater.shared.install(); return }
+            guard store.extra["notifiedVersion"] as? String != v else { return }   // asked about this version already
+            store.setExtra("notifiedVersion", v)
+            self.askToInstall(v)
+        }
+    }
+
+    private func askToInstall(_ version: String) {
+        let alert = NSAlert()
+        alert.messageText = "Backgrounds \(version) is available"
+        let notes = Updater.shared.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        alert.informativeText = (notes.isEmpty ? "" : notes + "\n\n") + "You have \(Updater.currentVersion). Install it now? Backgrounds will restart."
+        alert.addButton(withTitle: "Install & Restart")
+        alert.addButton(withTitle: "Later")
+        if let img = NSImage(named: NSImage.applicationIconName) { alert.icon = img }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            Updater.shared.install()
+            SettingsWindowController.shared.show(focus: "update")    // shows download progress / any error
+        }
+    }
+
+    @objc private func checkForUpdates() {
+        SettingsWindowController.shared.show(focus: "update")
+        Updater.shared.check()
+    }
+
+    @objc private func showUpdate() { SettingsWindowController.shared.show(focus: "update") }
 
     // MARK: menus
 
@@ -70,6 +117,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         let wallpapers = store.scan()
         let screens = WallpaperManager.screens()
+
+        if Updater.shared.status == "available", let v = Updater.shared.latestVersion {
+            let up = NSMenuItem(title: "Install Update \(v)…", action: #selector(showUpdate), keyEquivalent: "")
+            up.target = self
+            up.attributedTitle = NSAttributedString(string: up.title, attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
+            menu.addItem(up)
+            menu.addItem(.separator())
+        }
 
         func list(screen: WallpaperManager.ScreenInfo?) -> NSMenu {
             let sub = NSMenu()
@@ -112,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",").target = self
         menu.addItem(withTitle: "Open Wallpapers Folder", action: #selector(openFolder), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Backgrounds", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu

@@ -1,10 +1,13 @@
 name: Build apps
 
-# Builds Backgrounds for macOS and Windows, runs the tests, and smoke-tests both apps on real desktops.
-# Download the apps from the run's "Artifacts" section (Backgrounds-mac / Backgrounds-windows).
+# Builds Backgrounds for macOS and Windows, runs the tests, and smoke-tests both apps on real desktops,
+# including a full in-app update. Download the apps from the run's "Artifacts" section.
+# Pushing a tag like v1.2.0 (matching app/VERSION) also publishes a signed GitHub release that installed
+# apps update to (see "Releasing" in app/README.md).
 on:
   push:
     branches: ['**']
+    tags: ['v*']
     paths: ['app/**', 'Wallpaper - */**', '.github/workflows/build.yml']
   workflow_dispatch:
 
@@ -28,6 +31,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # wallpaper history for updates
       - name: Build
         run: app/mac/build.sh
       - uses: actions/upload-artifact@v4
@@ -42,6 +46,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - name: Build
         shell: pwsh
         run: app/windows/build.ps1
@@ -71,3 +76,62 @@ jobs:
           name: smoke-${{ matrix.os }}
           path: smoke
           retention-days: 14
+
+  mac-update:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: End-to-end update test
+        run: bash app/tests/update-mac.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: update-mac, path: smoke, retention-days: 14 }
+
+  windows-update:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: End-to-end update test
+        shell: pwsh
+        run: app/tests/update-windows.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: update-windows, path: smoke, retention-days: 14 }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [tests, mac, windows-build, windows-smoke, mac-update, windows-update]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match app/VERSION
+        run: |
+          V="$(tr -d '[:space:]' < app/VERSION)"
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then echo "::error::tag $GITHUB_REF_NAME does not match app/VERSION ($V)"; exit 1; fi
+          if [ ! -s app/update-public-key.txt ]; then echo "::error::app/update-public-key.txt is empty: set up update signing first (app/release/make-signing-key.sh)"; exit 1; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with: { name: Backgrounds-mac, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: Backgrounds-windows, path: dist }
+      - name: Sign and write update.json
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          pip install -q cryptography
+          python3 app/release/make_feed.py --version "$VERSION" \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" \
+            --mac dist/Backgrounds-mac.zip --windows dist/Backgrounds-windows.zip \
+            --notes-from app/CHANGELOG.md --expect-public-key "$(tr -d '[:space:]' < app/update-public-key.txt)" \
+            --out dist/update.json
+          python3 -c "import json; print(json.load(open('dist/update.json'))['notes'])" > dist/notes.md
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/Backgrounds-mac.zip dist/Backgrounds-windows.zip dist/update.json \
+            --title "Backgrounds $VERSION" --notes-file dist/notes.md --verify-tag

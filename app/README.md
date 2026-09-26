@@ -51,6 +51,45 @@ It needs the Microsoft Edge WebView2 Runtime, which Windows 11 and up-to-date Wi
   - *Wallpapers folder* (default **Pictures/Backgrounds**): open it, change it, restore the built-in
     wallpapers, reload.
 
+## Updates
+
+The apps check for a new version once a day (turn that off in **Settings › General › Updates**) and ask before
+installing; **Check for Updates** in the menu or in Settings checks right away. Installing downloads the new
+version, verifies it, replaces the app in place and restarts it. Nothing else to do.
+
+- Every release is signed. The apps only accept an update whose signature matches the public key built into
+  them (`app/update-public-key.txt`), and a download that is damaged or tampered with is refused.
+- Built-in wallpapers in Pictures/Backgrounds that the user never edited are updated along with the app; edited
+  ones are left exactly as they are; new built-ins are added; built-ins the user deleted stay deleted.
+- Mac: the app has to be in a folder it can write to (Applications is fine). If it was opened straight from
+  Downloads, macOS runs it from a read-only copy and the app will say to move it to Applications first.
+- Windows: same for the Backgrounds folder: anywhere under your user folder is fine (not Program Files).
+
+## Releasing a new version
+
+One-time setup:
+
+1. **Make the repository public** (GitHub › the repo › Settings › General › Danger Zone › Change visibility).
+   The apps download releases anonymously, which only works from a public repo.
+2. **Create the signing key** on your Mac: `bash app/release/make-signing-key.sh`
+   - Add the private key file's whole content as a repository secret named **UPDATE_SIGNING_KEY**
+     (Settings › Secrets and variables › Actions › New repository secret).
+   - Put the public key it prints into `app/update-public-key.txt` and commit it.
+   - Keep a backup of the private key (e.g. in your password manager), then delete the file. If the key is
+     lost, installed apps can't accept updates signed with a new one; users would download once by hand.
+   - Builds made before the public key was committed have updates switched off (Settings says so).
+
+Each release:
+
+1. Bump `app/VERSION` (e.g. `1.2.0`) and add a `## 1.2.0` section at the top of `app/CHANGELOG.md`
+   (shown to users in the update prompt).
+2. Commit, then tag and push: `git tag v1.2.0 && git push origin v1.2.0`
+3. The **Build apps** workflow builds and tests both apps, signs them, and publishes the GitHub release with
+   `Backgrounds-mac.zip`, `Backgrounds-windows.zip` and `update.json`. Installed apps pick it up within a day.
+
+The release step refuses to publish if the tag doesn't match `app/VERSION`, the signing secret is missing, or the
+secret doesn't match `app/update-public-key.txt`.
+
 ## Adding and editing wallpapers
 
 On first launch the built-in wallpapers are copied to **Pictures/Backgrounds** — one folder per wallpaper,
@@ -90,6 +129,8 @@ back to the `#key=value   description` lines of the page's header comment.
 - **Windows:** `app/windows/build.ps1` (needs the .NET SDK). Output: `app/windows/build/Backgrounds/` and
   `Backgrounds-windows.zip`. The project also compiles with `dotnet build` on macOS/Linux.
 - **Tests:** `node app/tests/settings.test.mjs` and `node app/tests/wallpapers.test.mjs` (need Playwright).
+  CI also runs the apps on real macOS/Windows desktops (`app/tests/smoke-*`) and a full update from 0.9.0 to
+  99.0.0 with a throwaway key (`app/tests/update-*`), including a refused badly signed update.
 - The version is in `app/VERSION`; the icon is drawn by `app/icons/make_icons.py`.
 
 ## How it works

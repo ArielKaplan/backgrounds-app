@@ -21,11 +21,21 @@
     <Description>Animated HTML wallpapers</Description>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <DebugType>embedded</DebugType>
+    <!-- Updates: the public key that must have signed a release (app/update-public-key.txt; override with
+         -p:UpdatePublicKey=...) and where to look for new versions. -->
+    <UpdatePublicKey Condition="'$(UpdatePublicKey)' == ''">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\update-public-key.txt').Trim())</UpdatePublicKey>
+    <UpdateFeed Condition="'$(UpdateFeed)' == ''">https://github.com/ArielKaplan/backgrounds-app/releases/latest/download/update.json</UpdateFeed>
   </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="UpdatePublicKey" Value="$(UpdatePublicKey)" />
+    <AssemblyMetadata Include="UpdateFeed" Value="$(UpdateFeed)" />
+  </ItemGroup>
   <ItemGroup>
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
     <Reference Include="Microsoft.CSharp" />
   </ItemGroup>
   <ItemGroup>

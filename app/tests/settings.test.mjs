@@ -42,6 +42,7 @@ for (const scheme of ['light', 'dark']) {
     const state = {
       platform: 'mac', version: '1.0.0', folder: '/Users/test/Pictures/Backgrounds', onBattery: false, launchAtLogin: false,
       screens: [{ id: 'A', name: 'Built-in Display', primary: true, width: 1512, height: 982 }, { id: 'B', name: 'LG UltraFine', primary: false, width: 2560, height: 1440 }],
+      update: { current: '1.1.0', status: 'upToDate', latest: '1.1.0', notes: '', progress: 0, lastCheck: new Date(Date.now() - 3 * 3600e3).toISOString() },
       wallpapers, settings: { arrangement: 'same', wallpaper: 'Aquarium', screens: {}, params: {}, paused: false, pauseWhenCovered: true, pauseOnBattery: true },
     };
     window.__calls = [];
@@ -52,6 +53,12 @@ for (const scheme of ['light', 'dark']) {
         case 'setSettings': state.settings = JSON.parse(JSON.stringify(msg.args.settings)); return JSON.parse(JSON.stringify(state));
         case 'setLaunchAtLogin': state.launchAtLogin = msg.args.enabled; return { enabled: state.launchAtLogin };
         case 'restoreBuiltins': return { added: [], state: JSON.parse(JSON.stringify(state)) };
+        case 'checkForUpdates':
+          state.update = { ...state.update, status: 'available', latest: '1.2.0', notes: '- Faster wallpapers\n- Bug fixes', lastCheck: new Date().toISOString() };
+          return JSON.parse(JSON.stringify(state.update));
+        case 'installUpdate':
+          state.update = { ...state.update, status: 'downloading', progress: 40 };
+          return JSON.parse(JSON.stringify(state.update));
         default: return null;
       }
     };
@@ -172,6 +179,39 @@ for (const scheme of ['light', 'dark']) {
   await page.click('.item:has-text("Train")');
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/settings-${scheme}-perscreen.png` });
   ok(await page.locator('#detail .actions button:has-text("Built-in Display")').count() === 1, 'per-screen use buttons shown');
+
+  // Updates
+  await page.click('#tab-general');
+  ok((await page.textContent('#u-current')) === '1.1.0', 'shows current version');
+  ok((await page.textContent('#u-status')).includes('up to date'), 'shows up to date');
+  ok((await page.textContent('#u-last')).includes('3 hours ago'), 'shows last check time');
+  ok(!(await page.isVisible('#banner')), 'no banner when up to date');
+  await page.click('#u-check');
+  await wait(100);
+  ok(await page.evaluate(() => window.__calls.some(c => c.cmd === 'checkForUpdates')), 'Check for Updates calls native');
+  ok(await page.isVisible('#banner') && (await page.textContent('#banner-title')).includes('1.2.0'), 'banner shows the new version');
+  ok((await page.textContent('#u-available')).includes('Faster wallpapers'), 'release notes shown');
+  await page.click('#tab-wallpapers');
+  ok(await page.isVisible('#banner'), 'banner visible on the Wallpapers tab too');
+  await page.click('#banner-more');
+  ok(await page.isVisible('#updates'), "What's new jumps to the Updates section");
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/settings-${scheme}-update.png` });
+  await page.uncheck('#g-autoupdate', { force: true });
+  await wait(100);
+  s = await lastSet();
+  ok(s.autoUpdateCheck === false, 'automatic update checks can be turned off');
+  await page.click('#banner-install');
+  await wait(100);
+  ok(await page.evaluate(() => window.__calls.some(c => c.cmd === 'installUpdate')), 'Install & Restart calls native');
+  ok((await page.textContent('#u-status')).includes('Downloading') && await page.locator('#u-available progress').count() === 1, 'download progress shown');
+  // native pushes: error, then disabled build
+  await page.evaluate(() => window.__bridgeReceive({ event: 'state', data: { ...window.__state, update: { current: '1.1.0', status: 'available', latest: '1.2.0', notes: '', error: 'The update failed: no connection' } } }));
+  ok((await page.textContent('#u-available')).includes('no connection'), 'update errors shown');
+  await page.evaluate(() => window.__bridgeReceive({ event: 'state', data: { ...window.__state, update: { current: '1.1.0', status: 'disabled' } } }));
+  ok((await page.textContent('#u-status')).includes('set up') && await page.locator('#u-check').isDisabled(), 'disabled build explains itself');
+  await page.click('#tab-wallpapers');
+  await page.evaluate(() => window.__bridgeReceive({ event: 'focus', data: 'update' }));
+  ok(await page.isVisible('#updates'), 'focus event from the menu opens the Updates section');
 
   ok(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
   await ctx.close();

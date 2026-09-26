@@ -26,6 +26,10 @@
 	<string>public.app-category.utilities</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>BackgroundsUpdatePublicKey</key>
+	<string>UPDATE_PUBLIC_KEY</string>
+	<key>BackgroundsUpdateFeed</key>
+	<string>UPDATE_FEED</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Animated HTML wallpapers.</string>
 </dict>

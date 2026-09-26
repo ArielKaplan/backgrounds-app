@@ -15,10 +15,14 @@ namespace Backgrounds
         const string Host = "settings.backgrounds.example";
         static SettingsForm single;
         readonly WebView2 web;
+        string focus;
 
-        public static void ShowSingle()
+        /// `focus`: "update" opens the page on the update section.
+        public static void ShowSingle(string focus = null)
         {
             if (single == null || single.IsDisposed) single = new SettingsForm();
+            single.focus = focus;
+            if (focus != null && single.web.CoreWebView2 != null) single.Send(new Dictionary<string, object> { ["event"] = "focus", ["data"] = focus });
             if (single.WindowState == FormWindowState.Minimized) single.WindowState = FormWindowState.Normal;
             single.Show();
             single.Activate();
@@ -105,7 +109,14 @@ namespace Backgrounds
             switch (cmd)
             {
                 case "getState":
+                    if (focus != null) { var f = focus; focus = null; BeginInvoke(new Action(() => Send(new Dictionary<string, object> { ["event"] = "focus", ["data"] = f }))); }
                     return State();
+                case "checkForUpdates":
+                    _ = Updater.Shared.Check();          // progress arrives as "state" events
+                    return Updater.Shared.StateJson();
+                case "installUpdate":
+                    _ = Updater.Shared.Install();
+                    return Updater.Shared.StateJson();
                 case "setSettings":
                     if (!(args.TryGetValue("settings", out var s) && s is Dictionary<string, object> sd)) throw new Exception("bad settings");
                     store.Settings = sd;
@@ -178,6 +189,7 @@ namespace Backgrounds
                 ["settings"] = store.Settings,
                 ["launchAtLogin"] = LoginItem.IsEnabled,
                 ["onBattery"] = TrayApp.Current?.OnBattery ?? false,
+                ["update"] = Updater.Shared.StateJson(),
             };
         }
     }
