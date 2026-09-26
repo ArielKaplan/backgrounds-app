@@ -1,0 +1,1428 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel Aquarium Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a3a5a; }
+  canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL AQUARIUM — a living, cozy retro fish tank
+   Options (add to the end of the address):
+     #pixels=240        vertical resolution in big pixels (smaller = chunkier)
+     #event=feeding     test mode: repeat one event (or "all" to cycle through every event)
+     #speed=3           run time faster (for testing)
+     #debug             show the current event name
+   Events: feeding eel puffer octopus jellies cleaning seahorses crab chest
+   Rare:   shark night turtle submarine whale
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const ROWS = parseInt(params.get('pixels')) || 240;
+const FORCE = params.get('event');
+const TIME_SCALE = parseFloat(params.get('speed')) || 1;
+const DEBUG = params.has('debug');
+const FPS = 30;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, SURF, SAND;   // SURF = water surface y, SAND = top of the sand bed
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const coin = () => (Math.random() < 0.5 ? 1 : -1);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+function mk(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+function mixHex(a, b, t) { const A = hexRgb(a), B = hexRgb(b); return `rgb(${A.map((v, i) => Math.round(v + (B[i] - v) * t))})`; }
+function px(x, y, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+const PERM = Array.from({ length: 512 }, () => Math.random());
+const h2 = (x, y) => PERM[((x * 73856093) ^ (y * 19349663)) & 511];
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = h2(xi, yi), b = h2(xi + 1, yi), c = h2(xi, yi + 1), d = h2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
+// ---------------------------------------------------------------- world
+const world = { t: 0, ents: [], parts: [], fx: [], dark: 0, flash: 0, alarm: 0, current: 0, food: [] };
+function addPart(x, y, vx, vy, life, col, o = {}) {
+  if (world.parts.length > 1200) world.parts.splice(0, 150);
+  world.parts.push({ x, y, vx, vy, life, max: life, col, drag: o.drag ?? 1, grav: o.grav ?? 0, size: o.size || 1, fade: o.fade ?? true, glow: o.glow ?? false, wob: o.wob ?? 0, ph: rand(0, 6.28), floor: o.floor ?? null });
+}
+function addFx(f) { f.t = f.t ?? 0; f.layer = f.layer || 'front'; world.fx.push(f); return f; }
+function later(fn, secs) { addFx({ dur: secs, layer: 'none', done: fn }); }
+// Rising bubble particle: wobbles, pops at the surface
+function bubble(x, y, big = false) {
+  world.parts.push({ x, y, vx: 0, vy: -rand(14, 24) * (big ? 1.3 : 1), life: 30, max: 30, bubble: true, big: big && chance(0.6), ph: rand(0, 6.28), col: null, drag: 1, grav: 0, fade: false });
+}
+
+// ---------------------------------------------------------------- scenery
+const scene = { bg: null, sand: null, weeds: [], decor: {}, rays: [], holes: [] };
+
+function buildBackground() {
+  const s = mk(W, H), c = s.getContext('2d'), img = c.createImageData(W, H), d = img.data;
+  const cols = ['#5ad0e8', '#3ab4dc', '#2896c8', '#1e7ab0', '#18639a', '#124e84', '#0e3e6e'].map(hexRgb);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const t = clamp((y - SURF) / (SAND - SURF), 0, 1);
+    const col = cols[clamp(Math.floor(t * (cols.length - 1) + bayer(x, y) * 0.9), 0, cols.length - 1)];
+    const o = (y * W + x) * 4;
+    d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 255;
+  }
+  // above-water strip
+  for (let y = 0; y < SURF; y++) for (let x = 0; x < W; x++) { const o = (y * W + x) * 4; d[o] = 196; d[o + 1] = 236; d[o + 2] = 248; }
+  // far rock silhouettes
+  const rock = ['#0f4a78', '#0d4270'].map(hexRgb), s1 = rand(0, 50), s2 = rand(0, 50);
+  for (let x = 0; x < W; x++) {
+    const top1 = Math.round(SAND - 34 - Math.max(0, Math.sin(x * 0.02 + s1)) * 34 - noise(x * 0.08, s1) * 14);
+    const top2 = Math.round(SAND - 16 - Math.max(0, Math.sin(x * 0.035 + s2)) * 22 - noise(x * 0.12, s2) * 8);
+    for (let y = top1; y < SAND + 4; y++) { const o = (y * W + x) * 4, k = bayer(x, y) < 0.35 ? 0 : 1, cc = [0x16, 0x5a, 0x8a]; const col = y < top1 + 2 ? cc : rock[k]; d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; }
+    for (let y = top2; y < SAND + 4; y++) { const o = (y * W + x) * 4, col = y < top2 + 1 ? [0x1e, 0x6a, 0x98] : [0x14, 0x56, 0x86]; d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; }
+  }
+  c.putImageData(img, 0, 0);
+  scene.bg = s;
+  scene.rays = Array.from({ length: Math.round(W / 60) + 2 }, () => ({ x: rand(-40, W), w: rand(6, 18), sp: rand(0.2, 0.5), ph: rand(0, 6.28) }));
+}
+
+function buildSand() {
+  const s = mk(W, H), c = s.getContext('2d');
+  const cols = ['#f0dca0', '#e6cc8a', '#d8b878', '#c8a468', '#b89058'];
+  for (let x = 0; x < W; x++) {
+    const top = Math.round(SAND + Math.sin(x * 0.05) * 1.5 + noise(x * 0.1, 3) * 2);
+    for (let y = top; y < H; y++) {
+      const t = (y - top) / (H - top);
+      let ci = clamp(Math.floor(t * 4 + bayer(x, y) * 0.8), 0, 4);
+      if (((y - top) + Math.round(Math.sin(x * 0.15) * 1.5)) % 7 === 0 && y > top + 3) ci = Math.min(4, ci + 1);
+      c.fillStyle = y === top ? '#fff0c0' : cols[ci];
+      c.fillRect(x, y, 1, 1);
+    }
+  }
+  // pebbles and shells
+  for (let i = 0; i < W / 6; i++) {
+    const x = randi(0, W), y = randi(SAND + 4, H - 2);
+    c.fillStyle = pick(['#9a8a7a', '#7a6a6a', '#b0a090', '#c87a7a', '#8aa0b0']);
+    c.fillRect(x, y, chance(0.3) ? 2 : 1, 1);
+  }
+  for (let i = 0; i < 4; i++) {
+    const x = randi(10, W - 10), y = randi(SAND + 6, H - 4);
+    c.fillStyle = '#ffd8e0'; c.fillRect(x - 1, y, 3, 1); c.fillRect(x, y - 1, 1, 1);
+    c.fillStyle = '#e8a0b0'; c.fillRect(x - 1, y + 1, 3, 1);
+  }
+  // starfish
+  for (let i = 0; i < 2; i++) {
+    const x = randi(10, W - 10), y = randi(SAND + 8, H - 5), col = pick(['#ff7a5a', '#ffb040', '#e85a9a']);
+    c.fillStyle = col;
+    c.fillRect(x - 1, y - 1, 3, 3); c.fillRect(x, y - 3, 1, 2); c.fillRect(x - 3, y, 2, 1); c.fillRect(x + 2, y, 2, 1); c.fillRect(x - 2, y + 2, 1, 1); c.fillRect(x + 2, y + 2, 1, 1);
+    c.fillStyle = '#ffffff'; c.fillRect(x, y, 1, 1);
+  }
+  scene.sand = s;
+}
+
+// seaweed & coral: depth-sorted, swaying
+function buildPlants() {
+  scene.weeds = [];
+  const n = Math.round(W / 14);
+  for (let i = 0; i < n; i++) {
+    const x = rand(0, W), front = chance(0.35), type = weighted({ kelp: 3, grass: 3, coral: 1.5, fan: 1, tube: 1 });
+    const baseY = front ? rand(H - 10, H + 2) : rand(SAND + 1, SAND + 8);
+    const h = type === 'kelp' ? rand(40, 90) * (front ? 1.2 : 1) : type === 'grass' ? rand(10, 26) : rand(8, 18);
+    scene.weeds.push({ x, y: baseY, h, type, front, ph: rand(0, 6.28),
+      col: type === 'coral' ? pick(['#ff7a8a', '#ff9a5a', '#e86ab0']) : type === 'fan' ? pick(['#b86ae0', '#ff6a8a']) : type === 'tube' ? pick(['#ffd040', '#7ae0c0', '#ff8a4a']) : null, blades: randi(2, 4) });
+  }
+  scene.weeds.sort((a, b) => a.y - b.y);
+}
+function drawPlant(p) {
+  const X = Math.round(p.x), Y = Math.round(p.y), t = world.t, sway = k => Math.sin(t * 0.9 + p.ph + k * 0.08) * k * 0.06 * (1 + world.current * 2) + world.current * k * 0.12;
+  if (p.type === 'kelp') {
+    for (let b = 0; b < p.blades; b++) {
+      const bx = X + (b - p.blades / 2) * 3, L = p.h * (0.7 + b * 0.12);
+      for (let k = 0; k < L; k++) {
+        const xx = bx + sway(k) + Math.sin(k * 0.3 + b) * 0.6, yy = Y - k;
+        px(xx, yy, k % 9 < 2 ? '#6ac84a' : b % 2 ? '#3a9a3a' : '#4aac40');
+        if (k % 9 === 4) { px(xx + 1, yy, '#5aba48'); px(xx + 2, yy - 1, '#5aba48'); }
+      }
+    }
+  } else if (p.type === 'grass') {
+    for (let b = 0; b < p.blades + 2; b++) {
+      const bx = X + b * 2 - p.blades, L = p.h * (0.6 + ((b * 7) % 5) * 0.1);
+      for (let k = 0; k < L; k++) px(bx + sway(k) * 1.4, Y - k, k > L - 3 ? '#8ae86a' : '#48b848');
+    }
+  } else if (p.type === 'coral') {
+    const branch = (x, y, len, dir) => { for (let k = 0; k < len; k++) { px(x + dir * k * 0.5, y - k, p.col); } px(x + dir * len * 0.5, y - len, '#ffffff'); };
+    branch(X, Y, p.h, 0); branch(X - 1, Y - p.h * 0.3, p.h * 0.6, -1); branch(X + 1, Y - p.h * 0.45, p.h * 0.5, 1); branch(X - 2, Y - p.h * 0.6, p.h * 0.3, -1.5);
+  } else if (p.type === 'fan') {
+    for (let k = 0; k < p.h; k++) { const w = Math.round(Math.sin((k / p.h) * Math.PI) * p.h * 0.5); for (let i = -w; i <= w; i++) if ((i + k) % 3 === 0 || Math.abs(i) === w) px(X + i + sway(k) * 0.5, Y - k, p.col); }
+    rect(X, Y - 2, 1, 3, '#7a4a6a');
+  } else if (p.type === 'tube') {
+    for (let b = 0; b < 3; b++) { const bx = X + (b - 1) * 3, L = p.h * (0.6 + b * 0.2); rect(bx, Y - L, 2, L, p.col); rect(bx, Y - L, 2, 1, '#ffffff'); px(bx, Y - L + 1, '#3a2a3a'); }
+  }
+}
+
+// ---------------------------------------------------------------- tank decorations
+function buildDecor() {
+  const items = ['castle', 'chest', 'diver', 'anemone', 'rock', 'pot', 'bubbler'];
+  for (let i = items.length - 1; i > 0; i--) { const j = randi(0, i); [items[i], items[j]] = [items[j], items[i]]; }
+  const D = scene.decor = {};
+  items.forEach((k, i) => { D[k] = { x: Math.round(W * (i + 0.5) / items.length + rand(-8, 8)), y: SAND + randi(4, 10) }; });
+  D.chest.open = 0; D.diver.t = rand(0, 3); D.bubbler.t = 0;
+  D.rock.hole = { x: D.rock.x + 6, y: D.rock.y - 10 };
+  D.pot.mouth = { x: D.pot.x + 8, y: D.pot.y - 5 };
+  // keep plants from covering the decor
+  scene.weeds = scene.weeds.filter(p => p.front || !Object.values(D).some(d => Math.abs(d.x - p.x) < 16));
+}
+function drawDecor() {
+  const D = scene.decor, t = world.t;
+  // castle
+  { const { x, y } = D.castle, X = x - 16, stone = '#9aa0b8', dark = '#6a7088', lite = '#c8ccdc';
+    rect(X, y - 22, 32, 22, stone); rect(X + 24, y - 22, 8, 22, dark); rect(X, y - 22, 2, 22, lite);
+    for (const tx of [X - 3, X + 23]) { rect(tx, y - 34, 12, 34, stone); rect(tx + 9, y - 34, 3, 34, dark); rect(tx, y - 34, 1, 34, lite); for (let i = 0; i < 3; i++) rect(tx + i * 4, y - 37, 3, 3, stone); }
+    rect(X + 11, y - 12, 10, 12, '#1a2a4a'); rect(X + 12, y - 14, 8, 2, '#1a2a4a');
+    rect(X + 2, y - 30, 2, 3, '#1a2a4a'); rect(X + 26, y - 30, 2, 3, '#1a2a4a');
+    rect(X + 3, y - 46, 1, 9, '#5a4a3a'); const wave = Math.floor(t * 3) % 2; rect(X + 4, y - 46, 5, 2 + wave, '#ff5a6a');
+    for (let i = 0; i < 12; i++) px(X + (i * 7) % 30 + 1, y - 2 - (i * 5) % 18, '#5aa848'); }
+  // treasure chest
+  { const { x, y } = D.chest, o = D.chest.open, X = x - 8;
+    if (o > 0.05) { ctx.globalAlpha = 0.5 * o; rect(X + 2, y - 12, 12, 4, '#fff0a0'); ctx.globalAlpha = 1; }
+    rect(X, y - 8, 16, 8, '#a8683a'); rect(X, y - 1, 16, 1, '#6a3e22'); rect(X, y - 5, 16, 1, '#ffd040'); rect(X + 7, y - 6, 3, 3, '#ffd040'); px(X + 8, y - 5, '#2a1a10');
+    const lid = Math.round(o * 5);
+    rect(X, y - 12 - lid, 16, 4, '#b8784a'); rect(X, y - 12 - lid, 16, 1, '#d89a6a'); rect(X, y - 9 - lid, 16, 1, '#ffd040');
+    if (o > 0.3) { for (let i = 0; i < 5; i++) px(X + 3 + i * 2, y - 9, i % 2 ? '#ffe060' : '#fff4b0'); px(X + 5, y - 10, '#ff5a8a'); } }
+  // diver helmet
+  { const { x, y } = D.diver, X = x;
+    rect(X - 7, y - 4, 14, 4, '#8a6a3a');
+    for (let dy = -14; dy <= 0; dy++) for (let dx = -7; dx <= 7; dx++) { if (dx * dx / 49 + (dy + 8) * (dy + 8) / 42 > 1) continue; px(X + dx, y - 4 + dy, dx + dy < -8 ? '#ffe0a0' : dx > 3 ? '#b8802a' : '#d8a040'); }
+    for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) if (dx * dx + dy * dy <= 9) px(X + 1 + dx, y - 12 + dy, dx * dx + dy * dy >= 7 ? '#8a6020' : '#2a4a6a');
+    px(X, y - 13, '#8ad8f0'); rect(X + 7, y - 10, 5, 2, '#3a3a3a');
+    const glint = Math.sin(t * 2) > 0.7; if (glint) px(X - 1, y - 14, '#ffffff'); }
+  // anemone
+  { const { x, y } = D.anemone;
+    rect(x - 6, y - 3, 13, 3, '#c83a7a');
+    for (let k = 0; k < 11; k++) { const bx = x - 6 + k * 1.2, L = 6 + (k % 3) * 2; for (let i = 0; i < L; i++) px(bx + Math.sin(t * 1.8 + k + i * 0.4) * i * 0.25, y - 3 - i, i === L - 1 ? '#ffd0f0' : '#ff7ac0'); } }
+  // rock arch with eel hole
+  { const { x, y } = D.rock, X = x - 14;
+    for (let dy = -22; dy <= 0; dy++) for (let dx = -16; dx <= 16; dx++) {
+      const q = (dx * dx) / 256 + ((dy + 1) * (dy + 1)) / 500; if (q > 1) continue;
+      const hx = dx - 6, hy = dy + 10; if (hx * hx + hy * hy * 1.6 < 12) { px(x + dx, y + dy, '#0a1624'); continue; }
+      const l = (dx + dy) / 20 + bayer(dx + 32, dy + 32) * 0.4;
+      px(x + dx, y + dy, l < -1.1 ? '#8a8aa0' : l < -0.4 ? '#6a6a80' : '#4e4e64');
+    }
+    for (let i = 0; i < 6; i++) px(X + 6 + i * 4, y - 8 - (i % 3) * 5, '#c85a8a'); }
+  // clay pot on its side
+  { const { x, y } = D.pot;
+    for (let dy = -8; dy <= 0; dy++) for (let dx = -10; dx <= 8; dx++) { if ((dx * dx) / 90 + ((dy + 4) * (dy + 4)) / 20 > 1) continue; px(x + dx, y + dy, dy < -5 ? '#e89a6a' : dx > 4 ? '#a85a36' : '#c8784a'); }
+    for (let dy = -7; dy <= -1; dy++) { px(x + 8, y + dy, '#e89a6a'); px(x + 9, y + dy, '#e89a6a'); }
+    rect(x + 8, y - 6, 2, 5, '#2a1410'); rect(x - 6, y - 5, 10, 1, '#8a4a2a'); }
+  // bubbler stone
+  { const { x, y } = D.bubbler;
+    rect(x - 4, y - 3, 8, 3, '#6a6a7a'); rect(x - 3, y - 4, 6, 1, '#8a8a9a'); px(x - 2, y - 3, '#9a9aaa'); }
+}
+function decorTick(dt) {
+  const D = scene.decor;
+  if ((D.bubbler.t -= dt) <= 0) { D.bubbler.t = rand(0.08, 0.18); bubble(D.bubbler.x + rand(-1, 1), D.bubbler.y - 4, chance(0.3)); }
+  if ((D.diver.t -= dt) <= 0) { D.diver.t = rand(3, 7); for (let i = 0; i < randi(3, 6); i++) later(() => bubble(D.diver.x + 1, D.diver.y - 22, true), i * 0.15); }
+  if (D.chest.target !== undefined) D.chest.open = lerp(D.chest.open, D.chest.target, dt * 4);
+}
+
+// ---------------------------------------------------------------- sprite builder
+const INK = '#132338', EYE = '#101820', BLUSH = '#ffa6bc';
+class SB {
+  constructor(w, h) { this.w = w; this.h = h; this.g = new Array(w * h).fill(null); }
+  set(x, y, c) { x = Math.round(x); y = Math.round(y); if (x >= 0 && y >= 0 && x < this.w && y < this.h) this.g[y * this.w + x] = c; return this; }
+  get(x, y) { return x >= 0 && y >= 0 && x < this.w && y < this.h ? this.g[y * this.w + x] : null; }
+  ell(cx, cy, rx, ry, c, shade, hi) {
+    for (let y = Math.floor(cy - ry - 1); y <= Math.ceil(cy + ry + 1); y++)
+      for (let x = Math.floor(cx - rx - 1); x <= Math.ceil(cx + rx + 1); x++) {
+        const dx = (x - cx) / (rx + 0.35), dy = (y - cy) / (ry + 0.35);
+        if (dx * dx + dy * dy > 1) continue;
+        let col = c;
+        if (shade && dy > 0.35) col = shade;
+        if (hi && dx * 0.5 + dy * 0.9 < -0.6) col = hi;
+        this.set(x, y, col);
+      }
+    return this;
+  }
+  rect(x, y, w, h, c) { for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.set(x + i, y + j, c); return this; }
+  tri(x, y, w, h, c, dir = -1) { for (let i = 0; i < w; i++) { const hh = Math.round((h * (i + 1)) / w); for (let j = 0; j < hh; j++) this.set(x + dir * i, y - Math.floor(hh / 2) + j, c); } return this; }
+  outline(c = INK) {
+    const add = [];
+    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
+      if (this.get(x, y)) continue;
+      if (this.get(x - 1, y) || this.get(x + 1, y) || this.get(x, y - 1) || this.get(x, y + 1)) add.push([x, y]);
+    }
+    for (const [x, y] of add) this.set(x, y, c);
+    return this;
+  }
+}
+function bake(b, ax, ay) {
+  const r = mk(b.w, b.h), l = mk(b.w, b.h), rc = r.getContext('2d'), lc = l.getContext('2d');
+  for (let y = 0; y < b.h; y++) for (let x = 0; x < b.w; x++) {
+    const c = b.g[y * b.w + x]; if (!c) continue;
+    rc.fillStyle = c; rc.fillRect(x, y, 1, 1); lc.fillStyle = c; lc.fillRect(b.w - 1 - x, y, 1, 1);
+  }
+  return { r, l, w: b.w, h: b.h, ax, ay };
+}
+function makeSet(fn, frames, ax, ay) { const o = {}; for (const [n, opt] of Object.entries(frames)) o[n] = bake(fn(opt).outline(), ax, ay); return o; }
+// anchor = sprite center
+function drawSpr(s, x, y, facing = 1, alpha = 1) {
+  const X = Math.round(x - (facing > 0 ? s.ax : s.w - 1 - s.ax)), Y = Math.round(y - s.ay);
+  if (alpha < 1) ctx.globalAlpha = alpha;
+  ctx.drawImage(facing > 0 ? s.r : s.l, X, Y);
+  if (alpha < 1) ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- fish & friends (all face right)
+function tetraSpr(o) {
+  const b = new SB(9, 5), v = o.v;
+  b.ell(4.5, 2, 3.2, 1.3, v.B, v.S);
+  b.rect(2, 1, 5, 1, v.stripe);
+  b.tri(1, 2, 2, o.wag ? 2 : 3, v.T);
+  b.set(7, 1, EYE);
+  return b;
+}
+function clownSpr(o) {
+  const b = new SB(13, 9), O = '#ff8a2a', S = '#e0621a', Wt = '#ffffff';
+  b.ell(6.5, 4, 4.5, 2.8, O, S, '#ffb060');
+  b.tri(2, 4, 2, o.wag ? 4 : 5, O);
+  for (const x of [4, 8]) for (let y = 1; y < 8; y++) if (b.get(x, y)) b.set(x, y, Wt);
+  b.set(6, 0, O).set(7, 0, O);
+  b.set(10, 3, EYE).set(10, 5, BLUSH);
+  return b;
+}
+function tangSpr(o) {
+  const b = new SB(15, 11), B = '#3a7aff', S = '#2a58c8', Y = '#ffd83a';
+  b.ell(7, 5, 5, 3.8, B, S, '#6aa0ff');
+  b.tri(2, 5, 2, o.wag ? 5 : 7, Y);
+  b.rect(4, 2, 6, 1, '#1a2a6a').rect(6, 3, 3, 1, '#1a2a6a');
+  b.set(11, 4, EYE).set(11, 3, '#ffffff').set(12, 6, BLUSH);
+  return b;
+}
+function angelSpr(o) {
+  const b = new SB(13, 16), Y = '#f0e8b8', S = '#d8c890', St = '#3a3a4a';
+  b.ell(6.5, 8, 3.5, 4.5, Y, S);
+  b.tri(5, 3, 4, 4, Y, 1).tri(5, 13, 4, 4, Y, 1);
+  for (let y = 1; y < 15; y++) { if (b.get(4, y)) b.set(4, y, St); if (b.get(7, y)) b.set(7, y, St); }
+  b.set(6, 0, Y).set(6, 15, Y).set(5, 1, Y).set(5, 14, Y);
+  b.tri(2, 8, 2, o.wag ? 3 : 4, S);
+  b.set(9, 7, EYE).set(10, 9, '#ff9aa0');
+  return b;
+}
+function goldSpr(o) {
+  const b = new SB(15, 10), O = '#ff9a2a', S = '#e06a1a', F = '#ffc86a';
+  b.ell(9, 4.5, 4, 3, O, S, '#ffd08a');
+  const w = o.wag ? 1 : 0;
+  for (let i = 0; i < 5; i++) { b.set(4 - i, 4 - i * 0.6 - w, F).set(4 - i, 5 + i * 0.6 + w, F).set(4 - i, 4, i > 1 ? F : O); }
+  b.set(9, 1, F).set(10, 0, F).set(8, 8, F);
+  b.set(12, 3, EYE).set(12, 2, '#ffffff').set(13, 5, BLUSH);
+  return b;
+}
+function pufferSpr(o) {
+  if (o.puff) {
+    const b = new SB(17, 17), Y = '#f0d070', S = '#c8a048', Wt = '#fff8e0';
+    b.ell(8, 8, 6.2, 6.2, Y, S, '#fff0a8');
+    b.ell(8, 11, 4, 2, Wt);
+    for (let i = 0; i < 12; i++) { const a = i / 12 * 6.283; b.set(8 + Math.cos(a) * 7.5, 8 + Math.sin(a) * 7.5, '#8a6a3a'); }
+    for (const [x, y] of [[5, 6], [10, 5], [6, 9], [11, 9]]) b.set(x, y, '#a88040');
+    b.set(12, 6, EYE).set(12, 5, '#ffffff').set(13, 7, EYE).set(14, 9, '#ff7a6a').set(11, 10, BLUSH);
+    return b;
+  }
+  const b = new SB(13, 9), Y = '#f0d070', S = '#c8a048';
+  b.ell(7, 4.5, 4, 3, Y, S, '#fff0a8');
+  b.ell(7, 6, 2.5, 1, '#fff8e0');
+  b.tri(2, 4, 2, o.wag ? 3 : 4, S);
+  for (const [x, y] of [[5, 3], [7, 2], [6, 5]]) b.set(x, y, '#a88040');
+  b.set(9, 3, EYE).set(9, 2, '#ffffff').set(11, 5, '#ff7a6a');
+  return b;
+}
+function seahorseSpr(o) {
+  const b = new SB(10, 16), Y = o.col || '#ffc83a', S = o.sh || '#e09a2a';
+  b.ell(5, 3, 2.2, 2, Y, S).rect(7, 3, 2, 1, Y).set(5, 0, S).set(4, 1, S);
+  b.ell(4.5, 7.5, 2.4, 3, Y, S);
+  for (let i = 0; i < 5; i++) b.set(4 + Math.sin(i * 0.9) * 1.3 - i * 0.2, 11 + i, i === 4 ? S : Y);
+  b.set(3, 15, S).set(2, 14, S);
+  b.set(1, 6 + (o.wag ? 1 : 0), '#ffe8a0').set(1, 7, '#ffe8a0');
+  for (let y = 5; y < 11; y += 2) b.set(6, y, S);
+  b.set(5, 2, EYE).set(6, 4, BLUSH);
+  return b;
+}
+function crabSpr(o) {
+  const b = new SB(15, 10), R = '#e84a3a', S = '#b8302a';
+  b.ell(7, 5, 4.5, 2.4, R, S, '#ff8a6a');
+  const up = o.snip ? -2 : 0;
+  b.ell(2, 3 + up, 1.5, 1.2, R).ell(12, 3 + up, 1.5, 1.2, R).set(3, 4, R).set(11, 4, R);
+  if (o.snip) b.set(2, 1, INK).set(12, 1, INK);
+  b.rect(5, 1, 1, 2, S).rect(9, 1, 1, 2, S).set(5, 0, EYE).set(9, 0, EYE);
+  const s = o.step ? 1 : 0;
+  for (const x of [4, 6, 8, 10]) b.set(x + (x % 4 === 0 ? s : -s), 8, S);
+  b.set(6, 5, BLUSH).set(8, 5, BLUSH);
+  return b;
+}
+function shrimpSpr(o) {
+  const b = new SB(11, 6), P = '#ff8a8a', S = '#e05a6a';
+  for (let i = 0; i < 7; i++) b.set(2 + i, 3 - Math.sin(i / 6 * Math.PI) * 1.5, i % 2 ? S : P).set(2 + i, 4 - Math.sin(i / 6 * Math.PI) * 1.2, P);
+  b.set(1, 4, S).set(0, 5, S).set(8, 2, EYE);
+  b.set(9, 1, '#ffd0d0').set(10, 0, '#ffd0d0').set(9, 3, '#ffd0d0');
+  if (o.wag) b.set(4, 5, S).set(6, 5, S); else b.set(5, 5, S);
+  return b;
+}
+function anglerSpr(o) {
+  const b = new SB(18, 14), D = '#3a3050', S = '#241e36';
+  b.ell(9, 8, 6, 4.5, D, S, '#5a4a70');
+  b.tri(3, 8, 3, o.wag ? 4 : 6, S);
+  for (let i = 0; i < 6; i++) b.set(10 + i * 0.6, 3 - Math.sin(i / 5 * Math.PI) * 2.5, '#5a4a70');
+  for (let x = 11; x < 16; x++) b.set(x, 10, x % 2 ? '#ffffff' : INK);
+  b.rect(11, 11, 5, 1, '#6a1a2a');
+  b.set(12, 6, '#d8f0a0').set(12, 7, EYE);
+  return b;
+}
+function turtleSpr(o) {
+  const b = new SB(28, 18), G = '#5aa84a', S = '#3a7a3a', Sh = '#7a5a3a', ShS = '#5a3e26';
+  const f = o.wag ? 2 : 0;
+  b.ell(22, 8, 3.5, 2.8, '#8ad06a', '#6aa84a').set(24, 7, EYE).set(25, 9, BLUSH);
+  b.ell(16, 3 - f, 4, 1.5, G).ell(7, 13 + f, 3, 1.3, G).ell(15, 14 - f * 0.5, 3.5, 1.3, G).ell(6, 4 + f * 0.5, 2.5, 1.2, G);
+  b.ell(12, 8.5, 9, 5, Sh, ShS, '#a88058');
+  for (const [x, y] of [[9, 7], [14, 6], [12, 10], [17, 9], [6, 9]]) b.ell(x, y, 1.5, 1, '#9a7a4a');
+  b.rect(4, 12, 17, 1, '#e8d8a0');
+  return b;
+}
+function sharkSpr(o) {
+  const b = new SB(46, 18), G = '#8a98b0', S = '#6a7890', Wt = '#e8eef4';
+  b.ell(24, 9, 16, 4.5, G, S, '#b0bcd0');
+  b.ell(26, 11, 12, 2, Wt);
+  b.tri(7, 9, 5, o.wag ? 9 : 12, S);
+  b.rect(2, 3, 3, 3, S).rect(2, 13, 3, 2, S);
+  for (let i = 0; i < 5; i++) b.rect(22 + i, 4 - i, 1, i + 1, G);
+  b.tri(26, 14, 4, 4, S, -1);
+  for (const x of [32, 34, 36]) b.set(x, 9, S);
+  b.set(38, 7, EYE).set(38, 6, '#ffffff');
+  b.rect(35, 11, 5, 1, '#5a4a5a');
+  for (const x of [36, 38]) b.set(x, 12, '#ffffff');
+  return b;
+}
+function octoSpr(o) {
+  const b = new SB(15, 16), c = o.c;
+  b.ell(7, 5, 5, 4.5, c.B, c.S, c.H);
+  for (let i = 0; i < 5; i++) {
+    const bx = 3 + i * 2, sw = Math.sin((o.wag ? 1.5 : 0) + i * 1.3);
+    for (let k = 0; k < 6; k++) b.set(bx + sw * k * 0.25, 9 + k, k === 5 ? c.S : c.B);
+  }
+  b.set(5, 5, '#ffffff').set(5, 6, EYE).set(9, 5, '#ffffff').set(9, 6, EYE);
+  b.set(4, 8, BLUSH).set(10, 8, BLUSH);
+  for (const [x, y] of [[4, 2], [9, 1], [7, 3]]) b.set(x, y, c.H);
+  return b;
+}
+function subSpr(o) {
+  const b = new SB(26, 14), Y = '#ffd83a', S = '#e0a82a';
+  b.ell(12, 8, 10, 4.5, Y, S, '#fff08a');
+  b.rect(10, 1, 6, 4, Y).rect(12, 0, 1, 1, '#8a8a8a');
+  b.ell(18, 8, 2, 2, '#6ad8ff').set(17, 7, '#ffffff').ell(11, 8, 1.6, 1.6, '#6ad8ff').ell(6, 8, 1.6, 1.6, '#6ad8ff');
+  b.rect(0, 6 + (o.wag ? 0 : 1), 2, 4, '#8a8a8a').rect(2, 7, 1, 3, S);
+  b.set(12, 1, '#ff4a4a');
+  return b;
+}
+
+const TETRA_COLS = [
+  { B: '#6ae0ff', S: '#3aa8d0', stripe: '#ff4a6a', T: '#ff7a8a' },
+  { B: '#ffe06a', S: '#e0b040', stripe: '#3a4a8a', T: '#fff0a0' },
+  { B: '#c8f0ff', S: '#90c8e0', stripe: '#8a6aff', T: '#d8d0ff' },
+];
+const OCTO_COLS = [
+  { B: '#ff7a5a', S: '#d0503a', H: '#ffb090' }, { B: '#d8b878', S: '#b09058', H: '#f0dca0' }, { B: '#b86ae0', S: '#8a4ab8', H: '#e0a8ff' },
+];
+const wagSet = fn => makeSet(fn, { a: {}, b: { wag: 1 } }, 0, 0);
+function centerSet(set) { for (const s of Object.values(set)) { s.ax = Math.floor(s.w / 2); s.ay = Math.floor(s.h / 2); } return set; }
+const SPR = {
+  tetra: TETRA_COLS.map(v => centerSet(makeSet(o => tetraSpr({ ...o, v }), { a: {}, b: { wag: 1 } }, 0, 0))),
+  clown: centerSet(wagSet(clownSpr)),
+  tang: centerSet(wagSet(tangSpr)),
+  angel: centerSet(wagSet(angelSpr)),
+  gold: centerSet(wagSet(goldSpr)),
+  puffer: centerSet(makeSet(pufferSpr, { a: {}, b: { wag: 1 }, puff: { puff: 1 } }, 0, 0)),
+  seahorse: centerSet(wagSet(seahorseSpr)),
+  seahorse2: centerSet(makeSet(o => seahorseSpr({ ...o, col: '#ff8ac8', sh: '#d85a9a' }), { a: {}, b: { wag: 1 } }, 0, 0)),
+  crab: centerSet(makeSet(crabSpr, { a: {}, b: { step: 1 }, snip: { snip: 1 } }, 0, 0)),
+  shrimp: centerSet(wagSet(shrimpSpr)),
+  angler: centerSet(wagSet(anglerSpr)),
+  turtle: centerSet(wagSet(turtleSpr)),
+  shark: centerSet(wagSet(sharkSpr)),
+  octo: OCTO_COLS.map(c => centerSet(makeSet(o => octoSpr({ ...o, c }), { a: {}, b: { wag: 1 } }, 0, 0))),
+  sub: centerSet(wagSet(subSpr)),
+};
+
+// ---------------------------------------------------------------- emote icons
+const ICONS = {};
+function icon(name, rows, col) {
+  const b = new SB(rows[0].length + 2, rows.length + 2);
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== '.') b.set(x + 1, y + 1, ch === 'o' ? '#ffffff' : col); }));
+  ICONS[name] = bake(b.outline('#ffffff'), Math.floor(b.w / 2), b.h - 1);
+}
+icon('heart', ['.X.X.', 'XoXXX', 'XXXXX', '.XXX.', '..X..'], '#ff5a8a');
+icon('note', ['..XX', '..XX', '..X.', 'XXX.', 'XX..'], '#6a5aff');
+icon('bang', ['X', 'X', 'X', '.', 'X'], '#ff4a3a');
+icon('q', ['XXX', '..X', '.X.', '...', '.X.'], '#3a6aff');
+icon('z', ['XXX', '..X', '.X.', 'XXX'], '#7a8aff');
+icon('sparkle', ['.X.', 'XoX', '.X.'], '#ffc83a');
+
+// ---------------------------------------------------------------- creatures
+const TOP = () => SURF + 12, BOT = () => SAND - 6;
+const threats = () => world.ents.filter(e => e.threat && !e.dead);
+function hideSpots() {
+  const D = scene.decor;
+  return [
+    { x: D.castle.x, y: D.castle.y - 8 }, { x: D.rock.x - 2, y: D.rock.y - 6 }, { x: D.anemone.x, y: D.anemone.y - 6 },
+    ...scene.weeds.filter(p => p.type === 'kelp').map(p => ({ x: p.x, y: Math.min(p.y - 10, BOT()) })),
+  ];
+}
+class Swimmer {
+  constructor(kind, o = {}) {
+    Object.assign(this, {
+      kind, set: SPR[kind], x: rand(0, W), y: rand(TOP(), BOT()), vx: 0, vy: 0, facing: coin(), speed: 12, accel: 1.5,
+      layer: 'mid', z: rand(0, 1), target: null, wanderT: 0, brain: null, emotes: [], tags: {}, age: rand(0, 5), dead: false,
+      band: null, frame: null, bob: rand(0, 6.28), alpha: 1, scared: 0, hide: false,
+    }, o);
+    world.ents.push(this);
+  }
+  act(gen) { this.brain = gen; return this; }
+  emote(name, dur = 1.6) { if (!this.emotes.some(e => e.name === name && e.t < 0.5)) this.emotes.push({ name, t: 0, dur }); }
+  pickWander() {
+    const b = this.band || [TOP(), BOT()];
+    this.target = { x: clamp(this.x + rand(-W * 0.4, W * 0.4), 10, W - 10), y: rand(b[0], b[1]) };
+    this.wanderT = rand(3, 8);
+  }
+  steer(tx, ty, spd, dt) {
+    const dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy) || 1, s = Math.min(spd, d * 1.5);
+    const k = Math.min(1, dt * this.accel);
+    this.vx = lerp(this.vx, (dx / d) * s, k); this.vy = lerp(this.vy, (dy / d) * s * 0.7, k);
+    return d;
+  }
+  update(dt) {
+    this.age += dt;
+    for (const e of this.emotes) e.t += dt;
+    this.emotes = this.emotes.filter(e => e.t < e.dur);
+    this.scared = Math.max(0, this.scared - dt);
+    let handled = false;
+    if (this.brain) {
+      let r;
+      try { r = this.brain.next(dt); } catch (e) { console.error(this.kind, e); r = { done: true }; }
+      if (r.done) this.brain = null; else handled = r.value === 'hold';
+    }
+    if (!handled) {
+      // flee anything scary nearby
+      for (const t of threats()) {
+        if (t === this || this.brave) continue;
+        const d = dist(this, t);
+        if (d < (t.scareR || 50) && this.layer === (t.layer === 'far' ? 'none' : this.layer)) {
+          if (this.scared <= 0) this.emote('bang', 1);
+          this.scared = 1.5;
+          const a = Math.atan2(this.y - t.y, this.x - t.x);
+          this.target = { x: clamp(this.x + Math.cos(a) * 60, 6, W - 6), y: clamp(this.y + Math.sin(a) * 40, TOP(), BOT()) };
+        }
+      }
+      if (this.hide && world.alarm > 0) {
+        if (!this.hideAt) this.hideAt = pick(hideSpots());
+        this.target = { x: this.hideAt.x + Math.sin(this.age * 2) * 3, y: this.hideAt.y + Math.cos(this.age * 1.7) * 2 };
+      } else this.hideAt = null;
+      if (!this.target || (this.wanderT -= dt) <= 0) this.pickWander();
+      const d = this.steer(this.target.x, this.target.y, this.speed * (this.scared > 0 ? 3 : 1), dt);
+      if (d < 3 && !this.hideAt) this.wanderT = Math.min(this.wanderT, rand(0.5, 2));
+    }
+    this.x += (this.vx + world.current * 8) * dt; this.y += this.vy * dt;
+    this.y = clamp(this.y, SURF + 6, SAND + (this.layer === 'floor' ? 30 : 0));
+    this.x = clamp(this.x, -60, W + 60);
+    if (Math.abs(this.vx) > 1.5) this.facing = Math.sign(this.vx);
+  }
+  frameName() { return this.frame || (Math.floor(this.age * (3 + Math.hypot(this.vx, this.vy) * 0.25)) % 2 ? 'a' : 'b'); }
+  draw() {
+    const s = this.set[this.frameName()] || this.set.a;
+    drawSpr(s, this.x, this.y + Math.sin(this.age * 2 + this.bob) * 0.6, this.facing, this.alpha);
+    for (const e of this.emotes) {
+      const k = e.t / e.dur;
+      if (k > 0.75 && Math.floor(world.t * 12) % 2) continue;
+      drawSpr(ICONS[e.name], this.x + this.facing * 2, this.y - s.ay - 2 - Math.min(1, k * 3) * 4, 1);
+    }
+  }
+}
+
+// ---- school of tiny fish (boids)
+class School {
+  constructor(n, o = {}) {
+    Object.assign(this, { layer: 'mid', z: rand(0, 1), dead: false, lead: { x: rand(20, W - 20), y: rand(TOP() + 10, BOT() - 20) }, goal: null, goalT: 0, speed: 20, override: null }, o);
+    const set = pick(SPR.tetra);
+    this.fish = Array.from({ length: n }, () => ({ x: this.lead.x + rand(-15, 15), y: this.lead.y + rand(-8, 8), vx: 0, vy: 0, ph: rand(0, 6), facing: 1, set }));
+    world.ents.push(this);
+  }
+  get x() { return this.lead.x; }
+  get y() { return this.lead.y; }
+  update(dt) {
+    if (this.override) { this.goal = this.override; }
+    else if (!this.goal || (this.goalT -= dt) <= 0 || dist(this.lead, this.goal) < 8) {
+      this.goal = { x: rand(20, W - 20), y: rand(TOP() + 5, BOT() - 10) }; this.goalT = rand(4, 9);
+    }
+    const dx = this.goal.x - this.lead.x, dy = this.goal.y - this.lead.y, d = Math.hypot(dx, dy) || 1;
+    this.lead.x += (dx / d) * Math.min(this.speed, d) * dt; this.lead.y += (dy / d) * Math.min(this.speed, d) * 0.7 * dt;
+    const T = threats();
+    for (const f of this.fish) {
+      let ax = (this.lead.x - f.x) * 0.8, ay = (this.lead.y - f.y) * 0.8;
+      for (const g of this.fish) { if (g === f) continue; const ddx = f.x - g.x, ddy = f.y - g.y, dd = ddx * ddx + ddy * ddy; if (dd < 16 && dd > 0) { ax += ddx / dd * 60; ay += ddy / dd * 60; } }
+      for (const t of T) { if (t.layer === 'far') continue; const ddx = f.x - t.x, ddy = f.y - t.y, dd = Math.hypot(ddx, ddy); if (dd < (t.scareR || 50)) { ax += ddx / dd * 900; ay += ddy / dd * 900; } }
+      if (world.food.length && this.hungry) { const fd = world.food.reduce((b, p) => (!b || dist(p, f) < dist(b, f) ? p : b), null); if (fd) { ax += (fd.x - f.x) * 1.5; ay += (fd.y - f.y) * 1.5; if (dist(fd, f) < 2.5) { fd.eaten = true; } } }
+      f.vx += ax * dt; f.vy += ay * dt;
+      const sp = Math.hypot(f.vx, f.vy), max = 45;
+      if (sp > max) { f.vx *= max / sp; f.vy *= max / sp; }
+      f.vx *= Math.pow(0.4, dt); f.vy *= Math.pow(0.4, dt);
+      f.x += (f.vx + world.current * 8) * dt; f.y = clamp(f.y + f.vy * dt, SURF + 5, SAND - 2);
+      if (Math.abs(f.vx) > 2) f.facing = Math.sign(f.vx);
+      f.ph += dt * (4 + sp * 0.2);
+    }
+  }
+  draw() { for (const f of this.fish) drawSpr(f.set[Math.floor(f.ph) % 2 ? 'a' : 'b'], f.x, f.y, f.facing); }
+}
+
+// ---- crab on the sand
+class Crab extends Swimmer {
+  constructor(o = {}) { super('crab', { layer: 'floor', y: SAND + randi(6, 14), speed: 10, ...o }); this.floorY = this.y; this.carry = null; }
+  update(dt) {
+    this.age += dt;
+    for (const e of this.emotes) e.t += dt;
+    this.emotes = this.emotes.filter(e => e.t < e.dur);
+    if (this.brain) { const r = this.brain.next(dt); if (r.done) this.brain = null; }
+    else {
+      if (!this.target || (this.wanderT -= dt) <= 0) { this.target = { x: clamp(this.x + rand(-60, 60), 10, W - 10), y: this.floorY }; this.wanderT = rand(3, 7); }
+      const dx = this.target.x - this.x;
+      if (Math.abs(dx) > 2) { this.vx = Math.sign(dx) * this.speed; this.frame = Math.floor(this.age * 8) % 2 ? 'a' : 'b'; }
+      else { this.vx = 0; this.frame = chance(0.004) ? 'snip' : this.frame === 'snip' && chance(0.9) ? 'snip' : 'a'; }
+      if (world.alarm > 0) { this.vx = 0; this.frame = 'a'; }
+    }
+    this.x += this.vx * dt;
+    this.facing = 1;   // crabs walk sideways and always face you
+  }
+  draw() {
+    if (world.alarm > 0 && !this.brain) {   // buried in sand with eyes poking out
+      px(this.x - 2, this.y - 1, EYE); px(this.x + 2, this.y - 1, EYE); rect(this.x - 5, this.y, 11, 1, '#d8b878'); return;
+    }
+    super.draw();
+    if (this.carry) { const X = Math.round(this.x), Y = Math.round(this.y - 7); rect(X - 1, Y - 1, 3, 3, INK); px(X, Y, '#ffffff'); px(X - 1, Y, '#e8f0ff'); px(X + 1, Y, '#c8d8f0'); }
+  }
+}
+
+// ---- eel living in the rock hole
+class Eel {
+  constructor() { Object.assign(this, { layer: 'mid', z: 0.6, dead: false, out: 0, target: 0, dir: -1, ph: 0, brain: null, mouth: 0, emotes: [] }); world.ents.push(this); this.brain = this.life(); }
+  get hole() { return scene.decor.rock.hole; }
+  get x() { return this.hole.x + this.dir * this.out * 0.9; }
+  get y() { return this.hole.y + Math.sin(this.ph) * this.out * 0.08; }
+  *life() {
+    for (;;) {
+      yield* wait(rand(6, 14));
+      if (world.alarm > 0 || director.name === 'eel') continue;
+      this.target = rand(10, 18); yield* wait(rand(3, 6)); this.target = 0;
+    }
+  }
+  emote(n, d = 1.5) { this.emotes.push({ name: n, t: 0, dur: d }); }
+  update(dt) {
+    this.ph += dt * 2;
+    if (this.brain) this.brain.next(dt);
+    this.out = lerp(this.out, this.target, dt * (this.target > this.out + 10 ? 8 : 2.5));
+    this.mouth = Math.max(0, this.mouth - dt * 2);
+    for (const e of this.emotes) e.t += dt;
+    this.emotes = this.emotes.filter(e => e.t < e.dur);
+  }
+  draw() {
+    if (this.out < 1) return;
+    const { x: hx, y: hy } = this.hole, n = Math.round(this.out), d = this.dir;
+    for (let i = 0; i <= n; i++) {
+      const X = hx + d * i * 0.9, Y = hy + Math.sin(this.ph - i * 0.35) * Math.min(2, i * 0.12);
+      rect(X, Y - 2, 1, 5, INK);
+      rect(X, Y - 1, 1, 3, i % 4 === 0 ? '#5a8a3a' : '#7aa848');
+      px(X, Y + 1, '#c8e08a');
+    }
+    const X = Math.round(hx + d * n * 0.9), Y = Math.round(hy + Math.sin(this.ph - n * 0.35) * Math.min(2, n * 0.12));
+    rect(X + d * 1, Y - 3, 4 * d > 0 ? 4 : -4, 6, INK);
+    for (let k = 0; k < 4; k++) rect(X + d * (k + 1), Y - 2, 1, 4, '#7aa848');
+    px(X + d * 2, Y - 2, '#ffffff'); px(X + d * 2, Y - 1, EYE);
+    if (this.mouth > 0.1) { rect(X + d * 3, Y + 1, 2 * d > 0 ? 2 : -2, 1, '#aa2a3a'); px(X + d * 4, Y, '#ffffff'); }
+    for (const e of this.emotes) drawSpr(ICONS[e.name], X + d * 2, Y - 5 - Math.min(1, e.t * 3) * 3, 1);
+  }
+}
+
+// ---- octopus in the pot
+class Octopus extends Swimmer {
+  constructor() {
+    super('octo', { set: SPR.octo[0], layer: 'mid', z: 0.7, speed: 10 });
+    const m = scene.decor.pot.mouth;
+    this.x = m.x; this.y = m.y; this.peek = 0; this.inPot = true; this.colIdx = 0; this.camo = 0; this.brain = this.life();
+  }
+  *life() {
+    for (;;) {
+      this.inPot = true;
+      yield* wait(rand(5, 12));
+      if (world.alarm > 0 || director.name === 'octopus') continue;
+      for (let t = 0; t < 1; t += 1 / 30) { this.peek = t; yield; }
+      if (chance(0.4)) this.emote(pick(['heart', 'note']), 1.4);
+      yield* wait(rand(1.5, 3));
+      for (let t = 1; t > 0; t -= 1 / 30) { this.peek = t; yield; }
+      this.peek = 0;
+    }
+  }
+  update(dt) {
+    this.age += dt;
+    for (const e of this.emotes) e.t += dt;
+    this.emotes = this.emotes.filter(e => e.t < e.dur);
+    if (this.brain) { const r = this.brain.next(dt); if (r.done) this.brain = this.life(); }
+    if (this.inPot) { const m = scene.decor.pot.mouth; this.x = m.x + this.peek * 4; this.y = m.y - this.peek * 2; }
+  }
+  draw() {
+    if (this.inPot && this.peek < 0.05) return;
+    const alpha = this.inPot ? 1 : 1 - this.camo * 0.75;
+    if (this.inPot) {   // just the head peeking out of the pot mouth
+      const s = this.set.a, show = Math.round(s.h * 0.45 * this.peek) + 1;
+      const X = Math.round(this.x - s.ax), Y = Math.round(this.y - s.ay);
+      ctx.drawImage(s.r, 0, 0, s.w, show, X, Y + (s.h * 0.45 - show), s.w, show);
+      for (const e of this.emotes) drawSpr(ICONS[e.name], this.x, Y - 3 - Math.min(1, e.t * 3) * 3, 1);
+      return;
+    }
+    this.alpha = alpha; super.draw();
+  }
+}
+
+// ---- jellyfish
+class Jelly {
+  constructor(o = {}) {
+    Object.assign(this, { x: rand(20, W - 20), y: BOT() + 10, vy: 0, ph: rand(0, 6.28), layer: 'mid', z: rand(0, 1), dead: false, col: pick(['#ffb0e0', '#c0b8ff', '#a8f0ff']), size: rand(4, 6), leaving: false, age: 0, drift: rand(-3, 3), glow: false }, o);
+    this.threat = false; world.ents.push(this);
+  }
+  update(dt) {
+    this.age += dt; this.ph += dt * 1.6;
+    const pulse = Math.sin(this.ph);
+    if (pulse > 0.85) this.vy = -12;
+    this.vy = lerp(this.vy, this.leaving ? -10 : 3, dt * 0.8);
+    this.y += this.vy * dt; this.x += (this.drift + world.current * 10) * dt;
+    if (!this.leaving) this.y = clamp(this.y, TOP() + 8, BOT() + 20);
+    if (this.leaving && (this.y < SURF - 10 || this.x < -20 || this.x > W + 20)) this.dead = true;
+    if (this.leaving) this.vy -= 6 * dt;
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y), s = this.size, squash = Math.sin(this.ph) * 0.8;
+    const rx = s + squash, ry = s * 0.8 - squash * 0.5;
+    for (let k = 0; k < 4; k++) {
+      const bx = X - rx + 1 + k * ((rx * 2 - 2) / 3);
+      for (let i = 0; i < s * 2.2; i++) px(bx + Math.sin(this.ph * 1.3 + k + i * 0.4) * i * 0.15, Y + 1 + i, i % 3 ? this.col : '#ffffff');
+    }
+    for (let dy = -Math.ceil(ry); dy <= 0; dy++) for (let dx = -Math.ceil(rx); dx <= Math.ceil(rx); dx++) {
+      if ((dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) > 1) continue;
+      px(X + dx, Y + dy, dy < -ry * 0.55 && dx < 0 ? '#ffffff' : this.col);
+    }
+    rect(X - rx, Y, rx * 2 + 1, 1, mixHex(this.col, '#ffffff', 0.4));
+    px(X - 2, Y - 2, EYE); px(X + 2, Y - 2, EYE); px(X - 3, Y - 1, BLUSH); px(X + 3, Y - 1, BLUSH);
+  }
+  glowDraw() {
+    if (!this.glow || world.dark < 0.3) return;
+    ctx.globalAlpha = world.dark * (0.4 + Math.sin(this.ph) * 0.15);
+    ctx.fillStyle = this.col; ctx.beginPath(); ctx.arc(this.x, this.y, this.size * 2.2, 0, 6.283); ctx.fill();
+    ctx.globalAlpha = world.dark * 0.9; this.draw(); ctx.globalAlpha = 1;
+  }
+}
+
+// ---- population
+const amb = { schools: [], clowns: [], seahorse: null, crab: null, eel: null, octo: null, puffer: null, shrimp: null, bubbleT: 3 };
+const byKind = k => world.ents.filter(e => e.kind === k && !e.dead);
+function* clownLife(c, i) {
+  for (;;) {
+    const A = scene.decor.anemone;
+    if (world.alarm > 0) { c.target = { x: A.x + (i ? 2 : -2), y: A.y - 5 }; yield 'move'; continue; }
+    c.band = [A.y - 30, A.y - 6];
+    if (!c.target || (c.wanderT -= 1 / 30) <= 0) { c.target = { x: A.x + rand(-22, 22), y: rand(A.y - 30, A.y - 6) }; c.wanderT = rand(1.5, 4); if (chance(0.08)) c.emote('heart', 1.4); }
+    yield 'move';
+  }
+}
+function* seahorseLife(c) {
+  const kelp = scene.weeds.filter(p => p.type === 'kelp');
+  for (;;) {
+    const k = kelp.length ? pick(kelp) : { x: rand(20, W - 20), y: BOT() };
+    c.target = { x: k.x + rand(-4, 4), y: clamp(k.y - rand(10, k.h * 0.8), TOP(), BOT()) };
+    c.wanderT = 99;
+    yield* until(() => dist(c, c.target) < 3, 30);
+    c.target = { x: c.x, y: c.y };
+    yield* wait(rand(4, 9));
+  }
+}
+function* shrimpLife(c) {
+  const R = scene.decor.rock;
+  for (;;) {
+    c.target = { x: R.x + rand(-14, 14), y: R.y - rand(2, 18) }; c.wanderT = 99;
+    yield* until(() => dist(c, c.target) < 2, 10);
+    c.target = { x: c.x, y: c.y };
+    yield* wait(rand(1, 4));
+  }
+}
+function populate() {
+  amb.schools = [new School(randi(12, 16)), new School(randi(8, 12), { layer: 'back', speed: 14 })];
+  amb.clowns = [0, 1].map(i => { const A = scene.decor.anemone; const c = new Swimmer('clown', { x: A.x + (i ? 10 : -10), y: A.y - 12, speed: 12 }); return c.act(clownLife(c, i)); });
+  for (const k of ['tang', 'gold', 'angel']) new Swimmer(k, { speed: k === 'angel' ? 7 : 11, hide: true });
+  new Swimmer('gold', { speed: 10, hide: true, layer: 'back' });
+  new Swimmer('angel', { speed: 6, hide: true, layer: 'back' });
+  amb.puffer = new Swimmer('puffer', { speed: 7, hide: true });
+  amb.seahorse = new Swimmer('seahorse', { speed: 5, accel: 0.8, hide: true });
+  amb.seahorse.act(seahorseLife(amb.seahorse));
+  amb.shrimp = new Swimmer('shrimp', { speed: 6, x: scene.decor.rock.x, y: scene.decor.rock.y - 10 });
+  amb.shrimp.act(shrimpLife(amb.shrimp));
+  amb.crab = new Crab({ x: rand(20, W - 20) });
+  amb.eel = new Eel();
+  amb.octo = new Octopus();
+}
+function ambientTick(dt) {
+  decorTick(dt);
+  if ((amb.bubbleT -= dt) <= 0) {
+    amb.bubbleT = rand(1, 3);
+    const f = pick(world.ents.filter(e => e instanceof Swimmer && e.layer === 'mid' && !e.dead));
+    if (f) bubble(f.x + f.facing * 5, f.y - 2);
+  }
+  // food flakes sink
+  for (const f of world.food) {
+    if (f.eaten) continue;
+    f.vy = lerp(f.vy, 6, dt); f.y += f.vy * dt; f.x += Math.sin(world.t * 2 + f.ph) * 4 * dt;
+    if (f.y > f.floor) { f.y = f.floor; f.settle = (f.settle || 0) + dt; if (f.settle > 20) f.eaten = true; }
+  }
+  world.food = world.food.filter(f => !f.eaten);
+}
+
+// ---------------------------------------------------------------- event helpers
+class Threat {
+  constructor(o) { Object.assign(this, { threat: true, scareR: 45, layer: 'mid', dead: false, dur: 1, follow: null }, o); world.ents.push(this); }
+  get x() { return this.follow ? this.follow.x : this._x; }
+  set x(v) { this._x = v; }
+  get y() { return this.follow ? this.follow.y : this._y; }
+  set y(v) { this._y = v; }
+  update(dt) { if ((this.dur -= dt) <= 0) this.dead = true; }
+  draw() {}
+}
+const scare = (x, y, r = 45, dur = 1, follow = null) => new Threat({ x, y, scareR: r, dur, follow });
+function* swimTo(c, x, y, spd, max = 20) {
+  const old = c.speed; c.speed = spd; c.target = { x, y }; c.wanderT = 99;
+  for (let t = 0; t < max && dist(c, c.target) > 3; t += 1 / 30) yield 'move';
+  c.speed = old;
+}
+function* hold(c, secs, fn) {
+  for (let t = 0; t < secs; t += 1 / 30) { c.vx *= 0.9; c.vy *= 0.9; fn?.(t); yield 'hold'; }
+}
+const bigFish = () => world.ents.filter(e => e instanceof Swimmer && ['tang', 'gold', 'angel'].includes(e.kind) && e.layer === 'mid' && !e.brain && !e.dead);
+function heartBubbles(x, y) {
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2, hx = 16 * Math.pow(Math.sin(a), 3), hy = -(13 * Math.cos(a) - 5 * Math.cos(2 * a) - 2 * Math.cos(3 * a) - Math.cos(4 * a));
+    later(() => world.parts.push({ x: x + hx * 0.45, y: y + hy * 0.45, vx: 0, vy: -6, life: 3, max: 3, bubble: true, big: false, ph: 0, fade: false }), i * 0.03);
+  }
+}
+function drawFood() {
+  for (const f of world.food) { px(f.x, f.y, f.col); if (f.big) px(f.x + 1, f.y, f.col); }
+}
+
+// ---------------------------------------------------------------- COMMON EVENTS
+// Feeding time: a shaker sprinkles flakes, everyone rushes up, the crab tidies what reaches the sand
+function* feeding() {
+  const cx = rand(W * 0.2, W * 0.8);
+  const can = addFx({ layer: 'front', dur: 1e9, y: -14, tilt: 0, draw(f) {
+    const X = Math.round(cx), Y = Math.round(f.y), tl = f.tilt;
+    rect(X - 5, Y, 10, 12, '#ff6a4a'); rect(X - 5, Y + 4, 10, 4, '#ffffff'); rect(X - 5, Y, 2, 12, '#ff9a7a');
+    rect(X - 4 + tl * 2, Y + 12, 8, 2, '#c8c8d0'); px(X - 2 + tl * 2, Y + 13, '#5a5a6a'); px(X + 1 + tl * 2, Y + 13, '#5a5a6a');
+    rect(X - 2, Y + 5, 4, 2, '#3a8aff');
+  } });
+  while (can.y < -2) { can.y += (yield) * 14; }
+  world.ents.forEach(e => e.emote && e.layer === 'mid' && chance(0.5) && e.emote('bang', 1));
+  amb.schools.forEach(s => (s.hungry = true));
+  for (let i = 0; i < 40; i++) {
+    can.tilt = Math.sin(i * 0.8) > 0 ? 1 : 0;
+    world.food.push({ x: cx + rand(-6, 6), y: SURF + 2, vy: rand(3, 10), floor: SAND + rand(2, 10), ph: rand(0, 6.28), col: pick(['#ff9a4a', '#ffd040', '#e85a3a', '#8ae05a']), big: chance(0.3) });
+    yield* wait(0.06);
+  }
+  const eaters = world.ents.filter(e => e instanceof Swimmer && ['tang', 'gold', 'angel', 'puffer', 'clown'].includes(e.kind) && !e.dead);
+  const saved = eaters.map(e => [e, e.brain]);
+  for (const e of eaters) e.act((function* () {
+    for (;;) {
+      const f = world.food.filter(p => p.y < p.floor - 1).sort((a, b) => dist(a, e) - dist(b, e))[0];
+      if (!f) { yield 'move'; continue; }
+      e.target = { x: f.x, y: f.y }; e.wanderT = 99; e.speed = 22;
+      if (dist(e, f) < 4) { f.eaten = true; if (chance(0.25)) e.emote('heart', 1.2); bubble(e.x + e.facing * 4, e.y); }
+      yield 'move';
+    }
+  })());
+  const crab = amb.crab;
+  crab.act((function* () {
+    for (;;) {
+      const f = world.food.filter(p => p.y >= p.floor - 1).sort((a, b) => Math.abs(a.x - crab.x) - Math.abs(b.x - crab.x))[0];
+      if (!f) { crab.frame = 'a'; yield; continue; }
+      const dx = f.x - crab.x;
+      if (Math.abs(dx) > 2) { crab.vx = Math.sign(dx) * 18; crab.frame = Math.floor(world.t * 10) % 2 ? 'a' : 'b'; yield; }
+      else { crab.vx = 0; for (let t = 0; t < 0.6; t += 1 / 30) { crab.frame = Math.floor(t * 8) % 2 ? 'snip' : 'a'; yield; } f.eaten = true; if (chance(0.3)) crab.emote('heart', 1.2); }
+    }
+  })());
+  let t = 0;
+  while (t < 30 && world.food.length) {
+    const dt = yield; t += dt;
+    if (can.y > -20 && t > 1) can.y -= dt * 14;
+  }
+  can.dur = 0;
+  amb.schools.forEach(s => (s.hungry = false));
+  for (const [e, b] of saved) { e.brain = b; e.speed = e.kind === 'angel' ? 7 : e.kind === 'puffer' ? 7 : e.kind === 'clown' ? 12 : 11; e.target = null; }
+  crab.brain = null; crab.vx = 0;
+  world.food = [];
+}
+
+// Moray ambush: the eel lurks, a goldfish drifts too close, SNAP, everyone scatters, eel acts like nothing happened
+function* eel() {
+  const E = amb.eel, h = E.hole;
+  E.brain = null; E.target = 7;
+  yield* wait(2);
+  E.emote('q', 1.5);
+  const bait = bigFish().sort((a, b) => dist(a, h) - dist(b, h))[0];
+  if (bait) {
+    bait.brain = null;
+    bait.act(swimTo(bait, h.x + E.dir * 32, h.y + rand(-4, 4), 8, 12));
+    yield* until(() => !bait.brain || dist(bait, h) < 36, 14);
+  }
+  E.target = 30; E.mouth = 1.5;
+  yield* wait(0.2);
+  scare(h.x + E.dir * 26, h.y, 55, 1.5);
+  E.mouth = 1.5;
+  yield* wait(0.7);
+  E.target = 14;
+  yield* wait(1.2);
+  E.emote('sparkle', 1.4); // "who, me?"
+  yield* wait(2);
+  E.emote('z', 1.4); E.mouth = 1;
+  yield* wait(1.5);
+  E.target = 0;
+  yield* wait(1);
+  E.brain = E.life();
+}
+
+// Puffer surprise: the clownfish sneaks up for a playful boop, the puffer balloons and floats away embarrassed
+function* puffer() {
+  const p = amb.puffer, c = amb.clowns[0];
+  p.brain = null;
+  p.act(swimTo(p, clamp(p.x, 40, W - 40), clamp(p.y, TOP() + 20, BOT() - 20), 7, 10));
+  yield* until(() => !p.brain, 12);
+  p.act((function* () { for (;;) yield* hold(p, 1); })());
+  const home = c.brain;
+  c.act((function* () {
+    yield* swimTo(c, p.x - p.facing * 14, p.y + 2, 14, 15);
+    c.facing = p.facing; c.emote('note', 1.2);
+    yield* hold(c, 0.8);
+    c.vx = p.facing * 30;
+    yield* hold(c, 0.3);
+  })());
+  yield* until(() => !c.brain, 20);
+  p.emote('bang', 1.2); p.frame = 'puff';
+  for (let i = 0; i < 12; i++) bubble(p.x + rand(-6, 6), p.y + rand(-6, 6), chance(0.5));
+  c.act((function* () { c.vx = -p.facing * 25; c.emote('sparkle', 1.5); yield* hold(c, 1.2); })());
+  let t = 0;
+  p.act((function* () { for (;;) { p.vy = -4; p.vx = Math.sin(t * 2) * 3; if (Math.floor(t * 2) !== Math.floor((t - 1 / 30) * 2)) p.facing *= -1; yield 'hold'; } })());
+  while (t < 5) t += yield;
+  p.frame = null; p.emote('heart', 1.5);
+  for (let i = 0; i < 16; i++) later(() => bubble(p.x - p.facing * 6, p.y, true), i * 0.05);
+  p.act((function* () { p.vx = p.facing * 30; yield* hold(p, 0.6); })());
+  yield* until(() => !p.brain, 3);
+  c.brain = home; c.act(clownLife(c, 0));
+}
+
+// Octopus heist: sneaks out, camouflages on the sand, pops out to startle the school, inks and jets home
+function* octopus() {
+  const o = amb.octo, m = scene.decor.pot.mouth;
+  o.brain = null;
+  for (let t = 0; t < 1; t += 1 / 30) { o.peek = t; yield; }
+  o.inPot = false; o.x = m.x + 4; o.y = m.y - 3;
+  const spot = { x: clamp(m.x + coin() * rand(50, 90), 20, W - 20), y: SAND - 1 };
+  o.facing = Math.sign(spot.x - o.x) || 1;
+  let ci = 0, ct = 0;
+  o.brain = (function* () { for (;;) yield; })();
+  while (Math.abs(o.x - spot.x) > 2) {
+    const dt = yield; ct += dt;
+    o.x += Math.sign(spot.x - o.x) * 12 * dt; o.y = lerp(o.y, spot.y, dt * 2) + Math.sin(world.t * 6) * 0.2;
+    if (ct > 0.7) { ct = 0; ci = (ci + 1) % 3; o.set = SPR.octo[ci]; }
+  }
+  o.set = SPR.octo[1];
+  for (let t = 0; t < 1.5; t += 1 / 30) { o.camo = t / 1.5; yield; }
+  const S = amb.schools[0];
+  S.override = { x: spot.x, y: spot.y - 16 };
+  yield* until(() => dist(S.lead, S.override) < 14, 12);
+  o.camo = 0; o.set = SPR.octo[2]; o.emote('bang', 1.2); o.y -= 4;
+  scare(o.x, o.y, 60, 1.2);
+  S.override = null;
+  yield* wait(0.8);
+  o.set = SPR.octo[0]; o.emote('note', 1.2);
+  yield* wait(1);
+  for (let i = 0; i < 40; i++) addPart(o.x + rand(-4, 4), o.y + rand(-3, 3), rand(-12, 12), rand(-12, 12), rand(2, 4), ['#3a2a4a', '#2a1e3a', '#4a3a5a'], { drag: 0.3, size: chance(0.4) ? 2 : 1 });
+  while (dist(o, m) > 3) { const dt = yield; const a = Math.atan2(m.y - o.y, m.x - o.x); o.x += Math.cos(a) * 60 * dt; o.y += Math.sin(a) * 60 * dt; o.facing = Math.sign(Math.cos(a)) || 1; if (chance(0.5)) bubble(o.x, o.y); }
+  o.inPot = true; o.peek = 1; o.camo = 0;
+  for (let t = 1; t > 0; t -= 1 / 30) { o.peek = t; yield; }
+  o.peek = 0; o.brain = o.life();
+}
+
+// Jellyfish drift: a small bloom of jellies pulses through; fish politely give them room
+function* jellies() {
+  const js = [];
+  for (let i = 0; i < randi(3, 5); i++) { js.push(new Jelly({ x: rand(W * 0.1, W * 0.9), y: SAND + rand(5, 25), drift: rand(-2, 2) })); yield* wait(rand(0.5, 1.5)); }
+  const zones = js.map(j => new Threat({ follow: j, scareR: 16, dur: 1e9 }));
+  let t = 0;
+  while (t < 28) { const dt = yield; t += dt; if (chance(dt * 0.3)) { const j = pick(js); for (let k = 0; k < 3; k++) addPart(j.x + rand(-3, 3), j.y - 3, rand(-3, 3), rand(-6, -2), 1.2, '#ffffff', { drag: 0.5 }); } }
+  js.forEach(j => (j.leaving = true));
+  yield* until(() => js.every(j => j.dead), 30);
+  zones.forEach(z => (z.dead = true));
+  js.forEach(j => (j.dead = true));
+}
+
+// Cleaning station: a big fish parks by the rock and the shrimp gives it a spa day
+function* cleaning() {
+  const f = bigFish()[0], s = amb.shrimp, R = scene.decor.rock;
+  if (!f) return;
+  const spot = { x: R.x + 26, y: R.y - 18 };
+  f.act(swimTo(f, spot.x, spot.y, 10, 15));
+  yield* until(() => !f.brain, 16);
+  f.facing = -1;
+  f.act((function* () { for (;;) yield* hold(f, 1); })());
+  f.emote('q', 1.2);
+  s.brain = null;
+  s.act(swimTo(s, f.x + 6, f.y - 3, 10, 8));
+  yield* until(() => !s.brain, 9);
+  let t = 0;
+  s.act((function* () { for (;;) { const k = Math.sin(t * 1.5); s.target = { x: f.x + k * 7, y: f.y - 4 + Math.cos(t * 3) * 2 }; s.speed = 8; s.wanderT = 99; yield 'move'; } })());
+  while (t < 6) {
+    const dt = yield; t += dt;
+    if (chance(dt * 3)) addPart(s.x + rand(-2, 2), s.y, rand(-6, 6), rand(-8, -2), 0.8, ['#ffffff', '#fff4b0'], { drag: 0.5 });
+    if (chance(dt * 0.5)) f.emote(chance(0.5) ? 'heart' : 'sparkle', 1.3);
+  }
+  f.emote('heart', 2);
+  f.brain = null; f.target = null;
+  s.brain = null; s.act(shrimpLife(s));
+}
+
+// Seahorse romance: a pink seahorse arrives, they twirl tails and swirl in a heart of bubbles
+function* seahorses() {
+  const a = amb.seahorse;
+  a.brain = null;
+  const dir = coin(), b = new Swimmer('seahorse2', { x: dir > 0 ? -10 : W + 10, y: rand(TOP() + 20, BOT() - 20), speed: 8, accel: 0.8 });
+  const mid = { x: clamp(a.x, 40, W - 40), y: clamp(a.y, TOP() + 25, BOT() - 25) };
+  a.act(swimTo(a, mid.x - 8, mid.y, 6, 20)); b.act(swimTo(b, mid.x + 8, mid.y, 8, 30));
+  yield* until(() => !a.brain && !b.brain, 32);
+  a.facing = 1; b.facing = -1;
+  a.emote('heart', 1.6); yield* wait(0.8); b.emote('heart', 1.6);
+  let t = 0;
+  const twirl = (c, off) => (function* () { for (;;) { c.target = { x: mid.x + Math.cos(t * 1.2 + off) * 10, y: mid.y + Math.sin(t * 2.4 + off) * 6 }; c.speed = 10; c.wanderT = 99; yield 'move'; } })();
+  a.act(twirl(a, 0)); b.act(twirl(b, Math.PI));
+  let hearts = 0;
+  while (t < 9) { const dt = yield; t += dt; if (t > 2 + hearts * 3 && hearts < 2) { hearts++; heartBubbles(mid.x, mid.y - 14); } }
+  a.brain = null; a.act(seahorseLife(a));
+  b.act((function* () { b.emote('heart', 1.5); yield* swimTo(b, dir > 0 ? -14 : W + 14, b.y - 10, 7, 40); b.dead = true; })());
+  yield* until(() => b.dead, 40);
+  b.dead = true;
+}
+
+// Pearl finder: a pearl sinks, the crab claims it, a nosy goldfish gets snipped at
+function* crab() {
+  const c = amb.crab;
+  const pearl = { x: rand(W * 0.15, W * 0.85), y: SURF + 2, vy: 0, floor: c.floorY - 1, taken: false };
+  const fx = addFx({ layer: 'ground', dur: 1e9, draw() { if (pearl.taken) return; const X = Math.round(pearl.x), Y = Math.round(pearl.y); rect(X - 1, Y - 1, 3, 3, INK); px(X, Y, '#ffffff'); px(X - 1, Y, '#e8f0ff'); if (Math.sin(world.t * 4) > 0.6) px(X + 2, Y - 2, '#ffffff'); } });
+  while (pearl.y < pearl.floor) { const dt = yield; pearl.vy = lerp(pearl.vy, 14, dt); pearl.y += pearl.vy * dt; pearl.x += Math.sin(world.t * 3) * 3 * dt; }
+  for (let i = 0; i < 6; i++) addPart(pearl.x, pearl.y, rand(-8, 8), rand(-4, -1), 0.6, '#f0dca0');
+  c.emote('bang', 1);
+  c.act((function* () {
+    while (Math.abs(c.x - pearl.x) > 2) { c.vx = Math.sign(pearl.x - c.x) * 24; c.frame = Math.floor(world.t * 12) % 2 ? 'a' : 'b'; yield; }
+    c.vx = 0; pearl.taken = true; c.carry = true; c.emote('sparkle', 1.6); c.frame = 'snip';
+    yield* wait(1.2);
+    c.frame = 'a';
+  })());
+  yield* until(() => !c.brain, 30);
+  const g = bigFish().find(e => e.kind === 'gold') || bigFish()[0];
+  if (g) {
+    g.act(swimTo(g, c.x + 10, c.y - 12, 12, 14));
+    yield* until(() => !g.brain, 15);
+    g.act((function* () { g.facing = -1; g.emote('q', 1.2); yield* hold(g, 1.2); })());
+    yield* wait(1);
+    c.act((function* () { for (let t = 0; t < 0.9; t += 1 / 30) { c.frame = Math.floor(t * 10) % 2 ? 'snip' : 'a'; yield; } c.emote('bang', 1); })());
+    yield* wait(0.4);
+    g.brain = null; g.emote('bang', 1); scare(c.x, c.y - 6, 30, 0.8);
+    yield* wait(1.5);
+  }
+  const ch = scene.decor.chest;
+  c.act((function* () { while (Math.abs(c.x - ch.x) > 3) { c.vx = Math.sign(ch.x - c.x) * 14; c.frame = Math.floor(world.t * 8) % 2 ? 'a' : 'b'; yield; } c.vx = 0; c.frame = 'a'; })());
+  yield* until(() => !c.brain, 40);
+  ch.target = 1; yield* wait(0.6);
+  c.carry = null; c.emote('heart', 1.8);
+  for (let i = 0; i < 8; i++) addPart(ch.x + rand(-5, 5), ch.y - 10, rand(-8, 8), rand(-14, -4), 1, ['#ffffff', '#fff4b0'], { drag: 0.5 });
+  yield* wait(1.2); ch.target = 0;
+  fx.dur = 0; c.brain = null;
+}
+
+// Treasure burst: the chest pops open with a gush of bubbles and fish play in the stream
+function* chest() {
+  const ch = scene.decor.chest;
+  for (let i = 0; i < 3; i++) { ch.target = 0.25; yield* wait(0.15); ch.target = 0; yield* wait(0.3); }
+  ch.target = 1;
+  world.flash = 0.1;
+  for (let i = 0; i < 50; i++) later(() => { bubble(ch.x + rand(-5, 5), ch.y - 12, chance(0.6)); if (chance(0.3)) addPart(ch.x + rand(-4, 4), ch.y - 12, rand(-10, 10), rand(-25, -10), 1.2, ['#fff4b0', '#ffd040'], { drag: 0.6 }); }, i * 0.08);
+  const S = amb.schools[0];
+  S.override = { x: ch.x, y: ch.y - 40 };
+  const players = bigFish().slice(0, 2);
+  let t = 0;
+  for (const f of players) f.act((function* () { for (;;) { f.target = { x: ch.x + Math.sin(t * 2 + f.bob) * 14, y: ch.y - 20 - ((t * 20 + f.bob * 10) % 60) }; f.speed = 16; f.wanderT = 99; yield 'move'; } })());
+  while (t < 7) { const dt = yield; t += dt; S.override = { x: ch.x + Math.sin(t) * 10, y: ch.y - 30 - ((t * 15) % 50) }; if (chance(dt * 0.6)) pick(players)?.emote('heart', 1.2); }
+  S.override = null; players.forEach(f => { f.brain = null; f.target = null; });
+  ch.target = 0;
+}
+
+// ---------------------------------------------------------------- RARE EVENTS
+function ditherRing(cx, cy, r, color, alpha) {
+  if (alpha <= 0 || r < 0.5) return;
+  const n = Math.max(8, Math.ceil(r * 7));
+  ctx.fillStyle = color;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2, X = Math.round(cx + Math.cos(a) * r), Y = Math.round(cy + Math.sin(a) * r * 0.8);
+    if (bayer(X, Y) < alpha) ctx.fillRect(X, Y, 1, 1);
+  }
+}
+function* alarmWait(s) { while (s > 0) { world.alarm = 2; s -= yield; } }
+
+// Shark! Everyone hides. The shark looks around... and a tiny brave fish scares it off.
+function* shark() {
+  const dir = coin(), y = rand(TOP() + 30, BOT() - 30);
+  const s = new Swimmer('shark', { x: dir > 0 ? -30 : W + 30, y, speed: 14, accel: 0.6, facing: dir, z: 0.9 });
+  s.threat = true; s.scareR = 70; s.brave = true;
+  world.alarm = 2;
+  yield* alarmWait(2);
+  s.act(swimTo(s, W / 2 + rand(-40, 40), y, 14, 40));
+  while (s.brain) { world.alarm = 2; yield; }
+  s.act((function* () { for (;;) yield* hold(s, 1); })());
+  yield* alarmWait(1); s.facing *= -1; s.emote('q', 1.4);
+  yield* alarmWait(1.6); s.facing *= -1;
+  yield* alarmWait(1);
+  const brave = new Swimmer('tetra', { set: SPR.tetra[1], x: s.x + s.facing * 100, y: s.y - 3, speed: 18, brave: true });
+  brave.act((function* () {
+    for (;;) {
+      const tx = s.x + s.facing * 25, ty = s.y - 2, dx = tx - brave.x, dy = ty - brave.y, d = Math.hypot(dx, dy);
+      if (d < 2) break;
+      brave.vx = dx / d * 16; brave.vy = dy / d * 16;
+      yield 'hold';
+    }
+    brave.vx = 0; brave.vy = 0; brave.facing = -s.facing;
+    yield* hold(brave, 0.8);
+    brave.emote('bang', 1.4);
+    yield* hold(brave, 2);
+  })());
+  while (brave.brain && brave.emotes.every(e => e.name !== 'bang')) { world.alarm = 2; yield; }
+  yield* alarmWait(0.4);
+  s.emote('bang', 1.2);
+  const away = -s.facing;
+  s.threat = false;
+  s.act((function* () { for (;;) { s.facing = away; s.vx = away * 80; s.vy = -5; for (let i = 0; i < 2; i++) bubble(s.x - away * 20, s.y + rand(-3, 3)); yield 'hold'; if (s.x < -55 || s.x > W + 55) { s.dead = true; return; } } })());
+  yield* until(() => s.dead, 10);
+  s.dead = true;
+  brave.emote('sparkle', 2);
+  world.alarm = 0;
+  yield* wait(1);
+  for (const f of world.ents.filter(e => e instanceof Swimmer && e.layer === 'mid')) later(() => f.emote('heart', 1.5), rand(0, 1.5));
+  brave.brain = null; brave.brave = false;
+  brave.act((function* () { yield* swimTo(brave, brave.x < W / 2 ? -12 : W + 12, brave.y, 20, 30); brave.dead = true; })());
+  yield* until(() => brave.dead, 30);
+  brave.dead = true;
+}
+
+// Lights out: the tank dims, fish doze, glowing jellies and an anglerfish come out, plankton sparkles
+function* night() {
+  let t = 0;
+  while (t < 6) { t += yield; world.dark = (t / 6) * 0.82; }
+  const fish = world.ents.filter(e => e instanceof Swimmer && ['tang', 'gold', 'angel', 'puffer', 'clown'].includes(e.kind));
+  const speeds = fish.map(f => f.speed);
+  fish.forEach(f => (f.speed = 3));
+  amb.schools.forEach(s => (s.speed = 6));
+  const dir = coin();
+  const ang = new Swimmer('angler', { x: dir > 0 ? -15 : W + 15, y: rand(BOT() - 40, BOT() - 10), speed: 7, facing: dir, brave: true });
+  ang.glowDraw = () => {
+    const lx = ang.x + ang.facing * 8, ly = ang.y - 8, p = 0.5 + Math.sin(world.t * 3) * 0.2;
+    ctx.globalAlpha = world.dark * p * 0.5; ctx.fillStyle = '#e8ffa0'; ctx.beginPath(); ctx.arc(lx, ly, 9, 0, 6.283); ctx.fill();
+    ctx.globalAlpha = 1; px(lx, ly, '#ffffff'); px(lx + 1, ly, '#f4ffc0'); px(lx, ly + 1, '#f4ffc0');
+  };
+  const js = [];
+  for (let i = 0; i < 3; i++) js.push(new Jelly({ glow: true, x: rand(W * 0.15, W * 0.85), y: rand(TOP() + 20, BOT()), drift: rand(-2, 2) }));
+  t = 0;
+  while (t < 32) {
+    const dt = yield; t += dt;
+    if (chance(dt * 6)) addPart(rand(0, W), rand(TOP(), SAND), rand(-2, 2), rand(-3, 0), rand(2, 4), ['#aaffe8', '#6affd0', '#3ac8b0'], { glow: true, wob: 3 });
+    if (chance(dt * 0.6)) pick(fish)?.emote('z', 1.4);
+  }
+  js.forEach(j => (j.leaving = true));
+  ang.act((function* () { yield* swimTo(ang, ang.x < W / 2 ? -20 : W + 20, ang.y, 9, 40); ang.dead = true; })());
+  t = 0;
+  while (t < 6) { t += yield; world.dark = 0.82 * (1 - t / 6); }
+  world.dark = 0;
+  fish.forEach((f, i) => (f.speed = speeds[i]));
+  amb.schools.forEach((s, i) => (s.speed = i ? 14 : 20));
+  if (!ang.dead) ang.dead = true;
+  js.forEach(j => (j.dead = true));
+  for (const f of fish) later(() => f.emote('sparkle', 1.2), rand(0, 2));
+}
+
+// Sea turtle: glides through, stops to munch some kelp, the school tags along behind it
+function* turtle() {
+  const dir = coin(), tu = new Swimmer('turtle', { x: dir > 0 ? -20 : W + 20, y: rand(TOP() + 25, BOT() - 40), speed: 9, accel: 0.5, facing: dir, brave: true });
+  const kelp = scene.weeds.filter(p => p.type === 'kelp').sort((a, b) => Math.abs(a.x - W / 2) - Math.abs(b.x - W / 2))[0];
+  const S = amb.schools[0];
+  tu.act((function* () {
+    if (kelp) {
+      yield* swimTo(tu, kelp.x - dir * 13, clamp(kelp.y - kelp.h * 0.6, TOP() + 10, BOT() - 10), 9, 40);
+      tu.facing = dir; tu.emote('heart', 1.6);
+      yield* hold(tu, 4, t => { if (Math.floor(t * 3) !== Math.floor((t - 1 / 30) * 3)) addPart(tu.x + dir * 12, tu.y + 1, dir * rand(2, 6), rand(-3, 3), 1.5, '#5aba48', { drag: 0.5 }); });
+    }
+    yield* swimTo(tu, dir > 0 ? W + 25 : -25, tu.y - 15, 10, 60);
+    tu.dead = true;
+  })());
+  while (!tu.dead) { S.override = { x: tu.x - tu.facing * 26, y: tu.y + 6 }; yield; }
+  S.override = null;
+}
+
+// Toy submarine: descends with its searchlight, scans the tank, finds the treasure, heads home
+function* submarine() {
+  const ch = scene.decor.chest, x0 = clamp(ch.x + coin() * rand(40, 70), 20, W - 20);
+  const sub = new Swimmer('sub', { x: x0, y: SURF + 6, speed: 10, accel: 1, facing: Math.sign(ch.x - x0) || 1, brave: true });
+  const light = addFx({ layer: 'front', dur: 1e9, draw() {
+    if (sub.dead) return;
+    ctx.globalCompositeOperation = 'lighter';
+    const nx = sub.x + sub.facing * 11, ny = sub.y + 2;
+    for (let i = 2; i < 60; i += 2) {
+      const X = nx + sub.facing * i, Y = ny + i * 0.45, w = i * 0.4;
+      ctx.globalAlpha = 0.1 * (1 - i / 60); ctx.fillStyle = '#fff8c0';
+      ctx.fillRect(Math.round(Math.min(X, X + sub.facing * 2)), Math.round(Y - w), 2, Math.round(w * 2));
+    }
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  } });
+  const curious = bigFish().slice(0, 2);
+  sub.act((function* () {
+    while (sub.y < ch.y - 28) { sub.vx = 0; sub.vy = 10; if (chance(0.3)) bubble(sub.x - sub.facing * 12, sub.y); yield 'hold'; }
+    curious.forEach(f => f.act((function* () { yield* swimTo(f, sub.x + rand(-25, 25), sub.y - rand(10, 18), 12, 12); f.emote('q', 1.4); yield* hold(f, 2); })()));
+    yield* swimTo(sub, ch.x - sub.facing * 20, ch.y - 22, 8, 20);
+    sub.facing = Math.sign(ch.x - sub.x) || 1;
+    yield* hold(sub, 1.5);
+    ch.target = 1; sub.emote('sparkle', 2);
+    for (let i = 0; i < 20; i++) later(() => addPart(ch.x + rand(-5, 5), ch.y - 10, rand(-10, 10), rand(-20, -5), 1.2, ['#fff4b0', '#ffd040'], { drag: 0.5 }), i * 0.08);
+    yield* hold(sub, 2.5);
+    ch.target = 0; sub.emote('heart', 1.5);
+    yield* hold(sub, 1);
+    for (;;) { sub.vy = -12; sub.vx = 0; if (chance(0.4)) bubble(sub.x - sub.facing * 12, sub.y); yield 'hold'; if (sub.y <= SURF + 7) { sub.dead = true; for (let i = 0; i < 10; i++) addPart(sub.x + rand(-8, 8), SURF, rand(-10, 10), rand(-12, -4), 0.5, '#ffffff'); return; } }
+  })());
+  yield* until(() => sub.dead, 60);
+  sub.dead = true; light.dur = 0;
+}
+
+// Whale song: an enormous whale glides past far behind the rocks, singing
+let WHALE = null;
+function whaleSprite(L) {
+  const h = Math.round(L * 0.2), c = mk(L, h + 4), g = c.getContext('2d');
+  for (let y = 0; y < h + 4; y++) for (let x = 0; x < L; x++) {
+    const u = x / L, half = h * 0.5 * Math.pow(Math.sin(Math.PI * Math.min(1, u * 1.15)), 0.6) * (u > 0.85 ? 1 - (u - 0.85) * 2 : 1);
+    const cy = h * 0.55, dy = y - cy;
+    if (Math.abs(dy) > half || u < 0.02) continue;
+    g.fillStyle = dy > half * 0.35 ? (y % 3 === 0 ? '#3a88b4' : '#2e7aa8') : dy < -half * 0.6 ? '#246a98' : '#1e5e8c';
+    g.fillRect(x, y, 1, 1);
+  }
+  g.fillStyle = '#e8f4ff'; g.fillRect(Math.round(L * 0.8), Math.round(h * 0.45), 2, 2);
+  g.fillStyle = '#1e5e8c'; for (let i = 0; i < 10; i++) g.fillRect(Math.round(L * 0.55) - i, Math.round(h * 0.8) + Math.round(i * 0.5), 3, 1);
+  return c;
+}
+function* whale() {
+  const dir = coin(), L = Math.round(W * 0.5);
+  WHALE = WHALE && WHALE.width === L ? WHALE : whaleSprite(L);
+  const img = WHALE, flip = mk(img.width, img.height);
+  { const g = flip.getContext('2d'); g.translate(img.width, 0); g.scale(-1, 1); g.drawImage(img, 0, 0); }
+  const w = { layer: 'far', dead: false, x: dir > 0 ? -L - 30 : W + 30, y: SAND - 60, t: 0, songT: 3,
+    update(dt) { this.t += dt; this.x += dir * 11 * dt; this.y = SAND - 60 + Math.sin(this.t * 0.3) * 6;
+      if ((this.songT -= dt) <= 0) { this.songT = rand(5, 7); const hx = this.x + (dir > 0 ? L * 0.85 : L * 0.15), hy = this.y + 12;
+        for (let i = 0; i < 3; i++) addFx({ layer: 'far', t: -i * 0.5, dur: 3.5, draw(f) { ditherRing(hx, hy, 4 + f.t * 20, '#bff0ff', (1 - f.t / 3.5) * 0.7); } }); }
+      if (dir > 0 ? this.x > W + 20 : this.x < -L - 20) this.dead = true; },
+    draw() {
+      const X = Math.round(this.x), Y = Math.round(this.y), tailX = dir > 0 ? X : X + L, flap = Math.sin(this.t * 1.2) * 6;
+      ctx.drawImage(dir > 0 ? img : flip, X, Y);
+      ctx.fillStyle = '#1e5e8c';
+      for (let i = 0; i < 14; i++) { const k = i / 14, tx = tailX - dir * (i + 2), ty = Y + img.height * 0.55 + flap * k; ctx.fillRect(Math.round(tx), Math.round(ty - k * 8), 1, Math.round(1 + k * 16)); }
+    } };
+  world.ents.push(w);
+  let reacted = false;
+  while (!w.dead) {
+    yield;
+    if (!reacted && Math.abs(w.x + L / 2 - W / 2) < 30) {
+      reacted = true;
+      for (const f of world.ents.filter(e => e instanceof Swimmer && e.layer === 'mid')) later(() => f.emote(chance(0.5) ? 'note' : 'heart', 1.6), rand(0, 2));
+      for (let i = 0; i < 20; i++) later(() => bubble(w.x + (dir > 0 ? L * 0.75 : L * 0.25) + rand(-4, 4), w.y, true), i * 0.1);
+    }
+  }
+}
+
+const COMMON = { feeding: 2, eel: 1.6, puffer: 1.6, octopus: 1.6, jellies: 1.3, cleaning: 1.3, seahorses: 1.3, crab: 1.4, chest: 1.3 };
+const RARE = { shark: 1, night: 1, turtle: 1, submarine: 1, whale: 1 };
+const EVENTS = { feeding, eel, puffer, octopus, jellies, cleaning, seahorses, crab, chest, shark, night, turtle, submarine, whale };
+const ALL_EVENTS = Object.keys(EVENTS);
+
+// ---------------------------------------------------------------- director
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+const director = { cur: null, name: '', cool: 5, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 3 : rand(12, 24); }
+  } else if ((director.cool -= dt) <= 0) {
+    let name;
+    if (FORCE) name = FORCE === 'all' ? ALL_EVENTS[director.idx++ % ALL_EVENTS.length] : FORCE;
+    else do { name = chance(0.15) ? weighted(RARE) : weighted(COMMON); } while (name === director.last);
+    if (!EVENTS[name]) return;
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; }
+  }
+}
+
+// ---------------------------------------------------------------- main loop
+function update(dt) {
+  world.t += dt;
+  world.alarm = Math.max(0, world.alarm - dt);
+  world.flash = Math.max(0, world.flash - dt * 1.5);
+  world.current = lerp(world.current, 0, dt * 0.3);
+  runDirector(dt);
+  ambientTick(dt);
+  for (const e of [...world.ents]) if (!e.dead) e.update(dt);
+  for (const p of world.parts) {
+    if (p.bubble) {
+      p.y += p.vy * dt; p.x += (Math.sin(world.t * 5 + p.ph) * 6 + world.current * 20) * dt;
+      if (p.y < SURF + 2) { p.life = 0; addPart(p.x, SURF + 1, -6, -4, 0.25, '#ffffff'); addPart(p.x, SURF + 1, 6, -4, 0.25, '#ffffff'); }
+      continue;
+    }
+    p.life -= dt;
+    if (p.drag !== 1) { const k = Math.pow(p.drag, dt); p.vx *= k; p.vy *= k; }
+    p.vy += p.grav * dt;
+    p.x += (p.vx + (p.wob ? Math.sin(world.t * 3 + p.ph) * p.wob : 0)) * dt; p.y += p.vy * dt;
+    if (p.floor !== null && p.y > p.floor) { p.y = p.floor; p.vy = 0; p.vx *= 0.9; }
+  }
+  for (const f of world.fx) f.t += dt;
+  const done = world.fx.filter(f => f.t > f.dur && f.done);
+  world.ents = world.ents.filter(e => !e.dead);
+  world.parts = world.parts.filter(p => p.life > 0);
+  world.fx = world.fx.filter(f => f.t <= f.dur);
+  for (const f of done) f.done();
+}
+function drawParts(glow) {
+  for (const p of world.parts) {
+    if (p.bubble) {
+      if (glow) continue;
+      const X = Math.round(p.x), Y = Math.round(p.y);
+      if (p.big) { px(X - 1, Y, '#d8f6ff'); px(X + 1, Y, '#a8e4f8'); px(X, Y - 1, '#d8f6ff'); px(X, Y + 1, '#a8e4f8'); px(X - 1, Y - 1, '#ffffff'); }
+      else { px(X, Y, '#d8f6ff'); }
+      continue;
+    }
+    if (p.glow !== glow) continue;
+    const k = p.life / p.max, X = Math.round(p.x), Y = Math.round(p.y);
+    if (p.fade && k < 0.4 && bayer(X, Y) > k * 2.5) continue;
+    ctx.fillStyle = Array.isArray(p.col) ? p.col[Math.min(p.col.length - 1, Math.floor((1 - k) * p.col.length))] : p.col;
+    ctx.fillRect(X, Y, p.size, p.size);
+  }
+}
+function drawFx(layer) { for (const f of world.fx) if (f.layer === layer && f.t >= 0 && f.draw) f.draw(f); }
+function drawRays() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const r of scene.rays) {
+    const a = 0.05 + 0.03 * Math.sin(world.t * r.sp + r.ph);
+    for (let y = SURF; y < SAND; y += 2) {
+      const k = (y - SURF) / (SAND - SURF), X = r.x + (y - SURF) * 0.35, w = r.w * (1 + k * 0.8);
+      ctx.globalAlpha = a * (1 - k);
+      ctx.fillStyle = '#e8ffff';
+      ctx.fillRect(Math.round(X), y, Math.round(w), 2);
+    }
+    r.x += r.sp * 0.05; if (r.x > W + 20) r.x = -60;
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+function drawSurface() {
+  for (let x = 0; x < W; x++) {
+    const y = SURF + Math.round(Math.sin(x * 0.12 + world.t * 1.6) * 1 + Math.sin(x * 0.05 - world.t) * 0.8);
+    px(x, y, '#ffffff'); px(x, y + 1, '#9ae8f8');
+  }
+  // caustic sparkles on the sand
+  for (let i = 0; i < W / 10; i++) {
+    const x = (i * 37.3 + Math.sin(world.t * 0.4 + i) * 6) % W, y = SAND + 2 + ((i * 13) % Math.max(1, H - SAND - 4));
+    if (Math.sin(world.t * 1.3 + i * 2.1) > 0.6) { ctx.globalAlpha = 0.5; rect(x, y, 3, 1, '#fffbe0'); ctx.globalAlpha = 1; }
+  }
+}
+function render(dt) {
+  ctx.drawImage(scene.bg, 0, 0);
+  drawRays();
+  drawFx('far');
+  for (const e of world.ents) if (e.layer === 'far') e.draw();
+  // back fish, then a haze of water in front of them for depth
+  for (const e of world.ents) if (e.layer === 'back') e.draw();
+  ctx.globalAlpha = 0.35; rect(0, SURF, W, SAND - SURF, '#2a86b8'); ctx.globalAlpha = 1;
+  ctx.drawImage(scene.sand, 0, 0);
+  drawSurface();
+  drawDecor();
+  drawFx('ground');
+  const list = world.ents.filter(e => e.layer === 'mid' || e.layer === 'floor').sort((a, b) => (a.layer === 'floor' ? a.y + 1000 : a.z ?? 0) - (b.layer === 'floor' ? b.y + 1000 : b.z ?? 0));
+  for (const p of scene.weeds) if (!p.front) drawPlant(p);
+  for (const e of list) e.draw();
+  drawFood();
+  drawParts(false);
+  for (const p of scene.weeds) if (p.front) drawPlant(p);
+  for (const e of world.ents) if (e.layer === 'front') e.draw();
+  drawFx('front');
+  if (world.dark > 0.01) {
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = mixHex('#ffffff', '#1a2250', world.dark);
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  for (const e of world.ents) if (e.glowDraw) e.glowDraw();
+  drawParts(true);
+  drawFx('glow');
+  if (world.flash > 0.01) { ctx.globalAlpha = world.flash * 0.5; rect(0, 0, W, H, '#ffffff'); ctx.globalAlpha = 1; }
+  if (DEBUG) { ctx.fillStyle = '#fff'; ctx.font = '8px monospace'; ctx.fillText(`${director.name || '-'}  ents:${world.ents.length} parts:${world.parts.length}`, 3, 9); }
+}
+function resize() {
+  H = ROWS;
+  W = Math.round((ROWS * innerWidth) / innerHeight);
+  SURF = 8;
+  SAND = Math.round(H * 0.82);
+  canvas.width = W; canvas.height = H;
+  ctx.imageSmoothingEnabled = false;
+  world.ents = []; world.parts = []; world.fx = []; world.food = [];
+  buildBackground(); buildSand(); buildPlants(); buildDecor();
+  populate();
+}
+addEventListener('resize', resize);
+resize();
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  try { update(dt); render(dt); } catch (e) { console.error(e); }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

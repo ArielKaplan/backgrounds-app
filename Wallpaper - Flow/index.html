@@ -1,0 +1,121 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Flowing Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { width: 100vw; height: 100vh; display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Palettes: [sky top, sky bottom, back layer, mid layer, front layer]
+// Pick one with a URL hash, e.g. wallpaper.html#dusk  (default: sequoia)
+const PALETTES = {
+  sequoia: ['#1b0f3b', '#e8638b', '#7a3fb8', '#d9486e', '#f2a65a'],
+  sonoma:  ['#0e3b43', '#9fd8c7', '#2f7f79', '#4fb39b', '#e7c873'],
+  dusk:    ['#0b1026', '#f28c6a', '#3b2a6b', '#8e3e7e', '#f4b183'],
+  ocean:   ['#021526', '#3fa7d6', '#0b4f8a', '#1f7fb8', '#7fd1e8'],
+  aurora:  ['#050b1a', '#1a3a4a', '#1bbf8a', '#3a7bd5', '#b36ae2'],
+  mono:    ['#0c0c0e', '#5a5a64', '#2a2a30', '#44444c', '#8a8a94'],
+};
+const params = new URLSearchParams(location.hash.slice(1).includes('=') ? location.hash.slice(1) : '');
+const name = params.get('palette') || location.hash.slice(1).split('&')[0] || 'sequoia';
+const palette = PALETTES[name] || PALETTES.sequoia;
+const SPEED = parseFloat(params.get('speed')) || 1;   // 0.5 = slower, 2 = faster
+const SCALE = 0.5;   // render at half resolution — soft shapes don't need more, saves GPU
+const FPS = 30;
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, powerPreference: 'low-power' });
+
+const frag = `
+precision highp float;
+uniform vec2 r;
+uniform float t;
+uniform vec3 c0, c1, c2, c3, c4;
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / r;
+  float ar = r.x / r.y;
+  float x = uv.x * ar;
+
+  // Sky gradient with a slow glow drifting across it
+  vec3 col = mix(c1, c0, smoothstep(0.0, 1.0, uv.y));
+  vec2 glowPos = vec2(ar * (0.5 + 0.3 * sin(t * 0.03)), 0.62 + 0.05 * cos(t * 0.04));
+  col += c1 * 0.35 * exp(-length(vec2(x, uv.y) - glowPos) * 3.0);
+
+  // Layered ribbons, back to front
+  for (int k = 0; k < 5; k++) {
+    float i = float(4 - k);
+    float f = i / 4.0;
+    vec3 lc = f > 0.5 ? mix(c3, c2, (f - 0.5) * 2.0) : mix(c4, c3, f * 2.0);
+
+    float y = 0.18 + i * 0.13
+      + 0.07 * sin(x * (1.1 + i * 0.25) + t * (0.06 + i * 0.015) + i * 1.9)
+      + 0.035 * sin(x * (2.6 - i * 0.3) - t * (0.08 - i * 0.01) + i * 4.1)
+      + 0.015 * sin(x * 5.3 + t * 0.11 + i * 2.3);
+
+    float d = uv.y - y;
+    float fill = smoothstep(0.006, -0.006, d);
+    float shade = 0.62 + 0.45 * exp(d * 7.0);          // brighter near the crest
+    col = mix(col, lc * shade, fill * 0.92);
+    col += lc * 0.35 * exp(-abs(d) * 90.0);           // soft glassy edge highlight
+  }
+
+  // Gentle vignette + film grain to prevent color banding
+  col *= 0.85 + 0.15 * smoothstep(1.2, 0.2, length(uv - 0.5));
+  col += (hash(gl_FragCoord.xy + fract(t)) - 0.5) / 128.0;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, 'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}'));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, frag));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+const hex = h => [1,3,5].map(i => parseInt(h.slice(i, i+2), 16) / 255);
+['c0','c1','c2','c3','c4'].forEach((u, i) => gl.uniform3fv(gl.getUniformLocation(prog, u), hex(palette[i])));
+const uR = gl.getUniformLocation(prog, 'r');
+const uT = gl.getUniformLocation(prog, 't');
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * dpr * SCALE);
+  canvas.height = Math.round(innerHeight * dpr * SCALE);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(uR, canvas.width, canvas.height);
+}
+addEventListener('resize', resize);
+resize();
+
+let last = 0;
+const start = performance.now() - Math.random() * 600000; // start at a random point in the loop
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS) return;
+  last = now;
+  gl.uniform1f(uT, (now - start) / 1000 * SPEED);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

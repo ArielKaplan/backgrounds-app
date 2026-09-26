@@ -1,0 +1,1877 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel Sheep Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9ad4f5; }
+  canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL SHEEP — a flock of very fluffy, not very bright sheep
+   Options (add to the end of the address):
+     #pixels=190        vertical resolution in big pixels (smaller = bigger sheep)
+     #event=follow      test mode: repeat one event (or "all" to cycle through every event)
+     #speed=3           run time faster (for testing)
+     #debug             show the current event name
+   Events: follow stack butterfly chorus dog nap stuck ball pronk faint
+   Rare:   shear wolf float count snow
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const ROWS = parseInt(params.get('pixels')) || 190;
+const FORCE = params.get('event');
+const TIME_SCALE = parseFloat(params.get('speed')) || 1;
+const DEBUG = params.has('debug');
+const FPS = 30, G = 420;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, HY, GY;   // HY = horizon, GY = top of the ground strip the flock walks along
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const coin = () => (Math.random() < 0.5 ? 1 : -1);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+function mk(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+function mixHex(a, b, t) { const A = hexRgb(a), B = hexRgb(b); return `rgb(${A.map((v, i) => Math.round(v + (B[i] - v) * t))})`; }
+function px(x, y, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+const PERM = Array.from({ length: 512 }, () => Math.random());
+const h2 = (x, y) => PERM[((x * 73856093) ^ (y * 19349663)) & 511];
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = h2(xi, yi), b = h2(xi + 1, yi), c = h2(xi, yi + 1), d = h2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
+// ---------------------------------------------------------------- pixel font (3x5)
+const FONT = {
+  A: '.X.X.XXXXX.XX.X', B: 'XX.X.XXX.X.XXX.', C: '.XXX..X..X...XX', D: 'XX.X.XX.XX.XXX.', E: 'XXXX..XX.X..XXX', F: 'XXXX..XX.X..X..',
+  G: '.XXX..X.XX.X.XX', H: 'X.XX.XXXXX.XX.X', I: 'XXX.X..X..X.XXX', J: '..X..X..XX.X.X.', K: 'X.XX.XXX.X.XX.X', L: 'X..X..X..X..XXX',
+  M: 'X.XXXXXXXX.XX.X', N: 'XX.X.XX.XX.XX.X', O: '.X.X.XX.XX.X.X.', P: 'XX.X.XXX.X..X..', Q: '.X.X.XX.XXX..XX', R: 'XX.X.XXX.X.XX.X',
+  S: '.XXX...X...XXX.', T: 'XXX.X..X..X..X.', U: 'X.XX.XX.XX.XXXX', V: 'X.XX.XX.XX.X.X.', W: 'X.XX.XXXXXXXX.X', X: 'X.XX.X.X.X.XX.X',
+  Y: 'X.XX.X.X..X..X.', Z: 'XXX..X.X.X..XXX', 0: 'XXXX.XX.XX.XXXX', 1: '.X.XX..X..X.XXX', 2: 'XX...X.X.X..XXX', 3: 'XX...X.X...XXX.',
+  4: 'X.XX.XXXX..X..X', 5: 'XXXX..XX...XXX.', 6: '.XXX..XXXX.XXXX', 7: 'XXX..X.X..X..X.', 8: 'XXXX.XXXXX.XXXX', 9: 'XXXX.XXXX..XXX.',
+  '!': '.X..X..X.....X.', '-': '......XXX......', '.': '.............X.', '?': 'XX...X.X.....X.', ' ': '...............', '~': '...XX.X.XX.....',
+};
+const textW = s => s.length * 4 - 1;
+function text(str, x, y, col = '#ffffff', shadow = '#3d3140') {
+  str = String(str).toUpperCase();
+  const draw = (ox, oy, c) => { ctx.fillStyle = c; for (let i = 0; i < str.length; i++) { const gl = FONT[str[i]] || FONT['?']; for (let k = 0; k < 15; k++) if (gl[k] === 'X') ctx.fillRect(Math.round(x + ox + i * 4 + (k % 3)), Math.round(y + oy + Math.floor(k / 3)), 1, 1); } };
+  if (shadow) draw(1, 1, shadow);
+  draw(0, 0, col);
+}
+
+// ---------------------------------------------------------------- world
+const world = { t: 0, ents: [], parts: [], fx: [], dark: 0, gloom: 0, wind: 0.3, windBase: 0.3, gust: 0, snow: 0, snowCover: 0, flash: 0 };
+function addPart(x, y, vx, vy, life, col, o = {}) {
+  if (world.parts.length > 1200) world.parts.splice(0, 150);
+  world.parts.push({ x, y, vx, vy, life, max: life, col, drag: o.drag ?? 1, grav: o.grav ?? 0, floor: o.floor ?? null, size: o.size || 1, fade: o.fade ?? true, wind: o.wind ?? 0, flutter: o.flutter ?? 0, glow: o.glow ?? false, ph: rand(0, 6.28) });
+}
+function addFx(f) { f.t = f.t ?? 0; f.layer = f.layer || 'front'; world.fx.push(f); return f; }
+function later(fn, secs) { addFx({ dur: secs, layer: 'none', done: fn }); }
+function popText(x, y, s, col = '#ffffff', dur = 1.4) {
+  addFx({ layer: 'front', dur, draw(f) { if (f.t > dur - 0.3 && Math.floor(f.t * 12) % 2) return; text(s, Math.round(x - textW(s) / 2), Math.round(y - 6 - Math.min(1, f.t * 3) * 4), col); } });
+}
+function dust(x, y, n = 6, col = ['#e8dcc0', '#c8b890']) { for (let i = 0; i < n; i++) addPart(x + rand(-5, 5), y, rand(-14, 14), rand(-10, -2), rand(0.3, 0.6), col, { drag: 0.2 }); }
+function woolFluff(x, y, n = 6) { for (let i = 0; i < n; i++) addPart(x + rand(-5, 5), y + rand(-4, 2), rand(-10, 10), rand(-14, -2), rand(0.8, 1.6), ['#ffffff', '#eeeaf4'], { drag: 0.5, grav: 8, flutter: 6 }); }
+
+// ---------------------------------------------------------------- scenery
+const scene = { bg: null, props: null, flowers: [], clouds: [], sun: { x: 0, y: 0 }, stars: [], tree: null };
+let plats = [], GROUND, CLIFF, BOULDER, HAY_LOW, HAY_TOP, FENCE, STUMP, props = {};
+
+function addPlat(x0, x1, y, kind, o = {}) { const p = { x0, x1, y, kind, ...o }; plats.push(p); return p; }
+function layoutProps() {
+  plats = []; props = {};
+  GROUND = addPlat(-60, W + 60, GY, 'ground', { ground: true });
+  const side = coin(), cw = 46, ch = 38;
+  props.cliff = { side, x0: side < 0 ? -4 : W - cw, x1: side < 0 ? cw : W + 4, top: GY - ch };
+  CLIFF = addPlat(props.cliff.x0, props.cliff.x1, GY - ch, 'cliff', { wall: side < 0 ? 'L' : 'R' });   // the screen edge acts like a wall
+  const bw = 26, bh = 16, bx = side < 0 ? cw + 4 : W - cw - 4 - bw;
+  props.boulder = { x: bx, w: bw, h: bh };
+  BOULDER = addPlat(bx + 4, bx + bw - 4, GY - bh + 1, 'boulder');
+  const a = side < 0 ? bx + bw + 8 : 8, b = side < 0 ? W - 8 : bx - 8;
+  let items = shuffle(['hay', 'fence', 'stump']);
+  const widths = { hay: 36, fence: 42, stump: 12 };
+  if (items.reduce((s, k) => s + widths[k], 0) + 40 > b - a) items = items.filter(k => k !== 'stump');
+  const free = (b - a) - items.reduce((s, k) => s + widths[k], 0), gap = free / (items.length + 1);
+  let x = a + gap;
+  for (const k of items) {
+    const X = Math.round(x + rand(-gap * 0.25, gap * 0.25));
+    if (k === 'hay') {
+      const dir = coin();
+      props.hay = { x: X, dir };
+      if (dir > 0) { HAY_LOW = addPlat(X, X + 18, GY - 10, 'hay', { wall: 'R' }); HAY_TOP = addPlat(X + 18, X + 36, GY - 21, 'hay'); }
+      else { HAY_LOW = addPlat(X + 18, X + 36, GY - 10, 'hay', { wall: 'L' }); HAY_TOP = addPlat(X, X + 18, GY - 21, 'hay'); }
+    } else if (k === 'fence') {
+      props.fence = { x: X, w: 42 };
+      FENCE = addPlat(X, X + 42, GY - 15, 'fence', { thin: true });
+    } else {
+      props.stump = { x: X };
+      STUMP = addPlat(X + 1, X + 11, GY - 8, 'stump');
+    }
+    x += widths[k] + gap;
+  }
+}
+const staticPlats = () => plats;
+
+function buildBackground() {
+  const s = mk(W, H), c = s.getContext('2d'), img = c.createImageData(W, H), d = img.data;
+  const set = (x, y, col) => { if (x < 0 || y < 0 || x >= W || y >= H) return; const o = (y * W + x) * 4; d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 255; };
+  const top = hexRgb('#62b6ee'), mid = hexRgb('#9fd8fa'), bot = hexRgb('#e2f5ff');
+  for (let y = 0; y < H; y++) {
+    const t = clamp(y / (HY + 6), 0, 1);
+    for (let x = 0; x < W; x++) {
+      const q = clamp(Math.floor(t * 8 + bayer(x, y) - 0.5), 0, 8) / 8;
+      set(x, y, q < 0.65 ? top.map((v, i) => lerp(v, mid[i], q / 0.65)) : mid.map((v, i) => lerp(v, bot[i], (q - 0.65) / 0.35)));
+    }
+  }
+  const far = ['#bde3b6', '#b0dcaa'].map(hexRgb), midc = ['#9fd48c', '#93cc80', '#88c476'].map(hexRgb);
+  const field = ['#86c86a', '#7ec163', '#77ba5c'].map(hexRgb), gnd = ['#72b956', '#6ab14f', '#63a949', '#5ca243'].map(hexRgb);
+  const s1 = rand(0, 50), s2 = rand(0, 50), s3 = rand(0, 50), farTop = [], midTop = [];
+  const ridge = (x, base, amp, f, seed) => base + Math.sin(x * f + seed) * amp + (noise(x * f * 3 + seed, seed) - 0.5) * amp * 1.4;
+  for (let x = 0; x < W; x++) {
+    const yf = Math.round(ridge(x, HY - 14, 7, 0.018, s1)), ym = Math.round(ridge(x, HY - 2, 5, 0.03, s2)), yn = Math.round(ridge(x, HY + 14, 3, 0.04, s3));
+    farTop[x] = yf; midTop[x] = ym;
+    for (let y = yf; y < ym; y++) set(x, y, far[bayer(x, y) < (y - yf) / (ym - yf + 1) ? 1 : 0]);
+    for (let y = ym; y < yn; y++) set(x, y, midc[clamp(Math.floor(((y - ym) / (yn - ym + 1)) * 3 + bayer(x, y) - 0.5), 0, 2)]);
+    for (let y = yn; y < GY; y++) set(x, y, field[clamp(Math.floor(((y - yn) / (GY - yn)) * 3 + bayer(x, y) - 0.5), 0, 2)]);
+    for (let y = GY; y < H; y++) set(x, y, gnd[clamp(Math.floor(((y - GY) / (H - GY)) * 4 + bayer(x, y) - 0.5), 0, 3)]);
+    set(x, GY, hexRgb('#8ed06e'));
+  }
+  const dark = hexRgb('#4f9440'), light = hexRgb('#94d677');
+  for (let i = 0; i < W * 1.2; i++) { const x = randi(0, W - 1), y = randi(HY + 16, H - 1); set(x, y, chance(0.5) ? light : dark); if (y > GY + 3 && chance(0.4)) { set(x - 1, y - 1, dark); set(x + 1, y - 1, dark); } }
+  c.putImageData(img, 0, 0);
+  const P = (x, y, w, h, col) => { c.fillStyle = col; c.fillRect(Math.round(x), Math.round(y), w, h); };
+  // tiny far trees
+  for (let i = 0; i < W / 26; i++) {
+    const x = randi(3, W - 3), t = farTop[x], r = randi(2, 3);
+    P(x, t + 1 - 1, 1, 2, '#8cbf88');
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) if (dx * dx + dy * dy <= r * r + 1) P(x + dx, t - r + dy, 1, 1, dx + dy < -1 ? '#b4dfae' : '#93c78e');
+  }
+  // a little red barn and silo on the hill, away from the cliff
+  const bx = props.cliff.side < 0 ? Math.round(W * rand(0.55, 0.8)) : Math.round(W * rand(0.2, 0.45)), by = midTop[bx] + 3;
+  P(bx, by - 10, 16, 10, '#c8503e'); P(bx + 12, by - 10, 4, 10, '#a83e30');
+  for (let k = 0; k < 6; k++) P(bx - 1 + k, by - 11 - k, 18 - k * 2, 1, k % 2 ? '#8a3a36' : '#7a3030');
+  P(bx + 5, by - 7, 6, 7, '#f4efe6'); P(bx + 6, by - 6, 4, 6, '#8a3a2e'); P(bx + 6, by - 6, 1, 1, '#f4efe6'); P(bx + 9, by - 6, 1, 1, '#f4efe6');
+  P(bx + 18, by - 16, 5, 16, '#c8c4bc'); P(bx + 21, by - 16, 2, 16, '#a8a49c'); P(bx + 18, by - 18, 5, 2, '#8a8680'); P(bx + 19, by - 19, 3, 1, '#8a8680');
+  // far away sheep dots on the hill
+  for (let i = 0; i < 5; i++) { const x = clamp(bx + randi(-60, 60), 2, W - 3), y = midTop[x] + randi(4, 12); P(x, y, 2, 1, '#ffffff'); P(x + 2, y, 1, 1, '#4c4250'); }
+  scene.bg = s;
+  scene.stars = Array.from({ length: Math.round(W * HY / 160) }, () => ({ x: randi(0, W), y: randi(0, HY - 6), tw: rand(0.5, 3), ph: rand(0, 6.28), big: chance(0.08) }));
+}
+
+function buildProps() {
+  const s = mk(W, H), c = s.getContext('2d');
+  const P = (x, y, w, h, col) => { c.fillStyle = col; c.fillRect(Math.round(x), Math.round(y), w, h); };
+  // ---- cliff with a tree
+  { const C = props.cliff, face = C.side < 0 ? C.x1 : C.x0;
+    const faceX = y => face - C.side * Math.round((y - C.top) * 0.14 + noise(y * 0.3, 5) * 2);
+    // tree first (behind the grass lip)
+    const tx = C.side < 0 ? 16 : W - 16, ty = C.top;
+    scene.tree = { x: tx, y: ty - 26 };
+    for (let y = ty - 20; y <= ty; y++) for (let dx = -1; dx <= 1; dx++) P(tx + dx, y, 1, 1, dx < 0 ? '#a0704a' : dx > 0 ? '#6a4428' : '#86583a');
+    const blobs = [[0, -28, 11], [-8, -22, 8], [8, -21, 8], [-4, -34, 7], [5, -33, 7]];
+    for (let dy = -42; dy <= -12; dy++) for (let dx = -18; dx <= 18; dx++) {
+      let q = 9; for (const [bx, by, br] of blobs) q = Math.min(q, ((dx - bx) ** 2 + (dy - by) ** 2) / (br * br));
+      if (q > 1) continue;
+      const l = (dx + dy + 26) / 12 + bayer(dx + 64, dy + 64) * 0.5;
+      P(tx + dx, ty + dy, 1, 1, l < -0.9 ? '#9ada72' : l < 0.3 ? '#68b654' : l < 1 ? '#529e46' : '#42883a');
+    }
+    for (let i = 0; i < 6; i++) { const [bx, by, br] = pick(blobs), a = rand(0, 6.28), r = rand(0.2, 0.8) * br; P(tx + bx + Math.cos(a) * r, ty + by + Math.sin(a) * r, 1, 1, '#ffb0c8'); }
+    for (let y = C.top; y <= GY; y++) {
+      const fx = faceX(y), x0 = C.side < 0 ? C.x0 : fx, x1 = C.side < 0 ? fx : C.x1;
+      for (let x = x0; x <= x1; x++) {
+        const edge = C.side < 0 ? fx - x : x - fx, strata = (y + Math.round(noise(x * 0.15, 2) * 3)) % 7 === 0;
+        let col = bayer(x, y) < 0.5 ? '#a49484' : '#9a8a7a';
+        if (strata) col = '#86786c';
+        if (edge < 3) col = edge < 1 ? '#6e6258' : '#827468';
+        if (noise(x * 0.4, y * 0.4) > 0.78) col = '#b8a898';
+        P(x, y, 1, 1, col);
+      }
+    }
+    const lip = C.side < 0 ? [C.x0, face + 1] : [face - 1, C.x1];
+    for (let x = lip[0]; x <= lip[1]; x++) {
+      P(x, C.top - 1, 1, 1, '#9ae07a'); P(x, C.top, 1, 2, '#7cc85e'); P(x, C.top + 2, 1, 1, '#5aa848');
+      if (hash01(x, 3) < 0.25) P(x, C.top - 2, 1, 1, '#7cc85e');
+    }
+    for (let k = 0; k < 4; k++) { const x = face - C.side * randi(0, 2), len = randi(2, 5), y0 = C.top + 2 + k * 3; for (let j = 0; j < len; j++) P(x - C.side * (j > 2 ? 1 : 0), y0 + j, 1, 1, '#5aa848'); }
+    for (let k = 0; k < 3; k++) { const x = randi(Math.max(4, C.x0 + 4), Math.min(W - 4, C.x1 - 4)); P(x, C.top - 2, 1, 1, pick(['#ffffff', '#ffd23a', '#ff8ac0'])); }
+  }
+  // ---- boulder
+  { const B = props.boulder, cx = B.x + B.w / 2;
+    for (let dy = -B.h; dy <= 0; dy++) for (let dx = -B.w / 2; dx <= B.w / 2; dx++) {
+      const q = (dx / (B.w / 2)) ** 2 + ((dy + B.h * 0.42) / (B.h * 0.62)) ** 2;
+      if (q > 1 || dy > 0) continue;
+      const l = (dx * 0.8 + dy) / B.h + bayer(dx + 40, dy + 40) * 0.35;
+      let col = l < -0.75 ? '#c2bec8' : l < -0.3 ? '#a8a4b0' : l < 0.15 ? '#8e8a98' : '#737080';
+      if (q > 0.86) col = '#5e5a6a';
+      if (dy < -B.h + 3 && q < 0.8 && bayer(dx + 3, dy) < 0.6) col = dy < -B.h + 2 ? '#8ed06e' : '#6cb454';
+      P(cx + dx, GY + dy, 1, 1, col);
+    }
+  }
+  // ---- haystack
+  if (props.hay) {
+    const { x, dir } = props.hay, bale = (bx, by) => {   // by = bottom
+      P(bx, by - 10, 18, 11, '#8a6a2a'); P(bx + 1, by - 9, 16, 9, '#e8c460'); P(bx + 1, by - 9, 16, 2, '#f8e08a'); P(bx + 1, by - 2, 16, 2, '#c8a040');
+      for (let k = 0; k < 14; k++) P(bx + 2 + hash01(bx + k, 5) * 14, by - 8 + hash01(bx, k) * 6, 1, 2, k % 2 ? '#d8b04a' : '#fff0a8');
+      P(bx + 5, by - 9, 1, 9, '#a8702e'); P(bx + 12, by - 9, 1, 9, '#a8702e');
+    };
+    bale(x, GY); bale(x + 18, GY);
+    bale(dir > 0 ? x + 18 : x, GY - 11);
+    for (let k = 0; k < 10; k++) P(x + rand(-4, 40), GY - rand(0, 1), 2, 1, '#e8c460');
+  }
+  // ---- fence
+  if (props.fence) {
+    const { x, w } = props.fence;
+    for (const ry of [GY - 15, GY - 8]) { P(x - 1, ry, w + 2, 2, '#9a6a3e'); P(x - 1, ry, w + 2, 1, '#c0905e'); }
+    for (let k = 0; k <= w; k += 14) { const X = x + Math.min(k, w - 3); P(X, GY - 16, 3, 17, '#7a5230'); P(X, GY - 16, 1, 17, '#a8764a'); P(X, GY - 16, 3, 1, '#c89a6a'); }
+  }
+  // ---- stump
+  if (props.stump) {
+    const { x } = props.stump;
+    P(x, GY - 7, 12, 8, '#7a4e2e'); P(x, GY - 7, 2, 8, '#9a6a42'); for (let k = 3; k < 12; k += 3) P(x + k, GY - 5, 1, 6, '#5e3a22');
+    P(x - 1, GY - 9, 14, 3, '#5e3a22'); P(x, GY - 9, 12, 2, '#e0b884'); P(x + 3, GY - 9, 6, 1, '#c89a64'); P(x + 5, GY - 9, 2, 1, '#e0b884');
+    P(x + 12, GY - 2, 1, 2, '#f4ead8'); P(x + 11, GY - 3, 3, 1, '#e8483a'); P(x + 11, GY - 3, 1, 1, '#ffffff');
+  }
+  scene.props = s;
+}
+function hash01(a, b) { let h = (a * 374761393 + b * 668265263) | 0; h = (h ^ (h >>> 13)) * 1274126177; return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+
+function buildFlowers() {
+  scene.flowers = [];
+  const n = Math.round(W / 5);
+  for (let i = 0; i < n; i++) scene.flowers.push({ x: rand(2, W - 2), y: Math.round(rand(GY + 2, H - 2)), type: weighted({ grass: 5, daisy: 2, clover: 1.4, butter: 1.2, bell: 0.8 }), ph: rand(0, 6.28), eaten: 0 });
+  scene.flowers.sort((a, b) => a.y - b.y);
+}
+function drawFlower(f) {
+  const X = Math.round(f.x), Y = f.y;
+  if (f.eaten > 0) { px(X, Y, '#4f9440'); return; }
+  const sw = Math.round(Math.sin(world.t * 1.6 + f.ph + f.x * 0.05) * (0.3 + world.wind));
+  if (f.type === 'grass') { px(X - 1, Y - 1, '#5aa84a'); px(X + 1, Y - 1, '#5aa84a'); px(X + sw, Y - 2, '#7ccc5e'); return; }
+  px(X, Y, '#4f9440'); px(X + Math.round(sw / 2), Y - 1, '#4f9440');
+  const hx = X + sw, hy = Y - 2;
+  if (f.type === 'daisy') { px(hx - 1, hy, '#ffffff'); px(hx + 1, hy, '#ffffff'); px(hx, hy - 1, '#ffffff'); px(hx, hy, '#ffcf30'); }
+  else if (f.type === 'clover') { px(hx, hy, '#ff9ec4'); px(hx + 1, hy, '#ff7fb0'); px(hx, hy - 1, '#ffc0da'); }
+  else if (f.type === 'butter') { px(hx, hy, '#ffd83a'); px(hx + 1, hy, '#ffc01a'); }
+  else { px(hx, hy, '#9ab0ff'); px(hx, hy + 1, '#7a90f0'); }
+}
+
+function makeCloud(size) {
+  const w = size * 5, h = size * 2 + 3, cv = mk(w, h), c = cv.getContext('2d'), blobs = [];
+  for (let i = 0; i < 4; i++) blobs.push([size * (1 + i * 1.05) + rand(-1, 1), h - size * rand(0.6, 1.1) - 1, size * rand(0.7, 1.15)]);
+  for (let y = 0; y < h - 1; y++) for (let x = 0; x < w; x++) {
+    if (!blobs.some(([bx, by, br]) => (x - bx) ** 2 + (y - by) ** 2 <= br * br)) continue;
+    c.fillStyle = y > h * 0.62 + bayer(x, y) * 2 - 1 ? '#dbeaf6' : '#ffffff'; c.fillRect(x, y, 1, 1);
+  }
+  return { img: cv, w, h };
+}
+function buildClouds() {
+  scene.clouds = [];
+  for (let i = 0; i < randi(4, 6); i++) { const size = randi(4, 7); scene.clouds.push({ ...makeCloud(size), x: rand(-20, W), y: rand(4, HY - 34), speed: rand(1, 2.6) * (size / 6) }); }
+}
+function drawSky() {
+  ctx.drawImage(scene.bg, 0, 0);
+  const d = world.dark;
+  if (d > 0.3) {
+    const a = clamp((d - 0.3) / 0.5, 0, 1);
+    for (const s of scene.stars) {
+      const on = Math.sin(world.t * s.tw + s.ph);
+      if (bayer(s.x, s.y) > a * (0.6 + on * 0.4)) continue;
+      px(s.x, s.y, s.big ? '#fff8d0' : '#ffffff');
+      if (s.big && on > 0.5) { px(s.x - 1, s.y, '#c8d8ff'); px(s.x + 1, s.y, '#c8d8ff'); px(s.x, s.y - 1, '#c8d8ff'); px(s.x, s.y + 1, '#c8d8ff'); }
+    }
+  }
+  const S = scene.sun, sunY = S.y + d * (HY + 10), R = 8;
+  if (sunY < HY + R) for (let dy = -R - 2; dy <= R + 2; dy++) for (let dx = -R - 2; dx <= R + 2; dx++) {
+    const r = Math.hypot(dx, dy), X = S.x + dx, Y = Math.round(sunY) + dy;
+    if (r <= R) px(X, Y, r < R - 3 ? mixHex('#fffbe0', '#ffb070', d) : mixHex('#ffe98a', '#ff8a50', d));
+    else if (r <= R + 2 && bayer(X, Y) < 0.25 * (1 - (r - R) / 2)) px(X, Y, '#fff4b0');
+  }
+  if (d > 0.35) {
+    const mx = W - S.x, my = Math.round(HY + 8 - (d - 0.35) / 0.65 * (HY - 26)), MR = 7;
+    for (let dy = -MR; dy <= MR; dy++) for (let dx = -MR; dx <= MR; dx++) {
+      if (dx * dx + dy * dy > MR * MR || (dx - 3) ** 2 + (dy + 1) ** 2 < 34) continue;
+      px(mx + dx, my + dy, dx + dy < -4 ? '#fffbe8' : '#f4e6b0');
+    }
+  }
+  for (const cl of scene.clouds) ctx.drawImage(cl.img, Math.round(cl.x), Math.round(cl.y));
+}
+
+// ---------------------------------------------------------------- sprite builder
+const INK = '#3d3140', EYE = '#1c1620', BLUSH = '#ff9ab4';
+class SB {
+  constructor(w, h) { this.w = w; this.h = h; this.g = new Array(w * h).fill(null); }
+  set(x, y, c) { x = Math.round(x); y = Math.round(y); if (x >= 0 && y >= 0 && x < this.w && y < this.h) this.g[y * this.w + x] = c; return this; }
+  get(x, y) { return x >= 0 && y >= 0 && x < this.w && y < this.h ? this.g[y * this.w + x] : null; }
+  ell(cx, cy, rx, ry, c, shade) {
+    for (let y = Math.floor(cy - ry - 1); y <= Math.ceil(cy + ry + 1); y++)
+      for (let x = Math.floor(cx - rx - 1); x <= Math.ceil(cx + rx + 1); x++) {
+        const dx = (x - cx) / (rx + 0.35), dy = (y - cy) / (ry + 0.35);
+        if (dx * dx + dy * dy > 1) continue;
+        this.set(x, y, shade && dx * 0.35 + dy * 0.95 > 0.5 ? shade : c);
+      }
+    return this;
+  }
+  outline(c = INK) {
+    const add = [];
+    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
+      if (this.get(x, y)) continue;
+      if (this.get(x - 1, y) || this.get(x + 1, y) || this.get(x, y - 1) || this.get(x, y + 1)) add.push([x, y]);
+    }
+    for (const [x, y] of add) this.set(x, y, c);
+    return this;
+  }
+}
+function bake(b, ax, ay) {
+  const r = mk(b.w, b.h), l = mk(b.w, b.h), rc = r.getContext('2d'), lc = l.getContext('2d');
+  for (let y = 0; y < b.h; y++) for (let x = 0; x < b.w; x++) {
+    const c = b.g[y * b.w + x]; if (!c) continue;
+    rc.fillStyle = c; rc.fillRect(x, y, 1, 1); lc.fillStyle = c; lc.fillRect(b.w - 1 - x, y, 1, 1);
+  }
+  return { r, l, w: b.w, h: b.h, ax, ay };
+}
+// feet at (x, y)
+function drawSpr(s, x, y, facing = 1, alpha = 1) {
+  const X = Math.round(x - (facing > 0 ? s.ax : s.w - 1 - s.ax)), Y = Math.round(y - s.ay);
+  if (alpha < 1) ctx.globalAlpha = alpha;
+  ctx.drawImage(facing > 0 ? s.r : s.l, X, Y);
+  if (alpha < 1) ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- the sheep sprite (faces right)
+const VARIANTS = {
+  white: { W: '#ffffff', S: '#dedae8', F: '#4c4250', FS: '#352d3a', L: '#433a47', skin: '#ffc4c6', skinS: '#eea0aa', eye: 'light', blush: '#d87898' },
+  cream: { W: '#fffaec', S: '#eadcc6', F: '#f4dccb', FS: '#d4ae9a', L: '#8a6a5c', skin: '#ffc4c6', skinS: '#eea0aa', eye: 'dark', blush: BLUSH },
+  black: { W: '#57505f', S: '#403a48', F: '#2c2632', FS: '#1e1a24', L: '#26202c', skin: '#e4acb4', skinS: '#c48c96', eye: 'light', blush: '#b8607e' },
+  wolf:  { W: '#ffffff', S: '#dedae8', F: '#8e889a', FS: '#686274', L: '#686274', skin: '#8e889a', skinS: '#686274', eye: 'wolf', blush: '#d87898' },
+};
+const BODY = [[4, 9, 3.2], [8, 7.8, 3.4], [11.6, 8.8, 3], [5, 11.8, 2.8], [8.8, 12, 3], [12, 11.6, 2.6]];
+const LEGS = [[6, 16], [8, 16], [12, 16], [14, 16]];
+const POSES = {
+  stand:  { legs: LEGS },
+  blink:  { legs: LEGS, eye: 'closed' },
+  walk1:  { legs: [[5, 15], [8, 16], [12, 16], [15, 15]] },
+  walk2:  { legs: [[6, 16], [9, 15], [13, 15], [14, 16]] },
+  run1:   { pix: [[6, 13], [5, 14], [4, 15], [8, 13], [7, 14], [7, 15], [12, 13], [13, 14], [13, 15], [14, 13], [15, 14], [16, 15]], by: -1, eye: 'wide' },
+  run2:   { legs: [[7, 15], [8, 15], [12, 15], [13, 15]], by: -1, eye: 'wide' },
+  jump:   { legs: [[6, 14], [8, 14], [12, 14], [14, 14]], by: -1, eye: 'happy' },
+  fall:   { pix: [[6, 13], [5, 14], [4, 15], [8, 13], [8, 14], [7, 15], [12, 13], [12, 14], [13, 15], [14, 13], [15, 14], [16, 15]], eye: 'wide', mouth: 'o', puff: 0.6 },
+  bah:    { legs: LEGS, head: [17.5, 6.5], mouth: 'bah', eye: 'closed' },
+  eat1:   { legs: LEGS, head: [17.5, 12], mouth: 'chew' },
+  eat2:   { legs: LEGS, head: [17.5, 12.5], eye: 'happy' },
+  sleep:  { pix: [[7, 16], [13, 16]], by: 3, head: [16.5, 13], eye: 'closed' },
+  lie:    { pix: [[7, 16], [13, 16]], by: 3, head: [17, 12] },
+  sit1:   { legs: [[13, 19], [15, 19]], top: 14, bx: -1, by: 2, head: [16.5, 8.5] },
+  sit2:   { pix: [[13, 14], [13, 15], [13, 16], [13, 17], [14, 18], [15, 14], [15, 15], [15, 16], [15, 17], [15, 18], [16, 19]], bx: -1, by: 2, head: [16.5, 8.5] },
+  sitb:   { legs: [[13, 19], [15, 19]], top: 14, bx: -1, by: 2, head: [16.5, 8.5], eye: 'closed' },
+  back1:  { flip: true, pix: [[6, 3], [6, 4], [6, 5], [8, 4], [8, 5], [12, 4], [12, 5], [14, 3], [14, 4], [14, 5]], head: [17, 13], eye: 'wide' },
+  back2:  { flip: true, pix: [[6, 4], [6, 5], [8, 3], [8, 4], [8, 5], [12, 3], [12, 4], [12, 5], [14, 4], [14, 5]], head: [17, 13.5], eye: 'spin' },
+  faint:  { flip: true, pix: [[6, 2], [6, 3], [6, 4], [6, 5], [8, 2], [8, 3], [8, 4], [8, 5], [12, 2], [12, 3], [12, 4], [12, 5], [14, 2], [14, 3], [14, 4], [14, 5]], head: [17, 13], eye: 'closed', mouth: 'o' },
+  dizzy:  { legs: LEGS, eye: 'spin', mouth: 'o' },
+  up:     { legs: LEGS, head: [17.5, 6], eye: 'up' },
+  scared: { legs: LEGS, eye: 'wide', puff: 1, mouth: 'o' },
+  happy:  { legs: LEGS, eye: 'happy' },
+  push:   { pix: [[5, 13], [4, 14], [3, 15], [8, 13], [7, 14], [6, 15], [12, 13], [12, 14], [11, 15], [14, 13], [14, 14], [13, 15]], by: 1, head: [17.5, 10], eye: 'closed' },
+};
+function sheepSpr(vName, lamb, bald, poseName) {
+  const P = POSES[poseName], v = VARIANTS[vName], b = new SB(24, 21), wolf = vName === 'wolf';
+  const k = lamb ? 0.72 : 1, hk = lamb ? 0.86 : 1, AX = 10, AY = 16;
+  const T = (x, y) => [AX + (x - AX) * k, AY - (AY - y) * k];
+  const fs = P.flip ? -1 : 1, bx = P.bx || 0, by = P.by || 0;
+  const fy = y => (P.flip ? 21 - y : y);
+  // legs
+  const legTop = P.top || 13;
+  for (const [x, bot] of P.legs || []) {
+    const [X, Y0] = T(x - 1, legTop), [, Y1] = T(x - 1, bot);
+    for (let y = Math.round(Y0); y <= Math.round(Y1); y++) b.set(X, y, y === Math.round(Y1) ? v.FS : v.L);
+  }
+  for (const [x, y] of P.pix || []) { const [X, Y] = T(x - 1, y); b.set(X, Y, v.L); }
+  // wolf tail pokes out from under the costume
+  if (wolf) { const [X, Y] = T(2 + bx, fy(12) + by); b.ell(X - 1, Y, (bald ? 2.4 : 1.8) * k, 1.1 * k, v.F, v.FS); b.set(X - 3, Y - 1, '#ffffff'); }
+  // body
+  if (bald) {
+    const [X, Y] = T(9.5 + bx, fy(10.5) + by);
+    b.ell(X, Y, 6 * k, 3.4 * k, v.skin, v.skinS);
+    const [tx, ty] = T(3 + bx, fy(9.4) + by); if (!wolf) b.ell(tx, ty, 1.3 * k, 1.1 * k, v.W, v.S);
+  } else {
+    const grow = P.puff || 0;
+    for (const [x, y, r] of BODY) { const [X, Y] = T(x + bx, fy(y) + by); b.ell(X, Y, (r + grow) * k, (r + grow) * k, v.W, v.S); }
+    const [tx, ty] = T(1.6 + bx, fy(9.4) + by); b.ell(tx, ty, (1.9 + grow * 0.5) * k, (1.9 + grow * 0.5) * k, v.W, v.S);
+    // a few wool curls
+    for (const [x, y] of [[6, 7], [10, 6], [4, 11], [11, 11], [8, 10]]) { const [X, Y] = T(x + bx, fy(y) + by); if (b.get(X, Y) === v.W) b.set(X, Y, v.S); }
+  }
+  // head: big and round, sticking out in front of the wool
+  const [hxf, hyf] = P.head ? T(P.head[0], P.head[1]) : T(17.5 + bx, 7.5 + by);
+  const HX = Math.round(hxf), HY = Math.round(hyf);
+  const E = (dx, dy, c) => b.set(HX + dx, HY + dy * fs, c);
+  E(-3, -1, v.F); E(-4, -1, v.F); E(-5, -1, v.FS); E(-4, 0, v.FS);           // floppy ear
+  if (wolf) b.ell(hxf + 2.8 * hk, hyf + 0.9 * fs, 1.7 * hk, 1.1 * hk, v.F, v.FS);
+  b.ell(hxf, hyf, 2.9 * hk, 3.1 * hk, v.F, v.FS);
+  b.ell(hxf - 0.7, hyf - 3 * hk * fs, 2 * hk, 1.1 * hk, v.W, v.S);             // wool tuft on top
+  if (wolf) { E(-1, -4, v.FS); E(-1, -5, v.FS); E(0, -4, v.F); E(4, 0, EYE); E(3, 2, '#ffffff'); }
+  const style = v.eye, eye = P.eye || 'open', Wt = style === 'wolf' ? '#ffe04a' : '#ffffff';
+  if (style === 'dark') {
+    if (eye === 'open') { E(0, -1, '#ffffff'); E(1, -1, EYE); E(0, 0, EYE); E(1, 0, EYE); }
+    else if (eye === 'closed') { E(0, 0, EYE); E(1, 0, EYE); }
+    else if (eye === 'happy') { E(0, 0, EYE); E(1, -1, EYE); }
+    else if (eye === 'wide') { E(0, -2, '#ffffff'); E(1, -2, EYE); E(0, -1, EYE); E(1, -1, EYE); E(0, 0, EYE); E(1, 0, EYE); }
+    else if (eye === 'up') { E(0, -2, EYE); E(1, -2, EYE); E(0, -1, '#ffffff'); E(1, -1, EYE); }
+    else if (eye === 'spin') { E(0, -1, EYE); E(1, 0, EYE); E(1, -1, '#ffffff'); E(0, 0, '#ffffff'); }
+  } else {
+    if (eye === 'open') { E(0, -1, Wt); E(1, -1, EYE); E(0, 0, Wt); E(1, 0, EYE); }
+    else if (eye === 'closed') { E(0, 0, '#b8aebc'); E(1, 0, '#b8aebc'); }
+    else if (eye === 'happy') { E(0, 0, '#d8d0dc'); E(1, -1, '#d8d0dc'); }
+    else if (eye === 'wide') { E(0, -2, Wt); E(1, -2, Wt); E(0, -1, Wt); E(1, -1, EYE); E(0, 0, Wt); E(1, 0, Wt); }
+    else if (eye === 'up') { E(0, -1, Wt); E(1, -1, EYE); E(0, 0, Wt); E(1, 0, Wt); }
+    else if (eye === 'spin') { E(0, -1, EYE); E(1, 0, EYE); E(1, -1, Wt); E(0, 0, Wt); }
+  }
+  E(-1, 1, v.blush);
+  if (!wolf) E(3, 1, v.FS);
+  if (P.mouth === 'bah') { E(2, 2, '#6a2a3a'); E(1, 2, '#ff8aa0'); E(2, 3, '#6a2a3a'); }
+  else if (P.mouth === 'o') E(2, 2, EYE);
+  else if (P.mouth === 'chew') E(2, 2, v.FS);
+  return b.outline(INK);
+}
+const SETS = {};
+function sheepSet(vName, lamb, bald) {
+  const key = vName + (lamb ? 'L' : '') + (bald ? 'B' : '');
+  if (!SETS[key]) { const o = {}; for (const p of Object.keys(POSES)) o[p] = bake(sheepSpr(vName, lamb, bald, p), 10, 16); SETS[key] = o; }
+  return SETS[key];
+}
+
+// ---------------------------------------------------------------- emote icons
+const ICONS = {};
+function icon(name, rows, col) {
+  const b = new SB(rows[0].length + 2, rows.length + 2);
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== '.') b.set(x + 1, y + 1, ch === 'o' ? '#ffffff' : col); }));
+  ICONS[name] = bake(b.outline('#ffffff'), Math.floor(b.w / 2), b.h - 1);
+}
+icon('heart', ['.X.X.', 'XoXXX', 'XXXXX', '.XXX.', '..X..'], '#ff5a8a');
+icon('note', ['..XX', '..XX', '..X.', 'XXX.', 'XX..'], '#6a5aff');
+icon('bang', ['X', 'X', 'X', '.', 'X'], '#ff4a3a');
+icon('q', ['XXX', '..X', '.X.', '...', '.X.'], '#3a6aff');
+icon('z', ['XXX', '..X', '.X.', 'XXX'], '#7a8aff');
+icon('sparkle', ['.X.', 'XoX', '.X.'], '#ffc83a');
+icon('dots', ['X.X.X'], '#6a6070');
+icon('sweat', ['.X', 'XX', 'XX'], '#5ab0ff');
+
+// ---------------------------------------------------------------- platforms, jumping, physics
+function backOf(c) {
+  if (c.lamb || c.dead || c.stun > 0 || c.float || c.hidden || c.noBack) return null;
+  const low = c.frame === 'sleep' || c.frame === 'lie', hw = 5;
+  return { x0: c.x - hw, x1: c.x + hw, y: c.y - (low ? 8 : 12), carrier: c };
+}
+function ridesOn(a, b) { for (let s = a, n = 0; s && s.plat && s.plat.carrier && n < 8; n++) { s = s.plat.carrier; if (s === b) return true; } return false; }
+const flock = () => world.ents.filter(e => e instanceof Sheep && !e.dead);
+function sheepOn(p) { return flock().filter(s => s.plat === p); }
+function canHop(p, q) {
+  if (!p || p === q || p.carrier) return false;
+  if (q.ground) return p.y >= GY - 24;
+  const rise = (p.ground ? GY : p.y) - q.y;
+  if (rise > 26) return false;
+  if (p.ground) return true;
+  return Math.max(q.x0 - p.x1, p.x0 - q.x1, 0) <= 34;
+}
+function route(from, to) {
+  if (from === to) return [];
+  const prev = new Map([[from, null]]), q = [from];
+  while (q.length) {
+    const p = q.shift();
+    if (p === to) break;
+    for (const n of plats) if (!prev.has(n) && canHop(p, n)) { prev.set(n, p); q.push(n); }
+  }
+  if (!prev.has(to)) return null;
+  const out = [];
+  for (let p = to; p !== from; p = prev.get(p)) out.unshift(p);
+  return out;
+}
+const openEdges = p => (p.ground || p.carrier ? [] : ['L', 'R'].filter(e => p.wall !== e));
+
+class Sheep {
+  constructor(o = {}) {
+    Object.assign(this, { x: 0, y: GY, vx: 0, vy: 0, plat: GROUND, lane: randi(1, 6), facing: coin(), frame: 'stand', variant: 'white', lamb: false, bald: false,
+      brain: null, busy: false, emotes: [], age: rand(0, 5), stun: 0, stunKind: 'back', dumb: rand(0.25, 1), dead: false, sitting: false, hidden: false,
+      ignore: null, ignoreT: 0, carX: 0, float: 0, hat: null, snowy: 0, mom: null, kinematic: false, clip: null, behind: false }, o);
+    if (this.plat) this.y = this.plat.y + (this.plat.ground ? this.lane : 0);
+    world.ents.push(this);
+  }
+  get set() { return sheepSet(this.variant, this.lamb, this.bald); }
+  get headY() { return this.y - (this.lamb ? 12 : 16); }
+  emote(name, dur = 1.6) { if (!this.emotes.some(e => e.name === name && e.t < 0.5)) this.emotes.push({ name, t: 0, dur }); }
+  baa(word) {
+    const w = word || (this.lamb ? pick(['MEH', 'BAA', 'MEE']) : this.variant === 'black' && chance(0.03) ? 'MOO' : pick(['BAA', 'BAAA', 'MAA']));
+    popText(this.x + this.facing * 4, this.headY - 2, w, this.lamb ? '#ffe0ee' : '#ffffff', 1.3);
+  }
+  claim() { this.brain = null; this.busy = true; this.vx = 0; this.sitting = false; if (this.plat) this.frame = this.frame === 'sleep' ? 'sleep' : 'stand'; return this; }
+  release() {
+    if (this.hidden || this.kinematic) { this.plat = null; this.vy = 0; this.fromY = this.y; }
+    this.busy = false; this.brain = null; this.vx = 0; this.sitting = false; this.kinematic = false; this.clip = null; this.hidden = false; this.behind = false; this.soft = false; this.bald = false;
+    if (this.plat && !['stand', 'sleep', 'lie'].includes(this.frame)) this.frame = 'stand';
+    return this;
+  }
+  act(gen) { this.brain = gen; return this; }
+  stunFor(t, kind = 'back') { this.stun = t; this.stunKind = kind; this.vx = 0; this.sitting = false; }
+  update(dt) {
+    this.age += dt;
+    for (const e of this.emotes) e.t += dt;
+    this.emotes = this.emotes.filter(e => e.t < e.dur);
+    this.ignoreT -= dt;
+    if (this.stun > 0) {
+      this.stun -= dt; this.vx = 0;
+      this.frame = this.stunKind === 'back' ? (Math.floor(this.age * 5) % 2 ? 'back1' : 'back2') : this.stunKind === 'faint' ? 'faint' : 'dizzy';
+      if (this.stun <= 0) { this.frame = 'stand'; if (this.plat && this.stunKind !== 'dizzy') dust(this.x, this.y, 3); }
+    } else if (this.brain) {
+      let r;
+      try { r = this.brain.next(dt); } catch (e) { console.error('sheep', e); r = { done: true }; }
+      if (r.done) this.brain = null;
+    } else if (!this.busy) this.brain = sheepLife(this);
+    if (!this.kinematic) this.physics(dt);
+  }
+  physics(dt) {
+    const p = this.plat;
+    if (p) {
+      if (p.carrier) {
+        const bk = backOf(p.carrier);
+        if (!bk) { this.plat = null; this.vy = -20; this.sitting = false; return; }
+        this.x += p.carrier.x - this.carX; this.carX = p.carrier.x;
+        this.plat = bk; this.y = bk.y;
+        this.x = clamp(this.x + this.vx * dt, bk.x0 - 1, bk.x1 + 1);
+        return;
+      }
+      this.x += this.vx * dt;
+      if (p.wall === 'R' && this.x > p.x1 - 7) { this.x = p.x1 - 7; if (this.vx > 0) this.bonked = true; }
+      if (p.wall === 'L' && this.x < p.x0 + 7) { this.x = p.x0 + 7; if (this.vx < 0) this.bonked = true; }
+      this.y = p.y + (p.ground ? this.lane : 0);
+      if (!p.ground && (this.x < p.x0 - 1.5 || this.x > p.x1 + 1.5)) { this.ignore = p; this.ignoreT = 0.15; this.plat = null; this.vy = 0; this.sitting = false; this.frame = 'fall'; this.fromY = this.y; }
+      return;
+    }
+    // airborne
+    const prevY = this.y;
+    this.vy += G * (1 - this.float) * dt;
+    if (this.float) this.vy = lerp(this.vy, -8 * this.float, dt);
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    if (this.fromY === undefined) this.fromY = prevY;
+    this.fromY = Math.min(this.fromY, this.y);
+    if (this.vy < 0 || this.float >= 1) return;
+    let best = null, by = 1e9;
+    for (const q of plats) {
+      if (q === this.ignore && this.ignoreT > 0) continue;
+      if (this.onlyBack && !q.ground) continue;
+      const qy = q.y + (q.ground ? this.lane : 0);
+      if (prevY <= qy + 0.01 && this.y >= qy && this.x >= q.x0 - 1 && this.x <= q.x1 + 1 && qy < by) { best = q; by = qy; }
+    }
+    for (const o of world.ents) {
+      if (!(o instanceof Sheep) || o === this || !o.plat || ridesOn(o, this) || (this.onlyBack && o !== this.onlyBack)) continue;
+      const bk = backOf(o); if (!bk) continue;
+      if (prevY <= bk.y + 0.01 && this.y >= bk.y && this.x >= bk.x0 && this.x <= bk.x1 && bk.y < by) { best = bk; by = bk.y; }
+    }
+    if (best) this.land(best, by);
+  }
+  land(q, qy) {
+    const drop = qy - (this.fromY ?? qy), impact = this.vy;
+    this.y = qy; this.vy = 0; this.vx = 0; this.plat = q; this.fromY = undefined; this.float = 0; this.onlyBack = null;
+    if (q.carrier) { this.carX = q.carrier.x; q.carrier.emote(chance(0.5) ? 'bang' : 'q', 1.2); }
+    if (this.frame === 'jump' || this.frame === 'fall') this.frame = 'stand';
+    if (!this.soft && (drop > 30 || (drop > 19 && chance(0.25 + this.dumb * 0.4)))) { this.stunFor(rand(1.2, 2.2)); this.emote('bang', 1); dust(this.x, this.y, 8); woolFluff(this.x, this.y - 8, 3); }
+    else if (impact > 60) dust(this.x, this.y, 3);
+    if (this.onLand) { const f = this.onLand; this.onLand = null; f(this, q, drop); }
+  }
+  sprite() { return this.set[this.frame] || this.set.stand; }
+  draw() {
+    const s = this.sprite();
+    if (this.plat && !this.plat.carrier && !this.hidden) {
+      const w = this.lamb ? 8 : 12;
+      ctx.globalAlpha = 0.18; rect(this.x - w / 2, this.y, w, 1, '#1e3a20'); ctx.globalAlpha = 1;
+    }
+    if (this.hidden) return;
+    if (this.clip) { ctx.save(); ctx.beginPath(); ctx.rect(this.clip.x0, this.clip.y0, this.clip.x1 - this.clip.x0, this.clip.y1 - this.clip.y0); ctx.clip(); }
+    drawSpr(s, this.x, this.y, this.facing);
+    if (this.clip) ctx.restore();
+    const hx = this.x + this.facing * (this.lamb ? 5 : 7), hy = this.headY;
+    if (this.hat === 'hay') { const X = Math.round(hx - 1), Y = Math.round(hy - 1); rect(X - 2, Y, 5, 1, '#e8c460'); px(X - 1, Y - 1, '#f8e08a'); px(X + 2, Y - 1, '#c8a040'); px(X - 3, Y + 1, '#e8c460'); }
+    if (this.hat === 'flower') { const X = Math.round(hx - 1), Y = Math.round(hy - 1); px(X - 1, Y, '#ffffff'); px(X + 1, Y, '#ffffff'); px(X, Y - 1, '#ffffff'); px(X, Y, '#ffcf30'); }
+    if (this.snowy > 0.05 && !this.bald) { ctx.globalAlpha = this.snowy; rect(this.x - 4, this.y - (this.lamb ? 10 : 14), 9, 2, '#f8fbff'); ctx.globalAlpha = 1; }
+    if (this.stun > 0 && this.stunKind !== 'faint') {
+      for (let i = 0; i < 3; i++) { const a = world.t * 6 + i * 2.09; px(this.x + this.facing * 4 + Math.cos(a) * 5, this.y - 17 + Math.sin(a) * 1.5, i === 0 ? '#ffe84a' : '#fff4a0'); }
+    }
+    for (const e of this.emotes) {
+      const k = e.t / e.dur;
+      if (k > 0.75 && Math.floor(world.t * 12) % 2) continue;
+      drawSpr(ICONS[e.name], this.x + this.facing * 4, this.headY - 3 - Math.min(1, k * 3) * 4, 1);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- sheep behaviour helpers (generators)
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+function* anim(s, frames, fps, secs) { let t = 0; while (t < secs) { s.frame = frames[Math.floor(t * fps) % frames.length]; t += yield; } }
+function* idle(s, secs) {
+  let t = 0, nb = rand(0.5, 2.5);
+  while (t < secs) { const dt = yield; t += dt; nb -= dt; s.frame = s.sitting ? (nb < 0 ? 'sitb' : s.frame.startsWith('sit') ? s.frame : 'sit1') : nb < 0 ? 'blink' : 'stand'; if (nb < -0.15) nb = rand(1.5, 4); }
+  if (!s.sitting) s.frame = 'stand';
+}
+function* walkTo(s, tx, sp = 9, o = {}) {
+  for (let g = 0; g < 4000; g++) {
+    if (!s.plat) { yield* until(() => s.plat, 5); return 'fell'; }
+    const p = s.plat;
+    if (!o.offEdge && !p.ground && !p.carrier) tx = clamp(clamp(tx, p.x0 + (p.wall === 'L' ? 7 : 2), p.x1 - (p.wall === 'R' ? 7 : 2)), 6, W - 6);
+    if (p.ground && !o.offscreen) tx = clamp(tx, 7, W - 7);
+    if (p.carrier) tx = clamp(tx, p.x0, p.x1);
+    const dx = tx - s.x;
+    if (Math.abs(dx) < 0.8) break;
+    s.facing = Math.sign(dx); s.vx = Math.sign(dx) * sp;
+    s.frame = sp > 16 ? (Math.floor(s.age * 10) % 2 ? 'run1' : 'run2') : Math.floor(s.age * (4 + sp * 0.25)) % 2 ? 'walk1' : 'walk2';
+    const dt = yield;
+    if (s.bonked) { s.bonked = false; s.vx = 0; s.frame = 'stand'; return 'bonk'; }
+    if (s.plat && Math.abs(tx - s.x) <= sp * dt + 0.2 && !o.offEdge) { s.x = tx; break; }
+  }
+  s.vx = 0; s.frame = 'stand';
+}
+function* jumpTo(s, tx, ty, extra = 8, ign = null) {
+  if (!s.plat) return;
+  const rise = Math.max(0, s.y - ty) + extra, vy0 = -Math.sqrt(2 * G * rise), dy = ty - s.y;
+  const t = (-vy0 + Math.sqrt(Math.max(0, vy0 * vy0 + 2 * G * dy))) / G;
+  s.ignore = ign || s.plat; s.ignoreT = ign ? 2 : 0.3;
+  s.facing = Math.sign(tx - s.x) || s.facing;
+  s.vx = (tx - s.x) / Math.max(0.15, t); s.vy = vy0; s.plat = null; s.frame = 'jump'; s.sitting = false; s.fromY = s.y;
+  yield* until(() => s.plat, 4);
+  if (s.stun <= 0) s.frame = 'stand';
+}
+// one hop from the current platform onto q
+function* hopStep(s, q, landX) {
+  const p = s.plat;
+  if (!p || p.carrier) return;
+  let launch, lx;
+  if (q.ground) {
+    const edges = openEdges(p);
+    if (!edges.length) return;
+    const e = edges.includes(s.x < (p.x0 + p.x1) / 2 ? 'L' : 'R') ? (s.x < (p.x0 + p.x1) / 2 ? 'L' : 'R') : edges[0];
+    launch = e === 'L' ? p.x0 + 2 : p.x1 - 2; lx = landX ?? clamp(launch + (e === 'L' ? -1 : 1) * rand(9, 16), 7, W - 7);
+    s.lane = randi(1, 6);
+  } else if (q.y < (p.ground ? GY : p.y) - 2 || p.ground) {
+    const side = s.x < (q.x0 + q.x1) / 2 ? -1 : 1;
+    launch = side < 0 ? q.x0 - 8 : q.x1 + 8; lx = landX ?? (side < 0 ? q.x0 + 4 : q.x1 - 4);
+    if (!p.ground) launch = clamp(launch, p.x0 + (p.wall === 'L' ? 7 : 2), p.x1 - (p.wall === 'R' ? 7 : 2));
+  } else {
+    lx = landX ?? clamp((q.x0 + q.x1) / 2 + rand(-3, 3), q.x0 + 3, q.x1 - 3);
+    launch = clamp(lx, p.x0 + 2, p.x1 - 2);
+  }
+  if (lx > q.x1 - 2 && !q.ground) lx = q.x1 - 3;
+  if (lx < q.x0 + 2 && !q.ground) lx = q.x0 + 3;
+  yield* walkTo(s, launch, 10);
+  if (s.plat !== p) return;
+  s.facing = Math.sign(lx - s.x) || s.facing;
+  s.frame = 'stand';
+  yield* wait(rand(0.2, 0.45));
+  yield* jumpTo(s, lx, q.y + (q.ground ? s.lane : 0));
+}
+function* goTo(s, q, landX) {
+  for (let tries = 0; tries < 3; tries++) {
+    if (!s.plat) yield* until(() => s.plat, 4);
+    if (s.plat === q) return true;
+    if (s.plat && s.plat.carrier) { yield* hopDown(s); continue; }
+    const r = route(s.plat, q);
+    if (!r || !r.length) return false;
+    for (let i = 0; i < r.length; i++) {
+      yield* hopStep(s, r[i], i === r.length - 1 ? landX : undefined);
+      if (s.stun > 0) yield* until(() => s.stun <= 0, 4);
+      if (s.plat !== r[i]) break;
+    }
+  }
+  return s.plat === q;
+}
+function* hopDown(s) {
+  if (!s.plat) return;
+  s.lane = randi(1, 6);
+  yield* jumpTo(s, clamp(s.x + coin() * rand(10, 16), 7, W - 7), GY + s.lane, 6);
+}
+
+// ---------------------------------------------------------------- everyday sheep life
+const ACTS = {
+  *graze(s) {
+    const f = scene.flowers.filter(f => f.eaten <= 0 && f.type !== 'grass' && Math.abs(f.x - s.x) < 40)[0];
+    if (f && s.plat.ground) { yield* walkTo(s, f.x - 8 * (Math.sign(f.x - s.x) || 1), 8); s.facing = Math.sign(f.x - s.x) || s.facing; }
+    yield* anim(s, ['eat1', 'eat1', 'eat2'], 3, rand(2, 5));
+    if (f && Math.abs(f.x - s.x) < 12) { f.eaten = rand(40, 80); if (chance(0.4)) s.emote('heart', 1.4); if (chance(0.08)) s.hat = 'flower'; }
+    s.frame = 'stand';
+  },
+  *wander(s) {
+    const p = s.plat;
+    let tx = p.ground ? clamp(s.x + rand(-80, 80), 8, W - 8) : rand(p.x0 + 2, p.x1 - 2), off = false;
+    if (!p.ground && chance(s.dumb * 0.12)) { const e = pick(openEdges(p)); if (e) { tx = e === 'L' ? p.x0 - 6 : p.x1 + 6; off = true; } }
+    const r = yield* walkTo(s, tx, rand(7, 11), { offEdge: off });
+    if (r === 'bonk') { s.emote('q', 1.2); dust(s.x + s.facing * 8, s.y - 8, 3, ['#e8c460', '#fff0a8']); }
+    if (r === 'fell' && s.stun <= 0) s.emote('q', 1.2);
+  },
+  *climb(s) {
+    const opts = plats.filter(q => !q.ground && canHop(s.plat, q) && sheepOn(q).length < Math.max(1, Math.floor((q.x1 - q.x0) / 11)));
+    if (!opts.length) { yield* idle(s, 1); return; }
+    const q = pick(opts);
+    yield* hopStep(s, q);
+    if (s.plat === q && chance(0.4)) s.emote(chance(0.5) ? 'sparkle' : 'note', 1.4);
+  },
+  *down(s) { yield* goTo(s, GROUND); },
+  *edge(s) {
+    const p = s.plat, e = pick(openEdges(p));
+    if (!e) return;
+    yield* walkTo(s, e === 'R' ? p.x1 - 2 : p.x0 + 2, 8);
+    if (s.plat !== p) return;
+    s.facing = e === 'R' ? 1 : -1; s.sitting = true;
+    let t = 0; const dur = rand(5, 12);
+    while (t < dur && s.plat === p) {
+      const dt = yield; t += dt;
+      s.frame = Math.floor(t * 1.6) % 7 === 6 ? 'sitb' : Math.floor(t * 2.2) % 2 ? 'sit1' : 'sit2';
+      if (chance(dt * 0.12)) s.emote(pick(['note', 'heart', 'dots']), 1.5);
+    }
+    s.sitting = false; s.frame = 'stand';
+  },
+  *nap(s) {
+    if (s.plat.thin) { s.frame = 'sleep'; yield* wait(1.5); s.emote('bang', 1); s.plat = null; s.ignore = FENCE; s.ignoreT = 0.2; s.vy = -30; s.frame = 'fall'; yield* until(() => s.plat, 4); return; }
+    s.frame = 'lie'; yield* wait(0.6); s.frame = 'sleep';
+    let t = 0; const dur = rand(6, 14);
+    while (t < dur) { const dt = yield; t += dt; if (Math.floor(t / 1.8) !== Math.floor((t - dt) / 1.8)) s.emote('z', 1.4); }
+    s.frame = 'lie'; yield* wait(0.5); s.frame = 'bah'; yield* wait(0.5); s.frame = 'stand';
+  },
+  *look(s) { for (let i = 0; i < randi(1, 3); i++) { yield* idle(s, rand(0.8, 2)); s.facing *= -1; } },
+  *baa(s) { s.frame = 'bah'; s.baa(); yield* wait(0.7); s.frame = 'stand'; yield* idle(s, rand(0.5, 1.5)); },
+  *friend(s) {
+    const o = flock().filter(o => o !== s && o.plat === s.plat && !o.busy && o.stun <= 0 && Math.abs(o.x - s.x) < 90)[0];
+    if (!o) { yield* idle(s, 1); return; }
+    const side = Math.sign(s.x - o.x) || 1, bonk = chance(0.2 * s.dumb);
+    const r = yield* walkTo(s, o.x + side * (bonk ? 6 : 11), bonk ? 20 : 9);
+    if (r || s.plat !== o.plat) return;
+    s.facing = -side;
+    if (bonk && Math.abs(o.x - s.x) < 9) {
+      o.stunFor(1.1); s.stunFor(1.1); s.emote('bang', 1); dust((s.x + o.x) / 2, s.y - 8, 5, ['#ffffff', '#eeeaf4']);
+      return;
+    }
+    if (!o.brain || !o.busy) o.facing = side;
+    s.emote('heart', 1.8); yield* wait(0.5);
+    if (chance(0.7)) o.emote('heart', 1.8);
+    yield* idle(s, rand(1.5, 3));
+  },
+  *stare(s) { if (chance(0.5)) s.facing *= -1; s.frame = 'stand'; s.emote('dots', 2.5); yield* wait(rand(2.5, 4)); if (chance(0.3)) s.emote('q', 1.2); },
+  *trip(s) { yield* walkTo(s, clamp(s.x + coin() * rand(15, 30), 8, W - 8), 10); if (s.plat) { s.stunFor(1.4); s.emote('bang', 1); dust(s.x, s.y, 4); } },
+  *hop(s) {
+    if (!s.plat) return;
+    s.emote('sparkle', 1.2);
+    for (let i = 0; i < randi(1, 3); i++) { s.ignore = null; s.vy = -95; s.plat = null; s.frame = 'jump'; s.fromY = s.y; yield* until(() => s.plat, 2); s.frame = 'stand'; yield* wait(0.12); }
+  },
+  *ride(s) {    // lambs hop onto mum's back
+    const m = s.mom;
+    if (!m || m.dead || m.plat !== GROUND || s.plat !== GROUND || m.busy || m.stun > 0) return;
+    yield* walkTo(s, m.x - m.facing * 12, 14);
+    const bk = backOf(m); if (!bk || s.plat !== GROUND) return;
+    s.onlyBack = m;
+    yield* jumpTo(s, m.x, bk.y, 10);
+    if (s.plat && s.plat.carrier) { s.emote('heart', 1.5); yield* idle(s, rand(4, 10)); }
+  },
+};
+function* lambTag(s) {
+  let t = 0; const dur = rand(4, 10);
+  while (t < dur) {
+    const m = s.mom;
+    if (!m || m.dead) return;
+    if (!s.plat) { t += yield; continue; }
+    if (m.plat && !m.plat.carrier && m.plat !== s.plat) {
+      if (s.plat.carrier) { yield* hopDown(s); continue; }
+      const r = route(s.plat, m.plat);
+      if (r && r.length && !m.plat.thin) yield* hopStep(s, r[0]);
+      else { s.frame = 'bah'; s.baa('MEH'); yield* wait(1); s.frame = 'stand'; }
+      t += 1; continue;
+    }
+    if (m.plat !== s.plat) { t += yield; continue; }
+    const tx = m.x - m.facing * 10, dx = tx - s.x, dt0 = 1 / 30;
+    if (Math.abs(dx) > 4) { s.facing = Math.sign(dx); s.vx = Math.sign(dx) * (Math.abs(dx) > 30 ? 20 : 12); s.frame = Math.floor(s.age * 8) % 2 ? 'walk1' : 'walk2'; }
+    else { s.vx = 0; s.facing = Math.sign(m.x - s.x) || s.facing; s.frame = m.frame.startsWith('eat') ? m.frame : m.frame === 'sleep' ? 'sleep' : 'stand'; }
+    if (!s.plat.ground && (s.x + s.vx * dt0 < s.plat.x0 + 2 || s.x + s.vx * dt0 > s.plat.x1 - 2)) s.vx = 0;
+    if (chance(0.003)) { yield* ACTS.hop(s); }
+    t += yield;
+  }
+  s.vx = 0; s.frame = 'stand';
+}
+function* sheepLife(s) {
+  yield* wait(rand(0, 0.6));
+  for (;;) {
+    if (!s.plat) { yield; continue; }
+    if (s.plat.carrier) { yield* idle(s, rand(1.5, 5)); if (s.plat && s.plat.carrier) yield* hopDown(s); continue; }
+    if (s.lamb && s.mom && !s.mom.dead && chance(0.55)) { if (chance(0.12)) yield* ACTS.ride(s); else yield* lambTag(s); continue; }
+    const p = s.plat, up = !p.ground;
+    const c = weighted({
+      graze: p.ground ? 4 : 0.5, wander: 3, climb: p.ground ? 1.2 : 0.7, down: up ? 1.6 : 0, edge: up && openEdges(p).length ? 1.8 : 0,
+      nap: world.dark > 0.5 ? 8 : 0.7, look: 1.4, baa: 0.9, friend: 1.1, stare: 0.9 * s.dumb, trip: p.ground ? 0.3 * s.dumb : 0, hop: 0.5,
+    });
+    yield* ACTS[c](s);
+    yield* wait(rand(0.1, 0.7));
+  }
+}
+
+// ---------------------------------------------------------------- little friends: butterflies and birds
+const BUTTERFLY_COLS = [['#ffb13a', '#ff7a1a'], ['#8ad4ff', '#4a9aff'], ['#ffc6ea', '#ff7ac8'], ['#fff29a', '#ffd23a']];
+class Butterfly {
+  constructor(x, y, o = {}) { Object.assign(this, { x, y, vx: 0, vy: 0, layer: 'air', dead: false, col: pick(BUTTERFLY_COLS), rest: 0, ph: rand(0, 6.28), speed: rand(12, 18), leaving: false, tx: x, ty: y, perch: null, host: null }, o); world.ents.push(this); this.pick(); }
+  pick() {
+    if (chance(0.25)) { const s = pick(flock().filter(s => s.plat && s.stun <= 0)); if (s) { this.host = s; return; } }
+    this.host = null;
+    const f = pick(scene.flowers.filter(f => f.type !== 'grass' && f.eaten <= 0));
+    if (f) { this.perch = f; this.tx = f.x; this.ty = f.y - 3; } else { this.tx = rand(0, W); this.ty = rand(HY, GY); }
+  }
+  update(dt) {
+    if (this.script) return;
+    this.ph += dt;
+    if (this.leaving) { this.tx = this.x < W / 2 ? -20 : W + 20; this.ty = this.y - 20; this.host = null; }
+    else if (this.host) { const h = this.host; if (h.dead || !h.plat) this.pick(); else { this.tx = h.x + h.facing * (h.lamb ? 3 : 5); this.ty = h.headY - 2; } }
+    if (this.rest > 0) {
+      this.rest -= dt;
+      if (this.host) { this.x = this.tx; this.y = this.ty; if (Math.abs(this.host.vx) > 0 || this.host.stun > 0) this.rest = 0; }
+      if (this.rest <= 0 || world.wind > 1.2) { this.host = null; this.perch = null; this.pick(); }
+      return;
+    }
+    const dx = this.tx - this.x, dy = this.ty - this.y, d = Math.hypot(dx, dy);
+    if (d < 1.5 && !this.leaving) { if (this.perch || this.host) this.rest = rand(2, 6); else this.pick(); return; }
+    const k = Math.min(1, dt * 2);
+    this.vx = lerp(this.vx, (dx / (d || 1)) * this.speed, k); this.vy = lerp(this.vy, (dy / (d || 1)) * this.speed, k);
+    this.x += (this.vx + world.wind * 5) * dt; this.y += (this.vy + Math.sin(this.ph * 7) * 12) * dt;
+    if (this.leaving && (this.x < -15 || this.x > W + 15)) this.dead = true;
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y), open = this.rest > 0 ? Math.sin(this.ph * 2) > 0.6 : Math.sin(this.ph * 22) > 0, [c1, c2] = this.col;
+    if (open) { px(X - 1, Y - 1, c1); px(X + 1, Y - 1, c1); px(X - 1, Y, c2); px(X + 1, Y, c2); } else { px(X, Y - 2, c1); px(X, Y - 1, c2); }
+    px(X, Y, '#3a2a2a');
+  }
+}
+class Bird {
+  constructor(o = {}) {
+    const dir = coin();
+    Object.assign(this, { layer: 'air', dead: false, dir, x: dir > 0 ? -8 : W + 8, y: rand(10, HY - 10), vx: 0, state: 'fly', host: null, t: 0, col: pick(['#5a8ad0', '#e05a48', '#e8b830', '#6a5a4a']), sit: rand(4, 12) }, o);
+    world.ents.push(this);
+    if (chance(0.5)) this.host = pick(flock().filter(s => s.plat && !s.lamb && s.stun <= 0)) || null;
+  }
+  update(dt) {
+    this.t += dt;
+    if (this.state === 'fly') {
+      if (this.host && !this.host.dead) {
+        const tx = this.host.x - this.host.facing * 2, ty = this.host.y - (this.host.frame === 'sleep' ? 9 : 13), dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy);
+        this.dir = Math.sign(dx) || this.dir;
+        if (d < 2) { this.state = 'perch'; return; }
+        this.x += dx / d * 40 * dt; this.y += dy / d * 40 * dt;
+      } else { this.x += this.dir * 45 * dt; this.y += Math.sin(this.t * 3) * 8 * dt - 6 * dt; if (this.x < -12 || this.x > W + 12) this.dead = true; }
+    } else {
+      const h = this.host;
+      if (!h || h.dead || !h.plat || h.stun > 0 || Math.abs(h.vx) > 0 || h.frame === 'jump' || (this.sit -= dt) <= 0) { this.state = 'fly'; this.host = null; this.dir = coin(); return; }
+      this.x = h.x - h.facing * 2; this.y = h.y - (h.frame === 'sleep' || h.frame === 'lie' ? 9 : 13);
+      if (chance(dt * 0.4)) popText(this.x, this.y - 1, pick(['TWEET', '~']), '#ffffff', 1);
+    }
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y), c = this.col;
+    if (this.state === 'perch') { px(X, Y - 1, c); px(X + this.dir, Y - 2, c); px(X + this.dir * 2, Y - 2, '#ffb030'); px(X - this.dir, Y - 1, c); px(X, Y, '#ffb030'); return; }
+    const up = Math.floor(this.t * 9) % 2;
+    px(X, Y, c); px(X - 1, Y - up, c); px(X + 1, Y - up, c); px(X + this.dir, Y + 1 - 1, c); px(X + this.dir * 2, Y, '#ffb030');
+  }
+}
+
+// ---------------------------------------------------------------- flock
+function populate() {
+  const n = clamp(Math.round(W / 42), 5, 9), adults = [];
+  for (let i = 0; i < n; i++) {
+    const variant = i === 1 ? 'black' : chance(0.3) ? 'cream' : 'white';
+    adults.push(new Sheep({ x: rand(12, W - 12), variant, facing: coin() }));
+  }
+  for (let i = 0; i < (n > 6 ? 2 : 1); i++) {
+    const mom = adults[i === 0 ? 0 : 2];
+    new Sheep({ x: clamp(mom.x + rand(-12, 12), 8, W - 8), variant: mom.variant === 'black' ? 'white' : mom.variant, lamb: true, mom, dumb: 1 });
+  }
+  const up = new Sheep({ plat: CLIFF, x: (CLIFF.x0 + CLIFF.x1) / 2, variant: 'white' });
+  up.x = clamp(up.x, 8, W - 8);
+  for (let i = 0; i < 3; i++) new Butterfly(rand(0, W), rand(HY, GY));
+}
+const amb = { birdT: rand(6, 14), flyT: 3 };
+function ambientTick(dt) {
+  const calm = world.snow < 0.2 && world.dark < 0.5;
+  const bflies = world.ents.filter(e => e instanceof Butterfly && !e.leaving);
+  if (calm && bflies.length < 4 && chance(dt * 0.2)) new Butterfly(chance(0.5) ? -5 : W + 5, rand(HY, GY));
+  if (!calm) bflies.forEach(b => (b.leaving = true));
+  if ((amb.birdT -= dt) <= 0) { amb.birdT = rand(12, 30); if (calm) new Bird(); }
+  for (const f of scene.flowers) if (f.eaten > 0) f.eaten -= dt;
+}
+
+// ---------------------------------------------------------------- guest stars: dog, frog, ball, wool, snowball
+function tickEmotes(e, dt) { for (const m of e.emotes) m.t += dt; e.emotes = e.emotes.filter(m => m.t < m.dur); }
+function drawEmotes(e, x, y) { for (const m of e.emotes) { const k = m.t / m.dur; if (k > 0.75 && Math.floor(world.t * 12) % 2) continue; drawSpr(ICONS[m.name], x, y - Math.min(1, k * 3) * 4, 1); } }
+function dogSpr(pose) {
+  const b = new SB(24, 16), K = '#2e2a34', KS = '#1e1a24', Wt = '#f6f4f0', WS = '#d8d2cc';
+  if (pose === 'lie') {   // belly up, legs in the air, very happy
+    b.ell(11, 12, 6, 2.6, K, KS); b.ell(11, 11, 3.5, 1.4, Wt, WS);
+    for (const x of [7, 9, 13, 15]) { b.set(x, 8, K); b.set(x, 7, Wt); }
+    b.ell(18, 11.5, 2.8, 2.3, K, KS); b.ell(20, 12.5, 1.8, 1.1, Wt, WS); b.set(18, 10, Wt);
+    b.set(20, 14, '#ff7a9a'); b.set(17, 12, EYE);
+    b.set(4, 11, K); b.set(3, 10, K); b.set(2, 9, Wt);
+    return b.outline(INK);
+  }
+  const sit = pose === 'sit';
+  if (sit) { b.set(4, 13, K); b.set(3, 13, K); b.set(2, 12, Wt); }
+  else { const up = pose === 'wag' || pose === 'run2'; b.set(4, 8, K); b.set(3, up ? 7 : 8, K); b.set(2, up ? 6 : 9, Wt); }
+  const legs = pose === 'run1' ? [[6, 12], [5, 13], [4, 14], [14, 12], [15, 13], [16, 14]] : pose === 'run2' ? [[7, 12], [8, 13], [9, 14], [12, 12], [11, 13], [10, 14]]
+    : sit ? [[13, 12], [13, 13], [13, 14], [15, 12], [15, 13], [15, 14]] : [[6, 12], [6, 13], [6, 14], [8, 12], [8, 13], [8, 14], [13, 12], [13, 13], [13, 14], [15, 12], [15, 13], [15, 14]];
+  for (const [x, y] of legs) b.set(x, y, y >= 14 ? Wt : K);
+  if (sit) b.ell(9, 11, 4.5, 3, K, KS); else b.ell(10, 9.5, 5.8, 2.8, K, KS);
+  b.ell(sit ? 13 : 14.5, sit ? 9.5 : 10, 2.2, 2.2, Wt, WS);
+  const hx = sit ? 16 : 18, hy = sit ? 5 : 6.5;
+  b.ell(hx, hy, 2.9, 2.6, K, KS);
+  b.ell(hx + 2.1, hy + 1.2, 1.8, 1.1, Wt, WS);
+  b.set(hx, hy - 2, Wt); b.set(hx, hy - 1, Wt);
+  b.set(hx - 2, hy - 3, K); b.set(hx - 1, hy - 3, K); b.set(hx - 2, hy - 2, KS);
+  b.set(hx + 1, hy - 1, EYE); b.set(hx + 4, hy + 1, EYE);
+  if (pose !== 'stand') b.set(hx + 2, hy + 3, '#ff7a9a');
+  return b.outline(INK);
+}
+let DOG = null;
+class Dog {
+  constructor(o) { if (!DOG) { DOG = {}; for (const p of ['run1', 'run2', 'stand', 'wag', 'sit', 'lie']) DOG[p] = bake(dogSpr(p), 11, 14); } Object.assign(this, { layer: 'mid', dead: false, x: 0, y: GY + 7, vx: 0, facing: 1, frame: 'run1', t: 0, emotes: [] }, o); world.ents.push(this); }
+  emote(n, d = 1.6) { this.emotes.push({ name: n, t: 0, dur: d }); }
+  update(dt) {
+    this.t += dt; this.x += this.vx * dt; tickEmotes(this, dt);
+    if (Math.abs(this.vx) > 0.5) { this.facing = Math.sign(this.vx); this.frame = Math.floor(this.t * 10) % 2 ? 'run1' : 'run2'; if (chance(dt * 8)) dust(this.x, this.y, 1); }
+    else if (this.frame === 'stand' || this.frame === 'wag') this.frame = Math.floor(this.t * 4) % 2 ? 'stand' : 'wag';
+  }
+  draw() { ctx.globalAlpha = 0.18; rect(this.x - 7, this.y, 14, 1, '#1e3a20'); ctx.globalAlpha = 1; drawSpr(DOG[this.frame], this.x, this.y, this.facing); drawEmotes(this, this.x + this.facing * 5, this.y - 16); }
+}
+class Frog {
+  constructor(o) { Object.assign(this, { layer: 'mid', dead: false, x: 0, y: GY + 7, z: 0, facing: 1, t: 0, jump: null, emerge: 0 }, o); world.ents.push(this); }
+  hopTo(x, y, h = 10) { this.jump = { x0: this.x, y0: this.y, x1: x, y1: y, t: 0, dur: 0.45, h }; this.facing = Math.sign(x - this.x) || this.facing; }
+  update(dt) {
+    this.t += dt; this.emerge = Math.min(1, this.emerge + dt * 2);
+    const j = this.jump;
+    if (j) { j.t += dt; const k = Math.min(1, j.t / j.dur); this.x = lerp(j.x0, j.x1, k); this.y = lerp(j.y0, j.y1, k); this.z = Math.sin(k * Math.PI) * j.h; if (k >= 1) { this.jump = null; this.z = 0; } }
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y - this.z - (1 - this.emerge) * -3), f = this.facing, air = !!this.jump;
+    rect(X - 3, Y - 3, 7, 3, '#2e5a24'); rect(X - 2, Y - 4, 5, 1, '#2e5a24');
+    rect(X - 2, Y - 3, 5, 2, '#6ac84a'); px(X - 2 * f, Y - 3, '#4a9a3a'); px(X + f, Y - 1, '#d8f4a8');
+    px(X - 1, Y - 5, '#2e5a24'); px(X + 1, Y - 5, '#2e5a24'); px(X - 1, Y - 4, '#ffffff'); px(X + 1, Y - 4, '#ffffff'); px(X - 1 + (f > 0 ? 0 : 0), Y - 4, '#ffffff');
+    px(X + (f > 0 ? 1 : -1), Y - 4, EYE);
+    if (air) { px(X - 3 * f, Y, '#6ac84a'); px(X - 4 * f, Y + 1, '#6ac84a'); } else { px(X - 3, Y, '#4a9a3a'); px(X + 3, Y, '#4a9a3a'); }
+  }
+}
+class Ball {
+  constructor(o) { Object.assign(this, { x: 0, y: GY + 4, vx: 0, vy: 0, layer: 'mid', dead: false, rot: 0, leaving: false }, o); world.ents.push(this); }
+  update(dt) {
+    const prevY = this.y;
+    this.vy += G * dt; this.x += this.vx * dt; this.y += this.vy * dt; this.rot += this.vx * dt / 3;
+    if (!this.leaving) { if (this.x < 4 && this.vx < 0) this.vx = -this.vx * 0.7; if (this.x > W - 4 && this.vx > 0) this.vx = -this.vx * 0.7; }
+    else if (this.x < -12 || this.x > W + 12 || this.y > H + 20) this.dead = true;
+    for (const p of plats) {
+      const py = p.ground ? GY + 4 : p.y;
+      if (!p.ground && (this.x < p.x0 || this.x > p.x1)) continue;
+      if (this.vy >= 0 && prevY <= py + 0.5 && this.y >= py) {
+        this.y = py;
+        if (this.vy > 45) { this.vy *= -0.55; if (this.vy < -40) dust(this.x, py, 2); } else { this.vy = 0; this.vx *= Math.pow(0.35, dt); if (!p.ground) this.vx += (this.x < (p.x0 + p.x1) / 2 ? -40 : 40) * dt; }
+        break;
+      }
+    }
+  }
+  draw() {
+    const X = Math.round(this.x), cy = Math.round(this.y - 3);
+    ctx.globalAlpha = 0.2; rect(X - 2, Math.max(this.y, GY + 4) + 1, 5, 1, '#1e3a20'); ctx.globalAlpha = 1;
+    for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+      const d2 = dx * dx + dy * dy; if (d2 > 10) continue;
+      if (d2 > 6) { px(X + dx, cy + dy, INK); continue; }
+      const a = Math.atan2(dy, dx) + this.rot;
+      px(X + dx, cy + dy, Math.floor(((a % 6.283) + 6.283) / 1.5708) % 2 ? '#ffffff' : '#e8483a');
+    }
+    px(X - 1, cy - 1, '#ffe0e0');
+  }
+}
+let WOOL = null;
+function woolSprite() {
+  const b = new SB(20, 17);
+  for (const [x, y, r] of BODY) b.ell(x + 2, y, r, r, '#ffffff', '#dedae8');
+  b.ell(3.6, 9.4, 1.9, 1.9, '#ffffff', '#dedae8');
+  return bake(b.outline(INK), 10, 15);
+}
+class Wool {
+  constructor(o) { if (!WOOL) WOOL = woolSprite(); Object.assign(this, { x: 0, y: 0, layer: 'air', dead: false, t: 0 }, o); world.ents.push(this); }
+  update(dt) { this.t += dt; }
+  draw() { drawSpr(WOOL, this.x, this.y, 1); }
+}
+class Snowball {
+  constructor(o) { Object.assign(this, { x: 0, y: 0, vx: 0, vy: 0, r: 3, layer: 'mid', dead: false, rot: 0, caught: [], grounded: false, dir: 1, onCliff: true }, o); world.ents.push(this); }
+  update(dt) {
+    if (this.onCliff) { this.x += this.vx * dt; if (this.x < CLIFF.x0 - 1 || this.x > CLIFF.x1 + 1) this.onCliff = false; }
+    else if (!this.grounded) { this.vy += G * dt; this.x += this.vx * dt; this.y += this.vy * dt; if (this.y >= GY + 7) { this.y = GY + 7; this.grounded = true; this.vx = this.dir * 30; dust(this.x, this.y, 8, ['#ffffff', '#e8f0ff']); } }
+    else { this.x += this.vx * dt; this.r = Math.min(11, this.r + dt * 0.9); if (chance(dt * 10)) addPart(this.x - this.dir * this.r, this.y, -this.dir * rand(5, 15), rand(-10, -3), 0.5, '#ffffff', { drag: 0.3 }); }
+    this.rot += this.vx * dt / Math.max(2, this.r);
+  }
+  draw() {
+    const X = Math.round(this.x), R = Math.round(this.r), cy = Math.round(this.y - R);
+    ctx.globalAlpha = 0.2; rect(X - R, this.y, R * 2, 1, '#2a3a50'); ctx.globalAlpha = 1;
+    this.caught.forEach((s, i) => {
+      const v = VARIANTS[s.variant];
+      for (const off of [0, 0.35]) { const a = this.rot + i * 2.4 + off; for (let j = 0; j < 3; j++) px(X + Math.cos(a) * (R + j), cy + Math.sin(a) * (R + j), v.L); }
+    });
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+      const d2 = dx * dx + dy * dy; if (d2 > R * R + 1) continue;
+      px(X + dx, cy + dy, d2 > (R - 1) * (R - 1) + 1 ? '#9aaac0' : dx + dy < -R * 0.7 ? '#ffffff' : dy > R * 0.35 && bayer(dx + 20, dy + 20) < 0.6 ? '#d4e0ee' : '#f2f6ff');
+    }
+    if (this.caught.length) { const a = this.rot * 0.5 + 1; const fx = X + Math.round(Math.cos(a) * (R - 2)), fy = cy + Math.round(Math.sin(a) * (R - 2)); rect(fx - 1, fy - 1, 3, 3, '#4c4250'); px(fx, fy - 1, '#ffffff'); }
+  }
+}
+
+// ---------------------------------------------------------------- event helpers
+const free = (fn = () => true) => flock().filter(s => !s.busy && s.stun <= 0 && s.plat && !s.plat.carrier && s.variant !== 'wolf' && !s.hidden && fn(s));
+const grab = list => { list.forEach(s => s.claim()); return list; };
+const byDist = x => (a, b) => Math.abs(a.x - x) - Math.abs(b.x - x);
+function* recover(list, max = 6) { yield* until(() => list.every(s => s.dead || (s.plat && s.stun <= 0)), max); }
+function* sleepUntil(s, flag) { s.frame = 'lie'; yield* wait(rand(0.4, 1)); s.frame = 'sleep'; let t = rand(0, 2); while (!flag.wake) { const dt = yield; t += dt; if (t > 2.4) { t = 0; if (chance(0.6)) s.emote('z', 1.4); } } }
+
+// ---------------------------------------------------------------- COMMON EVENTS
+// Follow the leader: one sheep marches purposefully up the cliff, the flock lines up behind it... and it walks right off the edge. So does everyone else.
+function* evFollow() {
+  const P = CLIFF, pool = free(s => !s.lamb);
+  if (pool.length < 3) return;
+  const leader = pool.sort(byDist((P.x0 + P.x1) / 2))[0];
+  const followers = pool.filter(s => s !== leader).slice(0, randi(2, 4));
+  const lamb = free(s => s.lamb)[0];
+  if (lamb && chance(0.7)) followers.push(lamb);
+  grab([leader, ...followers]);
+  const dir = props.cliff.side < 0 ? 1 : -1, edgeX = dir > 0 ? P.x1 : P.x0;
+  leader.frame = 'bah'; leader.baa('BAA!'); leader.emote('sparkle', 1.5);
+  yield* wait(0.8);
+  leader.frame = 'stand';
+  followers.forEach((f, i) => later(() => f.emote(pick(['bang', 'heart', 'note']), 1.2), 0.3 + i * 0.3));
+  leader.act((function* () { yield* goTo(leader, P); yield* walkTo(leader, edgeX - dir * 6, 9); leader.facing = dir; })());
+  followers.forEach((f, i) => f.act((function* () { yield* wait(1 + i * 1.3); yield* goTo(f, P); yield* walkTo(f, edgeX - dir * (13 + i * 7), 9); f.facing = dir; })()));
+  yield* until(() => [leader, ...followers].every(s => !s.brain), 50);
+  if (leader.plat !== P) return;
+  yield* wait(1.2);
+  leader.emote('sparkle', 1);
+  leader.act(walkTo(leader, edgeX + dir * 10, 9, { offEdge: true }));
+  yield* until(() => !leader.brain, 8);
+  yield* wait(0.8);
+  for (const f of followers) {
+    if (f.plat !== P) continue;
+    f.act((function* () { f.emote('bang', 0.8); yield* wait(0.3); yield* walkTo(f, edgeX + dir * 10, 10, { offEdge: true }); })());
+    yield* until(() => !f.brain, 10);
+    yield* wait(rand(0.2, 0.7));
+  }
+  yield* recover([leader, ...followers], 8);
+  leader.facing *= -1; leader.emote('q', 2);
+  yield* wait(1.4);
+  followers.forEach((f, i) => later(() => f.emote(pick(['dots', 'heart', 'sparkle']), 1.6), i * 0.35));
+  yield* wait(2.5);
+}
+
+// Sheep tower: sheep climb onto each other's backs, the tower wobbles, the bottom sheep sneezes
+function* evStack() {
+  const ground = free(s => s.plat === GROUND && !s.lamb);
+  if (ground.length < 3) return;
+  const base = ground.sort(byDist(W / 2))[0];
+  const crew = [base, ...ground.filter(s => s !== base).sort(byDist(base.x)).slice(0, 2)];
+  const lamb = free(s => s.lamb && s.plat === GROUND)[0];
+  if (lamb) crew.push(lamb);
+  grab(crew);
+  const clearSpots = [];
+  for (let x = 30; x <= W - 30; x += 4) if (!plats.some(p => !p.ground && p.x1 > x - 22 && p.x0 < x + 22)) clearSpots.push(x);
+  const spot = clearSpots.sort((a, b) => Math.abs(a - base.x) - Math.abs(b - base.x))[0] ?? clamp(base.x, 40, W - 40);
+  base.act(walkTo(base, spot, 9));
+  yield* until(() => !base.brain, 10);
+  base.emote('q', 1.5);
+  let top = base;
+  for (const s of crew.slice(1)) {
+    const target = top;
+    s.act((function* () {
+      const side = s.x < base.x ? -1 : 1;
+      yield* walkTo(s, base.x + side * 15, 11);
+      s.facing = -side; yield* wait(0.5);
+      const bk = backOf(target);
+      if (bk) { s.soft = true; s.onlyBack = target; yield* jumpTo(s, target.x, bk.y, 8); s.soft = false; }
+    })());
+    yield* until(() => !s.brain, 20);
+    if (s.plat && s.plat.carrier === target) { top = s; s.emote(chance(0.5) ? 'sparkle' : 'heart', 1.4); target.emote('sweat', 1.4); yield* wait(0.9); }
+  }
+  const tower = crew.filter(s => s.plat && s.plat.carrier);
+  if (!tower.length) { yield* wait(1); return; }
+  let t = 0;
+  while (t < 5) {
+    const dt = yield; t += dt;
+    tower.forEach((s, i) => { s.vx = Math.sin(t * (3 + t * 0.4) + i * 1.3) * 12; s.facing = Math.sin(t * 0.7 + i) > 0 ? 1 : -1; });
+    if (chance(dt * 1.2)) pick(tower).emote(pick(['note', 'sparkle', 'sweat']), 1.2);
+  }
+  base.frame = 'bah'; yield* wait(0.5); base.frame = 'blink'; yield* wait(0.4);
+  popText(base.x, base.headY - 4, 'ACHOO!', '#ffffff', 1.5);
+  for (const s of tower) { s.plat = null; s.vy = -rand(70, 120); s.vx = coin() * rand(15, 35); s.frame = 'fall'; s.fromY = s.y - 40; }
+  base.stunFor(1.2, 'dizzy');
+  yield* recover(crew, 6);
+  crew.forEach((s, i) => later(() => s.emote(pick(['q', 'heart', 'dots']), 1.6), i * 0.3));
+  yield* wait(2.5);
+}
+
+// A butterfly lands on a sheep's nose; the sheep follows it, totally mesmerised, straight into another sheep
+function* evButterfly() {
+  const s = free(s => s.plat === GROUND && !s.lamb).sort(byDist(W / 2))[0];
+  if (!s) return;
+  const other = free(o => o !== s && o.plat === GROUND).sort(byDist(s.x))[0];
+  grab(other ? [s, other] : [s]);
+  if (other) other.act((function* () { for (;;) yield* anim(other, ['eat1', 'eat1', 'eat2'], 3, 99); })());
+  const bf = new Butterfly(s.x < W / 2 ? -5 : W + 5, s.headY - 25, { script: true });
+  const nose = () => ({ x: s.x + s.facing * 10, y: s.headY + 4 });
+  for (let g = 0; g < 900; g++) {
+    const dt = yield, n = nose(), dx = n.x - bf.x, dy = n.y - bf.y, d = Math.hypot(dx, dy);
+    bf.ph += dt;
+    if (d < 1.5) break;
+    bf.x += dx / d * Math.min(d, 20 * dt); bf.y += dy / d * Math.min(d, 20 * dt) + Math.sin(bf.ph * 8) * 0.3;
+  }
+  bf.rest = 99; s.frame = 'up'; s.emote('heart', 1.8);
+  yield* wait(2.5);
+  bf.rest = 0;
+  const dir = other ? (Math.sign(other.x - s.x) || 1) : coin();
+  let t = 0;
+  while (t < 14) {
+    const dt = yield; t += dt; bf.ph += dt;
+    bf.x += dir * 6 * dt; bf.y = s.headY + 1 + Math.sin(t * 5) * 3;
+    s.facing = dir;
+    s.vx = Math.abs(bf.x - dir * 10 - s.x) > 1 ? dir * 7 : 0;
+    s.frame = s.vx ? (Math.floor(s.age * 6) % 2 ? 'walk1' : 'walk2') : 'up';
+    if (other && Math.abs(s.x - other.x) < 9) break;
+    if (!other && t > 7) break;
+    if (s.x < 6 || s.x > W - 6) break;
+  }
+  s.vx = 0;
+  if (other && Math.abs(s.x - other.x) < 10) {
+    other.brain = null;
+    popText((s.x + other.x) / 2, s.headY - 6, 'BONK', '#ffffff', 1.2);
+    s.stunFor(2.5); other.stunFor(2); other.emote('bang', 1);
+    woolFluff((s.x + other.x) / 2, s.y - 8, 6);
+    for (let g = 0; g < 60; g++) { const dt = yield; bf.ph += dt; bf.x = lerp(bf.x, s.x, dt * 3); bf.y = lerp(bf.y, s.y - 8, dt * 3); }
+    bf.rest = 99;
+    yield* wait(2);
+    s.emote('dots', 2);
+  } else { s.frame = 'stand'; s.emote('q', 1.6); }
+  bf.rest = 0; bf.script = false; bf.leaving = true;
+  yield* wait(2.5);
+}
+
+// Baa chorus: one after another, everyone joins in. Mostly.
+function* evChorus() {
+  const all = free();
+  if (all.length < 3) return;
+  grab(all);
+  const order = all.slice().sort((a, b) => a.x - b.x);
+  if (chance(0.5)) order.reverse();
+  const moo = order.find(s => s.variant === 'black');
+  const late = order.find(s => s.lamb) || order[order.length - 1];
+  for (const s of order) {
+    if (s === late) continue;
+    if (s.frame !== 'sleep') { s.frame = 'bah'; s.baa(s === moo ? 'MOO' : pick(['BAA', 'BAAA', 'MAA', 'BAA'])); }
+    yield* wait(0.35);
+    if (s.frame === 'bah') s.frame = 'stand';
+    yield* wait(rand(0.2, 0.5));
+  }
+  if (moo) {
+    yield* wait(0.6);
+    for (const s of order) if (s !== moo && s.frame !== 'sleep') { s.facing = Math.sign(moo.x - s.x) || s.facing; later(() => s.emote('q', 1.6), rand(0, 0.6)); }
+    yield* wait(2);
+    moo.emote('sweat', 1.6); moo.frame = 'bah'; moo.baa('BAA?'); yield* wait(0.6); moo.frame = 'stand';
+    yield* wait(0.8);
+    for (const s of order) if (s !== moo && s.frame !== 'sleep') later(() => s.emote('heart', 1.4), rand(0, 0.8));
+    yield* wait(1.5);
+  }
+  yield* wait(rand(2.5, 4));
+  for (const s of order) if (s !== late && s.frame !== 'sleep') s.facing = Math.sign(late.x - s.x) || s.facing;
+  late.frame = 'bah'; late.baa(late.lamb ? 'MEH' : 'BAA'); yield* wait(0.5); late.frame = 'stand';
+  yield* wait(0.6);
+  for (const s of order) if (s !== late && s.frame !== 'sleep') later(() => s.emote('dots', 2), rand(0, 0.5));
+  yield* wait(2.5);
+}
+
+// Sheepdog: the flock panics and runs, except one sheep who just walks up and says hi. The dog is delighted.
+function* evDog() {
+  const herd = free(s => s.plat === GROUND);
+  if (herd.length < 3) return;
+  grab(herd);
+  const dir = coin(), dog = new Dog({ x: dir > 0 ? -14 : W + 14, facing: dir, vx: dir * 45 });
+  const brave = herd.filter(s => !s.lamb).sort((a, b) => b.dumb - a.dumb)[0];
+  yield* until(() => (dir > 0 ? dog.x > 16 : dog.x < W - 16), 5);
+  dog.vx = dir * 20;
+  popText(dog.x, dog.y - 18, 'WOOF!', '#ffffff', 1.4);
+  for (const s of herd) {
+    if (s === brave) { s.emote('q', 1.5); continue; }
+    s.emote('bang', 1);
+    s.act((function* () { s.frame = 'scared'; yield* wait(rand(0.3, 0.7)); yield* walkTo(s, dir > 0 ? rand(W - 45, W - 10) : rand(10, 45), rand(24, 30)); s.facing = -dir; s.frame = 'scared'; yield* wait(1); s.frame = 'stand'; })());
+  }
+  brave.act((function* () { yield* wait(1); yield* walkTo(brave, clamp(W / 2 - dir * 20, 30, W - 30), 8); brave.facing = -dir; })());
+  yield* until(() => !brave.brain, 14);
+  for (let g = 0; g < 600; g++) {
+    const tx = brave.x - dir * 20;
+    if (Math.abs(dog.x - tx) < 2) break;
+    dog.vx = Math.sign(tx - dog.x) * 40; yield;
+  }
+  dog.vx = 0; dog.facing = dir; dog.frame = 'stand';
+  yield* wait(0.6); dog.emote('q', 1.2); brave.emote('q', 1.2); yield* wait(1.4);
+  brave.act(walkTo(brave, dog.x + dir * 13, 5));
+  yield* until(() => !brave.brain, 6);
+  brave.frame = 'happy'; brave.emote('heart', 1.8); dog.frame = 'sit'; yield* wait(1.2);
+  dog.frame = 'lie'; dog.emote('heart', 2); popText(dog.x, dog.y - 14, 'ARF!', '#ffffff', 1.2);
+  brave.frame = 'stand';
+  for (const s of herd) if (s !== brave) s.act((function* () {
+    yield* wait(rand(0.5, 3)); s.emote('q', 1.2);
+    yield* walkTo(s, clamp(dog.x + dir * rand(26, 50) * (chance(0.35) ? -1 : 1), 10, W - 10), 7);
+    s.facing = Math.sign(dog.x - s.x) || s.facing;
+    if (chance(0.4)) s.frame = 'lie'; else s.emote('heart', 1.4);
+  })());
+  yield* wait(9);
+  dog.frame = 'stand'; yield* wait(0.8);
+  popText(dog.x, dog.y - 18, 'WOOF', '#ffffff', 1.2);
+  herd.forEach(s => { if (s.frame === 'lie') s.frame = 'stand'; });
+  dog.vx = -dir * 45;
+  yield* until(() => dog.x < -20 || dog.x > W + 20, 10);
+  dog.dead = true;
+  herd.forEach((s, i) => later(() => { s.frame = 'bah'; s.baa(); later(() => { if (s.frame === 'bah') s.frame = 'stand'; }, 0.5); }, 0.3 + i * 0.4));
+  yield* wait(2);
+}
+
+// Nap pile: everybody snoozes together, a lamb sleeps on mum, a snore bubble grows... and pops
+function* evNap() {
+  const grp = free().sort(byDist(W / 2)).slice(0, 6);
+  if (grp.length < 3) return;
+  grab(grp);
+  const cx = clamp(W / 2 + rand(-40, 40), 40, W - 40), adults = grp.filter(s => !s.lamb), lambs = grp.filter(s => s.lamb), flag = { wake: false };
+  if (!adults.length) return;
+  adults.forEach((s, i) => s.act((function* () { yield* goTo(s, GROUND); yield* walkTo(s, cx + (i - adults.length / 2) * 13 + rand(-2, 2), 9); s.facing = coin(); yield* sleepUntil(s, flag); })()));
+  yield* wait(4);
+  lambs.forEach(l => l.act((function* () {
+    yield* goTo(l, GROUND);
+    const m = adults.includes(l.mom) ? l.mom : pick(adults);
+    yield* until(() => m.frame === 'sleep', 14);
+    yield* walkTo(l, m.x - 12, 12);
+    const bk = backOf(m);
+    if (bk) { l.soft = true; l.onlyBack = m; yield* jumpTo(l, m.x, bk.y, 6); l.soft = false; }
+    yield* sleepUntil(l, flag);
+  })()));
+  yield* wait(5);
+  const snorer = adults.find(s => s.frame === 'sleep') || adults[0];
+  const bub = addFx({ layer: 'front', dur: 1e9, r: 0, draw(f) {
+    if (f.r < 0.6) return;
+    const X = Math.round(snorer.x + snorer.facing * 11), Y = Math.round(snorer.y - 4), R = Math.round(f.r);
+    for (let a = 0; a < 20; a++) px(X + Math.cos(a / 20 * 6.283) * R, Y - R + Math.sin(a / 20 * 6.283) * R, '#c8ecff');
+    px(X - Math.round(R / 2), Y - R - Math.round(R / 2), '#ffffff');
+  } });
+  let t = 0;
+  while (t < 7) { const dt = yield; t += dt; bub.r = 1 + Math.abs(Math.sin(t * 1.4)) * t * 0.7; }
+  bub.dur = 0;
+  popText(snorer.x + snorer.facing * 11, snorer.y - 10, 'POP', '#c8ecff', 1);
+  snorer.emote('bang', 1); snorer.frame = 'lie';
+  yield* wait(1); snorer.facing *= -1; yield* wait(0.7); snorer.facing *= -1; yield* wait(0.5); snorer.frame = 'sleep';
+  const bird = new Bird(); bird.host = pick(adults);
+  yield* wait(rand(8, 11));
+  flag.wake = true;
+  for (const s of grp) {
+    yield* wait(rand(0.3, 0.8));
+    s.act((function* () { if (s.plat && s.plat.carrier) yield* hopDown(s); s.frame = 'lie'; yield* wait(0.4); s.frame = 'bah'; if (chance(0.6)) s.baa(s.lamb ? 'MEH' : 'BAAAA'); yield* wait(0.7); s.frame = 'stand'; })());
+  }
+  yield* wait(2);
+}
+
+// Head stuck in the haystack: legs kick, a friend gives a helpful shove, POP
+function* evStuck() {
+  if (!HAY_LOW) return;
+  const cand = free(s => !s.lamb).sort(byDist(HAY_LOW.x0));
+  if (cand.length < 2) return;
+  const s = cand[0], h = cand[1];
+  grab([s, h]);
+  const wd = HAY_LOW.wall === 'R' ? 1 : -1, wallX = wd > 0 ? HAY_LOW.x1 : HAY_LOW.x0;
+  s.act((function* () { yield* goTo(s, HAY_LOW); yield* walkTo(s, wallX - wd * 7, 9); })());
+  yield* until(() => !s.brain, 25);
+  if (s.plat !== HAY_LOW) return;
+  s.facing = wd; s.frame = 'stand'; s.emote('sparkle', 1);
+  yield* wait(1);
+  s.kinematic = true;
+  for (let t = 0; t < 0.4; t += 1 / 30) { s.x = lerp(wallX - wd * 7, wallX - wd * 2, t / 0.4); s.frame = 'push'; yield; }
+  s.clip = wd > 0 ? { x0: -99, x1: wallX, y0: 0, y1: H } : { x0: wallX, x1: W + 99, y0: 0, y1: H };
+  for (let i = 0; i < 10; i++) addPart(wallX, s.y - rand(5, 12), -wd * rand(5, 25), rand(-20, -5), rand(0.5, 1), ['#f8e08a', '#e8c460'], { grav: 60 });
+  let t = 0;
+  while (t < 3.5) {
+    const dt = yield; t += dt;
+    s.frame = Math.floor(t * 9) % 2 ? 'walk1' : 'walk2';
+    if (chance(dt * 5)) addPart(wallX, s.y - rand(5, 12), -wd * rand(2, 12), rand(-12, -2), 0.6, '#e8c460', { grav: 40 });
+    if (chance(dt * 0.9)) popText(s.x - wd * 6, s.y - 18, 'MMPH', '#ffffff', 0.9);
+  }
+  s.frame = 'stand';
+  h.act((function* () { yield* goTo(h, HAY_LOW); yield* walkTo(h, s.x - wd * 18, 9); h.facing = wd; })());
+  yield* until(() => !h.brain, 25);
+  if (h.plat === HAY_LOW) {
+    h.emote('q', 1.2); yield* wait(1.3);
+    h.emote('bang', 0.8); yield* wait(0.4);
+    for (let k = 0; k < 20 && Math.abs(h.x - (s.x - wd * 10)) > 1.5; k++) { h.x += wd * 2.2; h.frame = 'run1'; yield; }
+    h.frame = 'push';
+  } else { t = 0; while (t < 2.5) { const dt = yield; t += dt; s.frame = Math.floor(t * 12) % 2 ? 'walk1' : 'walk2'; } }
+  s.kinematic = false; s.clip = null; s.hat = 'hay'; s.plat = null; s.ignore = HAY_LOW; s.ignoreT = 0.5;
+  s.vx = -wd * 55; s.vy = -130; s.fromY = s.y - 40; s.frame = 'fall';
+  popText(wallX, s.y - 16, 'POP!', '#ffe080', 1.2);
+  for (let i = 0; i < 20; i++) addPart(wallX, s.y - 8, rand(-40, 40), rand(-60, -10), rand(0.6, 1.2), ['#f8e08a', '#e8c460', '#c8a040'], { grav: 120, drag: 0.6 });
+  if (h.plat === HAY_LOW) h.stunFor(1, 'dizzy');
+  yield* recover([s, h], 6);
+  s.emote('q', 1.5); yield* wait(1.5);
+  s.emote('heart', 1.5); h.emote('heart', 1.5);
+  later(() => { if (s.hat === 'hay') s.hat = null; }, 50);
+  yield* wait(1.5);
+}
+
+// Ball game: a ball bounces into the meadow, sheep chase it, headbutt it, and it comes down on someone's head
+function* evBall() {
+  const players = free(s => s.plat === GROUND);
+  if (players.length < 2) return;
+  grab(players);
+  const dir = coin(), ball = new Ball({ x: dir > 0 ? -6 : W + 6, y: GY - 20, vx: dir * 60, vy: 0 });
+  players.forEach(s => later(() => s.emote('bang', 1), rand(0, 0.8)));
+  const cool = new Map();
+  let t = 0;
+  const kicked = () => { for (const s of players) if (s.stun <= 0) s.frame = 'happy'; };
+  while (t < 20) {
+    const dt = yield; t += dt;
+    for (const s of players) {
+      if (s.stun > 0 || !s.plat) continue;
+      const dx = ball.x - s.x, chaser = s.lamb || s.dumb > 0.5;
+      s.facing = Math.sign(dx) || s.facing;
+      if (chaser && Math.abs(dx) > 8 && ball.y > GY - 30) { s.vx = Math.sign(dx) * (s.lamb ? 22 : 17); s.frame = Math.floor(s.age * 10) % 2 ? 'run1' : 'run2'; }
+      else { s.vx = 0; if ((cool.get(s) || 0) < t) s.frame = ball.y < s.headY - 12 ? 'up' : 'stand'; }
+      if (Math.abs(dx) < 8 && Math.abs(ball.y - s.y) < 12 && (cool.get(s) || 0) < t) {
+        cool.set(s, t + 1.3);
+        ball.vx = (Math.sign(W / 2 - ball.x + rand(-60, 60)) || s.facing) * rand(45, 90); ball.vy = -rand(120, 190);
+        s.frame = 'happy'; s.emote(pick(['sparkle', 'note', 'heart']), 1.2); popText(ball.x, ball.y - 8, pick(['BOING', 'BOP', 'BOUNCE']), '#ffffff', 0.8);
+      }
+    }
+    for (const s of players) if (s.stun <= 0 && ball.vy > 40 && Math.abs(ball.x - (s.x + s.facing * 6)) < 5 && Math.abs(ball.y - s.headY) < 4) {
+      ball.vy = -ball.vy * 0.8; ball.vx += rand(-30, 30); s.stunFor(1, 'dizzy'); s.emote('bang', 1); popText(ball.x, ball.y - 8, 'BONK', '#ffffff', 0.9);
+    }
+    void kicked;
+  }
+  // the big finish: BOOT it into the sky... and wait
+  const k = players.filter(s => s.stun <= 0 && s.plat === GROUND && !s.lamb).sort(byDist(ball.x))[0] || players[0];
+  yield* recover([k], 3);
+  k.act(walkTo(k, clamp(ball.x - (ball.x > W / 2 ? 1 : -1) * 8, 10, W - 10), 18));
+  for (let g = 0; g < 200 && k.brain; g++) { yield; for (const s of players) if (s !== k && s.stun <= 0) { s.vx = 0; s.frame = 'stand'; s.facing = Math.sign(ball.x - s.x) || s.facing; } }
+  k.facing = Math.sign(ball.x - k.x) || k.facing;
+  ball.x = k.x + k.facing * 6; ball.vx = 0; ball.vy = -440; ball.y = Math.min(ball.y, GY + 3);
+  k.frame = 'happy'; popText(k.x, k.headY - 6, 'BOOT!', '#ffe080', 1);
+  let hit = false;
+  for (let g = 0; g < 200; g++) {
+    yield;
+    for (const s of players) if (s.stun <= 0) { s.vx = 0; s.frame = 'up'; s.facing = Math.sign(ball.x - s.x) || s.facing; }
+    if (ball.vy > 0 && ball.y >= k.headY - 1) {
+      hit = true; ball.vy = -160; ball.vx = coin() * 70; ball.leaving = true;
+      k.stunFor(2.2, 'dizzy'); k.emote('bang', 1.2); popText(k.x, k.headY - 8, 'BONK', '#ffffff', 1.2);
+      break;
+    }
+  }
+  yield* wait(2);
+  players.forEach(s => { if (s !== k && s.stun <= 0) { s.frame = 'stand'; later(() => s.emote(pick(['dots', 'q']), 1.6), rand(0, 1)); } });
+  yield* until(() => ball.dead, 6);
+  ball.dead = true;
+  void hit;
+  yield* wait(1.5);
+}
+
+// Pronking: a lamb springs straight up for joy, an adult tries it... badly
+function* evPronk() {
+  const lamb = free(s => s.lamb && s.plat === GROUND)[0];
+  if (!lamb) return;
+  const adults = free(s => !s.lamb && s.plat === GROUND).sort(byDist(lamb.x)).slice(0, 2);
+  if (!adults.length) return;
+  grab([lamb, ...adults]);
+  const [a, b] = adults;
+  lamb.act(walkTo(lamb, clamp(lamb.x, 50, W - 50), 12));
+  yield* until(() => !lamb.brain, 8);
+  a.act((function* () { yield* walkTo(a, lamb.x + (a.x < lamb.x ? -22 : 22), 9); a.facing = Math.sign(lamb.x - a.x) || 1; })());
+  if (b) b.act((function* () { yield* walkTo(b, lamb.x + (b.x < lamb.x ? -40 : 40), 9); b.facing = Math.sign(lamb.x - b.x) || 1; })());
+  yield* until(() => !a.brain && (!b || !b.brain), 12);
+  const pronk = (s, vy) => { s.ignore = null; s.plat = null; s.vy = -vy; s.vx = 0; s.frame = 'jump'; s.fromY = s.y; };
+  lamb.soft = true;
+  for (let i = 0; i < 5; i++) { pronk(lamb, rand(130, 170)); lamb.facing *= i % 2 ? -1 : 1; if (i % 2 === 0) lamb.emote('sparkle', 1); yield* until(() => lamb.plat, 2); lamb.frame = 'happy'; yield* wait(0.2); }
+  lamb.soft = false; lamb.frame = 'stand';
+  a.emote('q', 1.5); yield* wait(1.3); a.emote('dots', 1.4); yield* wait(1.2);
+  a.soft = true; pronk(a, 70); yield* until(() => a.plat, 2); a.soft = false; a.frame = 'stand';
+  yield* wait(0.9); a.emote('sparkle', 1); yield* wait(0.5);
+  pronk(a, 210); a.fromY = a.y - 60;
+  yield* until(() => a.plat, 3);
+  lamb.act((function* () { yield* wait(0.8); yield* walkTo(lamb, a.x + (lamb.x < a.x ? -11 : 11), 10); lamb.facing = Math.sign(a.x - lamb.x) || 1; lamb.emote('heart', 1.6); })());
+  yield* recover([a], 4);
+  if (b) {
+    b.emote('bang', 1); yield* wait(1);
+    b.soft = true; pronk(b, 160); yield* until(() => b.plat, 3); b.soft = false;
+    b.frame = 'happy'; b.emote('sparkle', 1.5); yield* wait(1.2);
+    b.act(walkTo(b, clamp(b.x + b.facing * 25, 10, W - 10), 11));
+    yield* until(() => !b.brain, 5);
+    b.stunFor(1.3); b.emote('bang', 1); dust(b.x, b.y, 4);
+    yield* recover([b], 3);
+  }
+  a.emote('heart', 1.5);
+  yield* wait(2);
+}
+
+// Fainting sheep: a frog says RIBBIT, a sheep keels over stiff-legged. The frog sits on it. Then it happens again.
+function* evFaint() {
+  const s = free(s => !s.lamb && s.plat === GROUND).sort(byDist(W / 2))[0];
+  if (!s) return;
+  grab([s]);
+  const frog = new Frog({ x: clamp(s.x + s.facing * 22, 10, W - 10), y: GY + 7, facing: -s.facing });
+  yield* wait(0.6);
+  popText(frog.x, frog.y - 8, 'RIBBIT', '#c8ffaa', 1.4);
+  yield* wait(0.9);
+  s.frame = 'scared'; s.emote('bang', 1);
+  yield* wait(0.6);
+  s.stunFor(9, 'faint'); dust(s.x, s.y, 4);
+  yield* wait(1.2);
+  const sniffers = free(o => o.plat === GROUND && !o.lamb).sort(byDist(s.x)).slice(0, 2);
+  grab(sniffers);
+  sniffers.forEach((o, i) => o.act((function* () { yield* walkTo(o, s.x + (i ? 1 : -1) * 14, 10); o.facing = i ? -1 : 1; o.emote('q', 1.5); })()));
+  yield* until(() => sniffers.every(o => !o.brain), 14);
+  frog.hopTo(s.x, s.y - 7, 12);
+  yield* until(() => !frog.jump, 2);
+  yield* wait(1);
+  popText(frog.x, frog.y - 8, 'RIBBIT', '#c8ffaa', 1.4);
+  yield* wait(0.3);
+  for (const o of sniffers) { o.frame = 'scared'; o.emote('bang', 1); }
+  yield* wait(0.6);
+  for (const o of sniffers) o.stunFor(rand(3.5, 5), 'faint');
+  yield* wait(2);
+  frog.hopTo(clamp(frog.x + frog.facing * 18, -20, W + 20), GY + 7, 10);
+  for (let i = 0; i < 12 && frog.x > -10 && frog.x < W + 10; i++) { yield* until(() => !frog.jump, 2); yield* wait(0.3); frog.hopTo(frog.x + frog.facing * 16, GY + 7, 8); }
+  frog.dead = true;
+  s.stun = Math.min(s.stun, 1);
+  yield* recover([s, ...sniffers], 8);
+  [s, ...sniffers].forEach((o, i) => later(() => o.emote(pick(['dots', 'q', 'sweat']), 1.8), i * 0.4));
+  yield* wait(2.5);
+}
+
+// ---------------------------------------------------------------- RARE EVENTS
+// Blown away: a gust blows a sheep's whole fleece off. It hides behind the haystack until the fleece floats back down.
+function* evShear() {
+  const v = free(s => !s.lamb && s.variant !== 'black' && s.plat === GROUND).sort(byDist(W / 2))[0];
+  if (!v) return;
+  const watchers = free(s => s !== v && s.plat === GROUND).slice(0, 4);
+  grab([v, ...watchers]);
+  const leaves = dt => { if (chance(dt * 25)) addPart(rand(-10, W * 0.6), rand(HY - 20, GY), rand(60, 110), rand(-10, 10), rand(2, 4), pick(['#6ab454', '#94d86c', '#ffc6ea', '#ffffff']), { drag: 0.9, flutter: 14 }); };
+  let t = 0;
+  while (t < 3.5) { const dt = yield; t += dt; world.gust = Math.max(world.gust, t / 2); leaves(dt); v.frame = 'scared'; v.facing = 1; if (chance(dt * 4)) woolFluff(v.x, v.y - 10, 1); }
+  const wool = new Wool({ x: v.x - 1, y: v.y }); v.bald = true; v.frame = 'scared';
+  woolFluff(v.x, v.y - 8, 14); popText(v.x, v.headY - 4, 'EEP!', '#ffc4c6', 1.6); v.emote('bang', 1.2);
+  watchers.forEach(w => { w.facing = Math.sign(v.x - w.x) || w.facing; later(() => w.emote(pick(['bang', 'q', 'dots']), 1.6), rand(0.3, 1.2)); });
+  const hide = props.hay ? { x: props.hay.x + 18, edge: props.hay.x - 3 } : { x: props.boulder.x + props.boulder.w / 2, edge: props.boulder.x - 3 };
+  const st = { regrow: false };
+  v.act((function* () {
+    v.behind = true; v.lane = 1;
+    yield* walkTo(v, hide.x, 26);
+    while (!st.regrow) {
+      yield* wait(rand(2, 4)); if (st.regrow) break;
+      yield* walkTo(v, hide.edge, 7); v.facing = hide.edge < hide.x ? -1 : 1; v.emote('sweat', 1.4);
+      yield* wait(1.4); if (st.regrow) break;
+      yield* walkTo(v, hide.x, 16);
+    }
+  })());
+  // the fleece floats up to hang out with the clouds
+  t = 0;
+  const peakY = HY - 48;
+  while (t < 14) {
+    const dt = yield; t += dt;
+    world.gust = Math.max(0, 1.6 - t * 0.12); leaves(dt * world.gust);
+    wool.x += (t < 5 ? 22 : 3 * Math.sin(t * 0.5)) * dt; wool.y = lerp(wool.y, peakY + Math.sin(t * 0.8) * 3, dt * 0.6);
+    wool.x = clamp(wool.x, 20, W - 20);
+    for (const w of watchers) { w.facing = Math.sign(wool.x - w.x) || w.facing; w.frame = 'up'; }
+    if (chance(dt * 0.4)) { const w = pick(watchers); if (w) { w.frame = 'bah'; w.baa(w.lamb ? 'MEH' : 'BAA?'); } }
+  }
+  // ...and drifts back down onto its owner
+  st.regrow = true;
+  yield* until(() => !v.brain, 10);
+  v.act(walkTo(v, hide.edge - 16 * (hide.edge < hide.x ? 1 : -1), 10));
+  yield* until(() => !v.brain, 8);
+  v.behind = false; v.frame = 'up'; v.emote('q', 1.5);
+  for (let g = 0; g < 600; g++) {
+    const dt = yield, dx = v.x - 1 - wool.x, dy = v.y - wool.y;
+    if (Math.hypot(dx, dy) < 1.5) break;
+    wool.x += clamp(dx, -14, 14) * dt; wool.y += clamp(dy, -12, 12) * dt;
+    v.frame = 'up';
+  }
+  wool.dead = true; v.bald = false; v.frame = 'happy';
+  woolFluff(v.x, v.y - 8, 12); v.emote('sparkle', 1.8);
+  yield* wait(1); v.emote('heart', 1.8);
+  watchers.forEach(w => { w.frame = 'stand'; later(() => w.emote('heart', 1.4), rand(0, 1)); });
+  world.gust = 0;
+  yield* wait(2.5);
+}
+
+// A wolf in sheep's clothing: nobody notices. They all love the new sheep. The costume falls off. They love it anyway.
+function* evWolf() {
+  const herd = free();
+  if (herd.length < 3) return;
+  grab(herd);
+  const dir = coin(), wolf = new Sheep({ variant: 'wolf', x: dir > 0 ? -14 : W + 14, busy: true, facing: dir, dumb: 0, lane: 4 });
+  wolf.act(walkTo(wolf, clamp(W / 2 + rand(-30, 30), 50, W - 50), 7, { offscreen: true }));
+  yield* until(() => !wolf.brain, 40);
+  wolf.emote('dots', 2); yield* wait(1.6);
+  herd.forEach((s, i) => s.act((function* () {
+    yield* wait(0.3 + i * 0.5);
+    if (s.plat !== GROUND) yield* goTo(s, GROUND);
+    s.emote('heart', 1.5);
+    const side = s.x < wolf.x ? -1 : 1;
+    yield* walkTo(s, clamp(wolf.x + side * (12 + i * 5), 8, W - 8), 10);
+    s.facing = Math.sign(wolf.x - s.x) || 1;
+  })()));
+  yield* until(() => herd.every(s => !s.brain), 35);
+  wolf.emote('sweat', 1.6);
+  for (let k = 0; k < 4; k++) { const s = pick(herd); s.frame = 'bah'; s.baa(); s.emote('heart', 1.2); yield* wait(0.8); s.frame = 'stand'; }
+  const lamb = herd.find(s => s.lamb && s.plat === GROUND);
+  if (lamb) {
+    lamb.act((function* () { yield* walkTo(lamb, wolf.x - wolf.facing * 12, 12); const bk = backOf(wolf); if (bk) { lamb.soft = true; lamb.onlyBack = wolf; yield* jumpTo(lamb, wolf.x, bk.y, 8); lamb.soft = false; } })());
+    yield* until(() => !lamb.brain, 6);
+    lamb.emote('heart', 1.6); yield* wait(1.5);
+  }
+  for (let k = 0; k < 6; k++) { wolf.facing *= -1; yield* wait(0.13); }
+  wolf.bald = true;
+  woolFluff(wolf.x, wolf.y - 8, 16);
+  const costume = new Wool({ x: wolf.x, y: wolf.y + 1, layer: 'mid' });
+  costume.y = wolf.y + 1;
+  herd.forEach(s => { if (!s.plat || s.plat.carrier) return; s.frame = 'scared'; s.emote('bang', 1.2); });
+  wolf.emote('sweat', 1.6);
+  yield* wait(2.2);
+  herd.forEach(s => { if (s.frame === 'scared') s.frame = 'stand'; later(() => s.emote('heart', 1.4), rand(0, 1)); });
+  wolf.emote('q', 1.6);
+  yield* wait(2.2);
+  herd.forEach(s => { if (s.plat === GROUND) { s.frame = 'lie'; later(() => { if (s.frame === 'lie') s.frame = 'sleep'; }, rand(0.5, 2)); } });
+  wolf.frame = 'lie'; yield* wait(1); wolf.frame = 'sleep'; wolf.emote('heart', 2);
+  let t = 0;
+  while (t < 10) { const dt = yield; t += dt; if (chance(dt * 1.2)) pick([...herd, wolf]).emote('z', 1.4); }
+  herd.forEach(s => { if (s.plat === GROUND) s.frame = 'stand'; });
+  wolf.frame = 'stand';
+  if (lamb && lamb.plat && lamb.plat.carrier === wolf) { lamb.act(hopDown(lamb)); yield* until(() => !lamb.brain, 3); }
+  yield* wait(0.8);
+  costume.dead = true; wolf.bald = false; woolFluff(wolf.x, wolf.y - 8, 6);
+  wolf.frame = 'bah'; wolf.baa('BAA?'); yield* wait(0.7); wolf.frame = 'stand';
+  herd.forEach((s, i) => later(() => { s.emote('heart', 1.4); }, i * 0.2));
+  wolf.act(walkTo(wolf, dir > 0 ? W + 18 : -18, 8, { offscreen: true }));
+  yield* until(() => !wolf.brain, 45);
+  wolf.dead = true;
+  yield* wait(1);
+}
+
+// Too fluffy: static makes a sheep's wool so puffy it floats away. A friend jumps and grabs on. They land somewhere silly.
+function* evFloat() {
+  const s = free(s => !s.lamb && s.plat === GROUND && s.variant !== 'black').sort(byDist(W / 2))[0];
+  if (!s) return;
+  const jumper = free(o => o !== s && !o.lamb && o.plat === GROUND).sort(byDist(s.x))[0];
+  const watchers = free(o => o !== s && o !== jumper && o.plat === GROUND).slice(0, 4);
+  grab([s, ...(jumper ? [jumper] : []), ...watchers]);
+  let t = 0;
+  while (t < 2.5) { const dt = yield; t += dt; s.frame = Math.floor(t * 8) % 2 ? 'scared' : 'stand'; if (chance(dt * 12)) addPart(s.x + rand(-7, 7), s.y - rand(4, 15), 0, 0, 0.15, '#fff4a0'); }
+  popText(s.x, s.headY - 4, 'BZZT', '#fff4a0', 1.2);
+  s.kinematic = true; s.plat = null;
+  let fx = s.x, fy = s.y;
+  const hang = { on: false }, peak = HY - 6, target = chance(0.6) ? CLIFF : (HAY_TOP || CLIFF);
+  if (jumper) jumper.act((function* () {
+    yield* wait(1.5);
+    for (let k = 0; k < 3 && !hang.on; k++) {
+      yield* walkTo(jumper, s.x, 22);
+      yield* wait(0.25);
+      if (hang.on) return;
+      jumper.soft = k < 2; jumper.plat = null; jumper.ignore = null; jumper.fromY = jumper.y;
+      jumper.vy = -Math.sqrt(2 * G * clamp(jumper.y - 16 - fy, 10, 70)); jumper.vx = 0; jumper.frame = 'jump';
+      yield* until(() => jumper.plat || hang.on, 3);
+      jumper.soft = false;
+      if (!hang.on) { jumper.emote('sweat', 1); yield* recover([jumper], 3); }
+    }
+  })());
+  const floaters = () => [s, ...(hang.on ? [jumper] : [])];
+  let phase = 'rise';
+  t = 0;
+  for (let g = 0; g < 30 * 60; g++) {
+    const dt = yield; t += dt;
+    if (phase === 'rise') { fy -= (hang.on ? 5 : 9) * dt; fx += Math.sin(t * 0.7) * 5 * dt; if (fy <= peak) { phase = 'hover'; t = 0; } }
+    else if (phase === 'hover') { fx += Math.sin(t * 0.5) * 6 * dt; fy = peak + Math.sin(t * 1.1) * 2; if (t > 7) phase = 'drift'; }
+    else if (phase === 'drift') {
+      const cx = (target.x0 + target.x1) / 2, floor = target.y - (hang.on ? 15 : 0);
+      fx += clamp(cx - fx, -8, 8) * dt;
+      if (Math.abs(cx - fx) < 3) fy += 7 * dt;
+      if (fy >= floor) break;
+    }
+    fx = clamp(fx, 10, W - 10);
+    s.x = fx; s.y = fy + Math.sin(world.t * 2) * 0.8; s.frame = 'fall'; s.facing = Math.sin(t * 0.3) > 0 ? 1 : -1;
+    if (jumper && !hang.on && !jumper.plat && Math.abs(jumper.x - s.x) < 7 && Math.abs(jumper.y - 16 - s.y) < 7) {
+      hang.on = true; jumper.brain = null; jumper.kinematic = true; jumper.emote('bang', 1); s.emote('heart', 1.5);
+    }
+    if (hang.on) { jumper.x = s.x; jumper.y = s.y + 15; jumper.frame = 'fall'; jumper.facing = s.facing; }
+    for (const w of watchers) { if (w.stun > 0) continue; w.facing = Math.sign(s.x - w.x) || w.facing; w.frame = 'up'; if (chance(dt * 0.15)) { w.frame = 'bah'; w.baa(w.lamb ? 'MEH!' : 'BAA!'); } }
+    if (chance(dt * 0.5)) s.emote(pick(['q', 'sweat', 'note']), 1.4);
+  }
+  if (phase !== 'drift') { s.kinematic = false; s.vy = 0; s.fromY = s.y; if (hang.on) { jumper.kinematic = false; jumper.vy = 0; jumper.fromY = jumper.y; } }
+  else {
+    if (hang.on) { jumper.kinematic = false; jumper.plat = null; jumper.vy = 0; jumper.vx = 0; jumper.fromY = jumper.y; yield* until(() => jumper.plat, 2); yield* wait(0.3); }
+    s.kinematic = false; s.plat = null; s.vy = 0; s.vx = 0; s.fromY = s.y; s.soft = true;
+  }
+  yield* until(() => s.plat, 4);
+  s.soft = false; s.frame = 'happy'; s.emote('sparkle', 1.6);
+  if (jumper && jumper.plat) jumper.emote('heart', 1.5);
+  watchers.forEach(w => { w.frame = 'stand'; later(() => w.emote(pick(['heart', 'sparkle']), 1.4), rand(0, 1)); });
+  yield* wait(3);
+}
+
+// Counting sheep: night falls and the flock jumps the fence one at a time, 1... 2... 3... until someone doesn't quite make it
+function* evCount() {
+  if (!FENCE) return;
+  const grp = free();
+  if (grp.length < 3) return;
+  grab(grp);
+  const fx0 = FENCE.x0, fx1 = FENCE.x1, fcx = (fx0 + fx1) / 2;
+  const dir = fx0 > W - fx1 ? 1 : -1, startX = dir > 0 ? fx0 - 12 : fx1 + 12, landBase = dir > 0 ? fx1 + 14 : fx0 - 14;
+  const order = grp.slice().sort((a, b) => a.dumb - b.dumb), flag = { wake: false };
+  order.forEach((s, i) => s.act((function* () { yield* goTo(s, GROUND); yield* walkTo(s, startX - dir * (12 + i * 9), 10); s.facing = dir; })()));
+  let t = 0;
+  while (t < 8) { const dt = yield; t += dt; world.dark = Math.min(0.9, (t / 8) * 0.9); }
+  yield* until(() => order.every(s => !s.brain), 30);
+  let n = 0;
+  for (let i = 0; i < order.length; i++) {
+    const s = order[i], last = i === order.length - 1;
+    if (s.plat !== GROUND) continue;
+    order.slice(i + 1).forEach((o, k) => o.act((function* () { yield* walkTo(o, startX - dir * (12 + k * 9), 8); o.facing = dir; })()));
+    s.act((function* () {
+      yield* walkTo(s, startX, 10); s.facing = dir; yield* wait(0.35);
+      s.lane = randi(1, 6);
+      if (last) yield* jumpTo(s, fcx + rand(-4, 4), FENCE.y, 3);
+      else { s.soft = true; yield* jumpTo(s, clamp(landBase + dir * rand(0, 34), 8, W - 8), GY + s.lane, 24, FENCE); s.soft = false; }
+    })());
+    yield* until(() => !s.brain || (s.x - fcx) * dir > 0, 8);
+    popText(fcx, FENCE.y - 16, last ? `${n + 1}?` : String(n + 1), '#fff4b0', 1.6);
+    yield* until(() => !s.brain, 6);
+    n++;
+    if (!last) s.act((function* () { yield* walkTo(s, clamp(s.x + dir * rand(0, 12), 8, W - 8), 6); s.facing = coin(); yield* sleepUntil(s, flag); })());
+    else if (s.plat === FENCE) { s.emote('dots', 2); yield* wait(1.2); s.act(sleepUntil(s, flag)); }
+    yield* wait(0.3);
+  }
+  t = 0;
+  while (t < 10) { const dt = yield; t += dt; if (chance(dt * 1.5)) addPart(rand(0, W), rand(HY, GY), rand(-3, 3), rand(-3, 1), rand(2, 3), ['#fffbb0', '#d8ff70'], { glow: true, flutter: 4 }); }
+  t = 0;
+  while (t < 7) { const dt = yield; t += dt; world.dark = Math.max(0, 0.9 * (1 - t / 7)); }
+  world.dark = 0; flag.wake = true;
+  yield* wait(0.5);
+  for (const s of order) {
+    if (s.plat === FENCE) { s.brain = null; s.plat = null; s.ignore = FENCE; s.ignoreT = 0.3; s.vy = -20; s.fromY = s.y - 30; s.frame = 'fall'; continue; }
+    s.act((function* () { yield* wait(rand(0, 1.5)); s.frame = 'lie'; yield* wait(0.4); s.frame = 'bah'; if (chance(0.5)) s.baa(); yield* wait(0.6); s.frame = 'stand'; })());
+  }
+  yield* wait(3);
+}
+
+// Snow day: the meadow goes white, lambs try to catch snowflakes, and a snowball rolls off the cliff collecting sheep
+function* evSnow() {
+  let t = 0, ball = null;
+  const flakes = dt => {
+    const n = world.snow * W * 0.6 * dt;
+    for (let i = 0; i < n; i++) { const floor = rand(HY - 10, H), vy = rand(9, 14); addPart(rand(-20, W + 10), -2, rand(-2, 4), vy, floor / vy + 0.6, '#ffffff', { flutter: 5, floor, fade: true }); }
+  };
+  while (t < 75 || (ball && !ball.dead)) {
+    const dt = yield; t += dt;
+    world.snow = t < 8 ? t / 8 : t > 55 ? Math.max(0, (75 - t) / 20) : 1;
+    world.gloom = world.snow * 0.3;
+    world.snowCover = clamp(Math.max(world.snowCover, (t - 4) / 25), 0, 1);
+    flakes(dt);
+    for (const s of flock()) s.snowy = Math.max(s.snowy, world.snowCover * 0.9);
+    if (chance(dt * 0.35)) {
+      const l = free(s => s.lamb && s.plat === GROUND)[0];
+      if (l) { l.claim(); l.act((function* () { for (let k = 0; k < 3; k++) { l.frame = 'up'; yield* wait(0.5); l.frame = 'bah'; yield* wait(0.35); } l.emote('heart', 1.2); l.frame = 'stand'; l.busy = false; })()); }
+    }
+    if (!ball && t > 28) {
+      const edgeDir = props.cliff.side < 0 ? 1 : -1;
+      ball = new Snowball({ x: (edgeDir > 0 ? CLIFF.x1 : CLIFF.x0) - edgeDir * 6, y: CLIFF.y, vx: edgeDir * 14, dir: edgeDir });
+    }
+    if (ball && !ball.dead) {
+      if (ball.grounded) for (const s of flock()) {
+        if (ball.caught.includes(s) || s.plat !== GROUND || s.hidden || s.variant === 'wolf') continue;
+        if (Math.abs(s.x - ball.x) < ball.r + 3) {
+          s.claim(); s.hidden = true; s.kinematic = true; ball.caught.push(s);
+          popText(ball.x, ball.y - ball.r * 2 - 4, s.lamb ? 'MEH!' : 'BAA!', '#ffffff', 1);
+        }
+      }
+      for (const s of ball.caught) { s.x = ball.x; s.y = GY + s.lane; }
+      if (ball.grounded && (ball.x < 12 || ball.x > W - 12)) {
+        ball.dead = true;
+        for (let i = 0; i < 40; i++) addPart(ball.x, ball.y - ball.r, rand(-50, 50), rand(-70, -10), rand(0.6, 1.4), ['#ffffff', '#e8f0ff'], { grav: 140, drag: 0.5 });
+        popText(ball.x, ball.y - 24, 'FLUMP', '#ffffff', 1.4);
+        const caught = ball.caught;
+        for (const s of caught) {
+          s.hidden = false; s.kinematic = false; s.plat = null; s.x = clamp(ball.x - ball.dir * rand(4, 26), 8, W - 8);
+          s.vy = -rand(80, 150); s.vx = -ball.dir * rand(5, 25); s.fromY = s.y - 40; s.snowy = 1; s.frame = 'fall';
+        }
+        yield* recover(caught, 6);
+        caught.forEach((s, i) => later(() => s.emote(pick(['sparkle', 'heart', 'q']), 1.6), i * 0.3));
+        yield* wait(2);
+        caught.forEach(s => s.release());
+      }
+    }
+  }
+  world.snow = 0;
+  while (world.snowCover > 0) { const dt = yield; world.snowCover = Math.max(0, world.snowCover - dt / 14); world.gloom = world.snowCover * 0.15; for (const s of flock()) s.snowy = Math.min(s.snowy, world.snowCover); }
+  world.gloom = 0;
+}
+
+const COMMON = { follow: 1.6, stack: 1.4, butterfly: 1.5, chorus: 1.3, dog: 1.4, nap: 1.2, stuck: 1.3, ball: 1.4, pronk: 1.3, faint: 1.4 };
+const RARE = { shear: 1, wolf: 1, float: 1, count: 1, snow: 1 };
+const EVENTS = { follow: evFollow, stack: evStack, butterfly: evButterfly, chorus: evChorus, dog: evDog, nap: evNap, stuck: evStuck, ball: evBall, pronk: evPronk, faint: evFaint,
+  shear: evShear, wolf: evWolf, float: evFloat, count: evCount, snow: evSnow };
+const ALL_EVENTS = () => Object.keys(EVENTS);
+
+// ---------------------------------------------------------------- director
+const director = { cur: null, name: '', cool: 8, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 3 : rand(14, 28); cleanupEvent(); }
+  } else if ((director.cool -= dt) <= 0) {
+    if (!ALL_EVENTS().length) { director.cool = 5; return; }
+    let name;
+    if (FORCE) name = FORCE === 'all' ? ALL_EVENTS()[director.idx++ % ALL_EVENTS().length] : FORCE;
+    else do { name = chance(0.15) && Object.keys(RARE).length ? weighted(RARE) : weighted(COMMON); } while (name === director.last && ALL_EVENTS().length > 1);
+    if (!EVENTS[name]) { director.cool = 5; return; }
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; cleanupEvent(); }
+  }
+}
+function cleanupEvent() {
+  for (const s of flock()) { if (s.variant === 'wolf') s.dead = true; else if (s.busy) s.release(); }
+  for (const e of world.ents) { if (e instanceof Butterfly && e.script) { e.script = false; e.leaving = true; } if (e instanceof Dog || e instanceof Frog || e instanceof Ball || e instanceof Snowball || e instanceof Wool) e.dead = true; }
+  world.dark = 0; world.gust = 0; world.windBase = 0.3; world.snow = 0; world.snowCover = 0; world.gloom = 0;
+}
+
+// ---------------------------------------------------------------- main loop
+function update(dt) {
+  world.t += dt;
+  world.gust = Math.max(0, world.gust - dt * 0.2);
+  world.wind = world.windBase + Math.sin(world.t * 0.23) * 0.15 + world.gust;
+  for (const cl of scene.clouds) { cl.x += cl.speed * (0.6 + world.wind) * dt; if (cl.x > W + 4) { cl.x = -cl.w - rand(0, 40); cl.y = rand(4, HY - 34); } }
+  runDirector(dt);
+  ambientTick(dt);
+  const ents = [...world.ents].sort((a, b) => depth(a) - depth(b));   // carriers before riders
+  for (const e of ents) if (!e.dead) e.update(dt);
+  for (const p of world.parts) {
+    p.life -= dt;
+    if (p.drag !== 1) { const k = Math.pow(p.drag, dt); p.vx *= k; p.vy *= k; }
+    p.vy += p.grav * dt;
+    p.x += (p.vx + p.wind * world.wind * 20 + (p.flutter ? Math.sin(world.t * 4 + p.ph) * p.flutter : 0)) * dt; p.y += p.vy * dt;
+    if (p.floor !== null && p.y > p.floor) { p.y = p.floor; p.vy = 0; p.vx *= 0.8; }
+  }
+  for (const f of world.fx) f.t += dt;
+  const done = world.fx.filter(f => f.t > f.dur && f.done);
+  world.ents = world.ents.filter(e => !e.dead);
+  world.parts = world.parts.filter(p => p.life > 0);
+  world.fx = world.fx.filter(f => f.t <= f.dur);
+  for (const f of done) f.done();
+  world.flash = Math.max(0, world.flash - dt * 1.5);
+}
+function depth(e) { let n = 0; for (let s = e; s && s.plat && s.plat.carrier && n < 8; s = s.plat.carrier) n++; return n; }
+function drawParts(glow) {
+  for (const p of world.parts) {
+    if (p.glow !== glow) continue;
+    const k = p.life / p.max, X = Math.round(p.x), Y = Math.round(p.y);
+    if (p.fade && k < 0.4 && bayer(X, Y) > k * 2.5) continue;
+    ctx.fillStyle = Array.isArray(p.col) ? p.col[Math.min(p.col.length - 1, Math.floor((1 - k) * p.col.length))] : p.col;
+    ctx.fillRect(X, Y, p.size, p.size);
+  }
+}
+function drawFx(layer) { for (const f of world.fx) if (f.layer === layer && f.t >= 0 && f.draw) f.draw(f); }
+function render() {
+  drawSky();
+  drawFx('sky');
+  for (const e of world.ents) if (e.layer === 'sky') e.draw();
+  for (const e of world.ents) if (e.behind) e.draw();
+  ctx.drawImage(scene.props, 0, 0);
+  drawFx('ground');
+  const list = world.ents.filter(e => e instanceof Sheep && !e.behind || e.layer === 'mid').sort((a, b) => a.y - b.y || depth(a) - depth(b));
+  const F = scene.flowers; let i = 0;
+  for (const e of list) { while (i < F.length && F[i].y <= e.y) drawFlower(F[i++]); e.draw(); }
+  while (i < F.length) drawFlower(F[i++]);
+  for (const e of world.ents) if (e.layer === 'air') e.draw();
+  drawParts(false);
+  drawFx('front');
+  if (world.snowCover > 0.01) {
+    const c = world.snowCover, lvl = Math.round(c * 8);
+    if (lvl > 0) {
+      scene.snowLayers = scene.snowLayers || [];
+      if (!scene.snowLayers[lvl]) {   // dithered snow blanket, cached per level so grass still peeks through
+        const cv = mk(W, H - GY), g = cv.getContext('2d');
+        for (let y = 0; y < H - GY; y++) for (let x = 0; x < W; x++) {
+          const k = bayer(x, y) + noise(x * 0.2, y * 0.5) * 0.35 - 0.12;
+          if (k < (lvl / 8) * 0.8) { g.fillStyle = y === 0 || bayer(x + 1, y + 2) < 0.2 ? '#ffffff' : '#e8eef8'; g.fillRect(x, y, 1, 1); }
+        }
+        scene.snowLayers[lvl] = cv;
+      }
+      ctx.drawImage(scene.snowLayers[lvl], 0, GY);
+    }
+    ctx.fillStyle = '#f4f8ff';
+    ctx.globalAlpha = Math.min(1, c * 1.5);
+    ctx.fillRect(0, GY - 1, W, 2);
+    for (const p of plats) if (!p.ground) ctx.fillRect(Math.round(Math.max(0, p.x0)), p.y - 1, Math.round(Math.min(W, p.x1) - Math.max(0, p.x0)), 2);
+    ctx.globalAlpha = 1;
+    for (const e of list) e.draw();
+  }
+  const d = world.dark, g = world.gloom;
+  if (d > 0.01 || g > 0.01) {
+    ctx.globalCompositeOperation = 'multiply';
+    if (d > 0.01) { ctx.fillStyle = d < 0.4 ? mixHex('#ffffff', '#ffb890', d / 0.4) : mixHex('#ffb890', '#3c4884', (d - 0.4) / 0.6); ctx.fillRect(0, 0, W, H); }
+    if (g > 0.01) { ctx.fillStyle = mixHex('#ffffff', '#b8c0cc', g); ctx.fillRect(0, 0, W, H); }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  drawParts(true);
+  drawFx('glow');
+  if (world.flash > 0.01) { ctx.globalAlpha = world.flash * 0.5; rect(0, 0, W, H, '#ffffff'); ctx.globalAlpha = 1; }
+  if (DEBUG) text(`${director.name || '-'} ents:${world.ents.length} parts:${world.parts.length}`, 3, 3, '#ffffff');
+}
+function resize() {
+  H = ROWS;
+  W = Math.round((ROWS * innerWidth) / innerHeight);
+  GY = H - 26; HY = Math.round(H * 0.5);
+  canvas.width = W; canvas.height = H;
+  ctx.imageSmoothingEnabled = false;
+  scene.sun = { x: Math.round(W * rand(0.3, 0.7)), y: Math.round(HY * 0.28) };
+  world.ents = []; world.parts = []; world.fx = [];
+  director.cur = null; director.name = ''; director.cool = 8;
+  Object.assign(world, { dark: 0, gloom: 0, gust: 0, windBase: 0.3, snow: 0, snowCover: 0, flash: 0 });
+  HAY_LOW = HAY_TOP = FENCE = STUMP = null; scene.snowLayers = null;
+  layoutProps(); buildBackground(); buildProps(); buildFlowers(); buildClouds();
+  populate();
+}
+addEventListener('resize', resize);
+resize();
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  try { update(dt); render(); } catch (e) { console.error(e); }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,1908 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel Meadow Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #88c8f0; }
+  canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL MEADOW — a living, cozy retro wallpaper
+   Options (add to the end of the address):
+     #pixels=240        vertical resolution in big pixels (smaller = chunkier)
+     #event=rain        test mode: repeat one event (or "all" to cycle through every event)
+     #speed=3           run time faster (for testing)
+     #debug             show the current event name
+   Events: ducks fox apples rain butterflies race nap flock
+   Rare:   night unicorn ufo balloon bison
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const ROWS = parseInt(params.get('pixels')) || 240;
+const FORCE = params.get('event');
+const TIME_SCALE = parseFloat(params.get('speed')) || 1;
+const DEBUG = params.has('debug');
+const FPS = 30;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, HY, GY0, GY1;   // HY = horizon, GY0..GY1 = walkable meadow depth range
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const coin = () => (Math.random() < 0.5 ? 1 : -1);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+function mk(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgbStr = a => `rgb(${a[0] | 0},${a[1] | 0},${a[2] | 0})`;
+function mixHex(a, b, t) { const A = hexRgb(a), B = hexRgb(b); return rgbStr(A.map((v, i) => v + (B[i] - v) * t)); }
+function px(x, y, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), w, h); }
+
+const PERM = Array.from({ length: 512 }, () => Math.random());
+const h2 = (x, y) => PERM[((x * 73856093) ^ (y * 19349663)) & 511];
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = h2(xi, yi), b = h2(xi + 1, yi), c = h2(xi, yi + 1), d = h2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
+// ---------------------------------------------------------------- world state
+const world = {
+  t: 0, ents: [], parts: [], fx: [],
+  wind: 0.3, windBase: 0.3, gust: 0,
+  dark: 0, gloom: 0, rain: 0, rainbow: 0, flash: 0,
+};
+function addPart(x, y, vx, vy, life, col, o = {}) {
+  if (world.parts.length > 1200) world.parts.splice(0, 150);
+  world.parts.push({
+    x, y, vx, vy, life, max: life, col,
+    drag: o.drag ?? 1, grav: o.grav ?? 0, floor: o.floor ?? null, bounce: o.bounce ?? 0,
+    size: o.size || 1, fade: o.fade ?? true, wind: o.wind ?? 0, flutter: o.flutter ?? 0, glow: o.glow ?? false, ph: rand(0, 6.28),
+  });
+}
+function addFx(f) { f.t = f.t ?? 0; f.layer = f.layer || 'front'; world.fx.push(f); return f; }
+
+// ---------------------------------------------------------------- scenery
+const scene = { sky: null, land: null, pond: null, tree: null, burrows: [], flowers: [], clouds: [], sun: { x: 0, y: 0 }, nightStars: [], nearTop: [] };
+
+function buildSky() {
+  const s = mk(W, H), c = s.getContext('2d'), img = c.createImageData(W, H), d = img.data;
+  const top = hexRgb('#5aaeee'), mid = hexRgb('#9ad4fb'), bot = hexRgb('#e6f7ff');
+  for (let y = 0; y < H; y++) {
+    const t = clamp(y / (HY + 4), 0, 1);
+    for (let x = 0; x < W; x++) {
+      const q = clamp(Math.floor(t * 8 + bayer(x, y) - 0.5), 0, 8) / 8;
+      const col = q < 0.65 ? top.map((v, i) => lerp(v, mid[i], q / 0.65)) : mid.map((v, i) => lerp(v, bot[i], (q - 0.65) / 0.35));
+      const o = (y * W + x) * 4;
+      d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 255;
+    }
+  }
+  c.putImageData(img, 0, 0);
+  scene.sky = s;
+  scene.nightStars = Array.from({ length: Math.round(W * HY / 180) }, () => ({ x: randi(0, W), y: randi(0, HY - 8), tw: rand(0.5, 3), ph: rand(0, 6.28), big: chance(0.08) }));
+}
+
+const ridge = (x, base, amp, f, seed) => base + Math.sin(x * f + seed) * amp + (noise(x * f * 3 + seed, seed) - 0.5) * amp * 1.4;
+const inPond = (x, y, pad = 0) => {
+  const P = scene.pond; if (!P) return false;
+  const dx = (x - P.x) / (P.rx + pad), dy = (y - P.y) / (P.ry + pad * 0.6);
+  return dx * dx + dy * dy <= 1;
+};
+
+function buildLand() {
+  const s = mk(W, H), c = s.getContext('2d'), img = c.createImageData(W, H), d = img.data;
+  const set = (x, y, col) => { if (x < 0 || y < 0 || x >= W || y >= H) return; const o = (y * W + x) * 4; d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 255; };
+  const far = ['#b6dfb2', '#a7d6a3'].map(hexRgb);
+  const midc = ['#92cd82', '#85c476', '#79ba6b'].map(hexRgb);
+  const near = ['#7fc865', '#75bf5c', '#6bb654', '#62ad4d', '#59a446'].map(hexRgb);
+  const s1 = rand(0, 50), s2 = rand(0, 50), s3 = rand(0, 50);
+  const farTop = [], midTop = [];
+  for (let x = 0; x < W; x++) {
+    const yf = Math.round(ridge(x, HY - 18, 7, 0.016, s1));
+    const ym = Math.round(ridge(x, HY - 5, 5, 0.028, s2));
+    const yn = Math.round(ridge(x, HY + 8, 2.5, 0.045, s3));
+    farTop[x] = yf; midTop[x] = ym; scene.nearTop[x] = yn;
+    for (let y = yf; y < ym; y++) set(x, y, far[bayer(x, y) < (y - yf) / (ym - yf + 1) ? 1 : 0]);
+    for (let y = ym; y < yn; y++) set(x, y, midc[clamp(Math.floor(((y - ym) / (yn - ym + 1)) * 3 + bayer(x, y) - 0.5), 0, 2)]);
+    for (let y = yn; y < H; y++) set(x, y, near[clamp(Math.floor(((y - yn) / (H - yn)) * 5 + bayer(x, y) - 0.5), 0, 4)]);
+  }
+  // meadow flecks + tiny grass marks
+  const light = hexRgb('#97da79'), dark = hexRgb('#4c943f');
+  for (let i = 0; i < (W * H) / 30; i++) {
+    const x = randi(0, W - 1), y = randi(scene.nearTop[x] + 1, H - 1);
+    if (chance(0.5)) set(x, y, light);
+    else { set(x, y, dark); if (y > HY + 30 && chance(0.5)) { set(x - 1, y - 1, dark); set(x + 1, y - 1, dark); } }
+  }
+  c.putImageData(img, 0, 0);
+
+  // lollipop trees and bushes along the far/mid hills
+  for (let i = 0; i < W / 22; i++) {
+    const x = randi(4, W - 4), onFar = chance(0.5), top = onFar ? farTop[x] : midTop[x];
+    const r = onFar ? randi(2, 3) : randi(3, 4), cy = top + (onFar ? 1 : 2) - r;
+    c.fillStyle = onFar ? '#8cc08a' : '#6ba85c';
+    c.fillRect(x, cy + r - 1, 1, onFar ? 2 : 3);
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r + 1) continue;
+      c.fillStyle = (dx + dy) < -r * 0.5 ? (onFar ? '#b0dca8' : '#8fd070') : (dx + dy) > r * 0.4 ? (onFar ? '#88bd86' : '#4f9a48') : (onFar ? '#9ccf98' : '#66b458');
+      c.fillRect(x + dx, cy + dy, 1, 1);
+    }
+  }
+
+  buildPond(c);
+  buildBurrows(c);
+  buildTree(c);
+  // little mushrooms
+  for (let i = 0; i < 4; i++) {
+    const x = randi(8, W - 8), y = randi(GY0 + 10, H - 6);
+    if (inPond(x, y, 6)) continue;
+    c.fillStyle = '#f4ead8'; c.fillRect(x, y - 1, 1, 2);
+    c.fillStyle = '#e8483a'; c.fillRect(x - 1, y - 2, 3, 1); c.fillRect(x, y - 3, 1, 1);
+    c.fillStyle = '#ffffff'; c.fillRect(x - 1, y - 2, 1, 1);
+  }
+  scene.land = s;
+}
+
+function buildPond(c) {
+  const P = scene.pond = {
+    x: Math.round(W * rand(0.42, 0.68)), y: Math.round(lerp(GY0, GY1, rand(0.3, 0.5))),
+    rx: Math.round(W * 0.085), ry: Math.round(H * 0.045), pads: [],
+  };
+  for (let dy = -P.ry - 2; dy <= P.ry + 2; dy++) for (let dx = -P.rx - 2; dx <= P.rx + 2; dx++) {
+    const e1 = (dx * dx) / ((P.rx + 1.6) ** 2) + (dy * dy) / ((P.ry + 1.3) ** 2);
+    if (e1 > 1) continue;
+    const e2 = (dx * dx) / (P.rx ** 2) + (dy * dy) / (P.ry ** 2);
+    let col;
+    if (e2 > 1) col = dy < 0 ? '#5a9a48' : '#d9c68e';
+    else if (dy < -P.ry * 0.5 + bayer(dx + 40, dy + 40) * 2) col = '#4a9ad2';
+    else if (dy > P.ry * 0.45 && bayer(dx + 40, dy + 40) < 0.4) col = '#86d0f2';
+    else col = '#62b6e6';
+    c.fillStyle = col; c.fillRect(P.x + dx, P.y + dy, 1, 1);
+  }
+  for (let i = 0; i < 3; i++) {
+    const a = rand(0, 6.28), X = Math.round(P.x + Math.cos(a) * P.rx * 0.6), Y = Math.round(P.y + Math.sin(a) * P.ry * 0.5);
+    c.fillStyle = '#4f9a3a'; c.fillRect(X - 1, Y, 3, 1); c.fillRect(X, Y - 1, 2, 1);
+    if (chance(0.6)) { c.fillStyle = '#ffa6cc'; c.fillRect(X, Y - 1, 1, 1); }
+    P.pads.push({ x: X, y: Y });
+  }
+  for (const side of [-1, 1]) {
+    const bx = P.x + side * (P.rx - 1);
+    for (let k = 0; k < 3; k++) {
+      const X = bx + side * k * 2, hgt = randi(4, 7), Y = P.y + randi(-1, 2);
+      c.fillStyle = '#5a9a3a'; c.fillRect(X, Y - hgt, 1, hgt);
+      if (chance(0.7)) { c.fillStyle = '#7a4a2a'; c.fillRect(X, Y - hgt - 2, 1, 2); }
+    }
+  }
+}
+
+function buildBurrows(c) {
+  scene.burrows = [];
+  let tries = 0;
+  while (scene.burrows.length < 4 && tries++ < 200) {
+    const x = randi(20, W - 20), y = randi(GY0 + 6, GY1 - 10);
+    if (inPond(x, y, 16)) continue;
+    if (scene.burrows.some(b => Math.hypot(b.x - x, (b.y - y) * 2) < 40)) continue;
+    scene.burrows.push({ x, y, busy: false });
+  }
+  for (const b of scene.burrows) {
+    for (let dy = -3; dy <= 1; dy++) for (let dx = -7; dx <= 7; dx++) {
+      if ((dx * dx) / 49 + (dy * dy) / 9 > 1) continue;
+      c.fillStyle = dy < -1 ? '#d4ab74' : dy < 1 ? '#b88c5a' : '#9a7048';
+      c.fillRect(b.x + dx, b.y + dy, 1, 1);
+    }
+    c.fillStyle = '#3b2618'; c.fillRect(b.x - 3, b.y - 1, 7, 2); c.fillRect(b.x - 2, b.y - 2, 5, 1);
+    c.fillStyle = '#5a3c24'; c.fillRect(b.x - 3, b.y - 1, 7, 1);
+    c.fillStyle = '#3b2618'; c.fillRect(b.x - 2, b.y - 1, 5, 1);
+  }
+}
+
+function buildTree(c) {
+  const side = scene.pond.x > W / 2 ? -1 : 1;
+  const T = scene.tree = { x: Math.round(side < 0 ? W * rand(0.1, 0.18) : W * rand(0.82, 0.9)), y: Math.round(GY0 + 4), apples: [], branch: null };
+  const s = H / 240;
+  for (let y = Math.round(T.y - 26 * s); y <= T.y; y++) {
+    const base = T.y - y < 3 ? 1 : 0;
+    for (let dx = -2 - base; dx <= 2 + base; dx++) {
+      c.fillStyle = dx <= -2 ? '#a8764a' : dx >= 1 ? '#6a4226' : '#8a5a34';
+      c.fillRect(T.x + dx, y, 1, 1);
+    }
+  }
+  const blobs = [[0, -34, 14], [-11, -28, 10], [11, -27, 11], [-6, -42, 9], [7, -41, 9], [0, -24, 9]].map(([x, y, r]) => [x * s, y * s, r * s]);
+  const cy0 = T.y, R = Math.ceil(26 * s);
+  for (let dy = -Math.ceil(54 * s); dy <= 0; dy++) for (let dx = -R; dx <= R; dx++) {
+    let inside = null;
+    for (const [bx, by, br] of blobs) {
+      const q = ((dx - bx) ** 2 + (dy - by) ** 2) / (br * br);
+      if (q <= 1 && (!inside || q < inside.q)) inside = { q, bx, by, br };
+    }
+    if (!inside) continue;
+    const l = ((dx - inside.bx) + (dy - inside.by)) / inside.br + bayer(dx + 64, dy + 64) * 0.5;
+    c.fillStyle = l < -0.55 ? '#94d86c' : l < 0.35 ? '#64b452' : l < 0.9 ? '#4e9a44' : '#3f8438';
+    c.fillRect(T.x + dx, cy0 + dy, 1, 1);
+  }
+  for (let i = 0; i < 7; i++) {
+    const [bx, by, br] = pick(blobs), a = rand(0.2, 2.9), r = rand(0.3, 0.8) * br;
+    T.apples.push({ x: Math.round(T.x + bx + Math.cos(a) * r), y: Math.round(cy0 + by + Math.sin(a) * r * 0.6), on: true, regrow: 0 });
+  }
+  T.branch = { x: T.x + Math.round(side * 9 * s), y: Math.round(T.y - 30 * s) };   // where birds and owls perch
+  T.top = Math.round(T.y - 54 * s);
+}
+
+// ---------------------------------------------------------------- flowers and grass (swaying, depth-sorted)
+const FLOWER_TYPES = { grass: 7, daisy: 2, tulip: 1.3, bell: 1.2, dandelion: 1, clover: 1 };
+const TULIPS = ['#ff6a8a', '#ffb13a', '#ff4a5a', '#c77dff'];
+function buildFlowers() {
+  scene.flowers = [];
+  const n = Math.round((W * (H - HY)) / 120);
+  for (let i = 0; i < n; i++) {
+    const x = rand(0, W), top = scene.nearTop[Math.floor(x)] + 2;
+    const y = Math.round(top + Math.pow(Math.random(), 0.9) * (H - top));
+    if (inPond(x, y, 3)) continue;
+    if (scene.burrows.some(b => Math.abs(b.x - x) < 8 && Math.abs(b.y - y) < 4)) continue;
+    const type = weighted(FLOWER_TYPES);
+    scene.flowers.push({
+      x, y, type, phase: rand(0, 6.28), h: randi(2, 4) + (y > H * 0.85 ? 1 : 0),
+      col: type === 'tulip' ? pick(TULIPS) : null, eaten: 0, puff: type === 'dandelion' && chance(0.4), bloom: 1,
+    });
+  }
+  scene.flowers.sort((a, b) => a.y - b.y);
+}
+function drawFlower(f) {
+  const X = Math.round(f.x), Y = Math.round(f.y);
+  if (f.eaten > 0) { px(X, Y, '#4f9a42'); return; }
+  const sway = Math.round(Math.sin(world.t * 1.7 + f.phase + f.x * 0.05) * (0.3 + world.wind * 1.4) * (f.h / 3));
+  if (f.type === 'grass') {
+    px(X, Y, '#4f9a42'); px(X - 1, Y - 1, '#5aa84a'); px(X + 1, Y - 1, '#5aa84a'); px(X + sway, Y - 2, '#6cbc55');
+    if (f.h > 3) px(X + sway, Y - 3, '#7fcc62');
+    return;
+  }
+  const hgt = Math.max(1, Math.round(f.h * f.bloom));
+  for (let i = 0; i < hgt; i++) px(X + Math.round((sway * i) / hgt), Y - i, '#4f9a42');
+  if (f.bloom < 0.6) return;
+  const hx = X + sway, hy = Y - hgt;
+  switch (f.type) {
+    case 'daisy':
+      px(hx - 1, hy, '#ffffff'); px(hx + 1, hy, '#ffffff'); px(hx, hy - 1, '#ffffff'); px(hx, hy + 1, '#f0f0f0'); px(hx, hy, '#ffcf30');
+      break;
+    case 'tulip':
+      px(hx - 1, hy - 1, f.col); px(hx + 1, hy - 1, f.col); px(hx - 1, hy, f.col); px(hx, hy, f.col); px(hx + 1, hy, f.col); px(hx, hy - 1, mixHex(f.col.length === 7 ? f.col : '#ff6a8a', '#ffffff', 0.35));
+      break;
+    case 'bell':
+      px(hx, hy, '#8ea6ff'); px(hx + 1, hy + 1, '#6f88f0'); px(hx - 1, hy + 1, '#6f88f0');
+      break;
+    case 'dandelion':
+      if (f.puff) { px(hx, hy - 1, '#ffffff'); px(hx - 1, hy, '#f2f2f2'); px(hx + 1, hy, '#f2f2f2'); px(hx, hy, '#e0e0e0'); px(hx, hy + 1, '#f2f2f2'); }
+      else { px(hx, hy, '#ffd23a'); px(hx + 1, hy, '#ffbf1a'); px(hx, hy - 1, '#ffe066'); }
+      break;
+    case 'clover':
+      px(hx, hy, '#ff9ec4'); px(hx + 1, hy, '#ff7fb0'); px(hx, hy - 1, '#ffc0da');
+      break;
+  }
+}
+function nearestFlower(x, y, maxD = 1e9, filter = f => f.type !== 'grass' && f.eaten <= 0 && f.bloom >= 1) {
+  let best = null, bd = maxD;
+  for (const f of scene.flowers) {
+    if (!filter(f)) continue;
+    const d = Math.hypot(f.x - x, (f.y - y) * 1.5);
+    if (d < bd) { bd = d; best = f; }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------- clouds, sun, sky extras
+function makeCloud(size) {
+  const w = size * 5, h = size * 2 + 3, white = mk(w, h), gray = mk(w, h);
+  const blobs = [];
+  for (let i = 0; i < 4; i++) blobs.push([size * (1 + i * 1.05) + rand(-1, 1), h - size * rand(0.6, 1.1) - 1, size * rand(0.7, 1.15)]);
+  for (const [cv, hi, lo] of [[white, '#ffffff', '#dbeaf6'], [gray, '#b9c2cf', '#8e99a8']]) {
+    const c = cv.getContext('2d');
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (y >= h - 1) continue;
+      let ins = false;
+      for (const [bx, by, br] of blobs) if ((x - bx) ** 2 + (y - by) ** 2 <= br * br) { ins = true; break; }
+      if (!ins) continue;
+      c.fillStyle = y > h * 0.62 + bayer(x, y) * 2 - 1 ? lo : hi;
+      c.fillRect(x, y, 1, 1);
+    }
+  }
+  return { white, gray, w, h };
+}
+function buildClouds() {
+  scene.clouds = [];
+  const n = randi(4, 6);
+  for (let i = 0; i < n; i++) {
+    const size = randi(4, 8);
+    scene.clouds.push({ ...makeCloud(size), x: rand(-20, W), y: rand(4, HY - 30), speed: rand(1.2, 3) * (size / 6) });
+  }
+}
+function drawSky() {
+  ctx.drawImage(scene.sky, 0, 0);
+  const d = world.dark;
+  if (d > 0.3) {
+    const a = clamp((d - 0.3) / 0.5, 0, 1);
+    for (const s of scene.nightStars) {
+      const on = Math.sin(world.t * s.tw + s.ph);
+      if (bayer(s.x, s.y) > a * (0.6 + on * 0.4)) continue;
+      px(s.x, s.y, s.big ? '#fff8d0' : '#ffffff');
+      if (s.big && on > 0.5) { px(s.x - 1, s.y, '#c8d8ff'); px(s.x + 1, s.y, '#c8d8ff'); px(s.x, s.y - 1, '#c8d8ff'); px(s.x, s.y + 1, '#c8d8ff'); }
+    }
+  }
+  // sun sets as night falls; moon rises opposite
+  const S = scene.sun, sunY = S.y + d * (HY + 10), R = 8;
+  if (sunY < HY + R) {
+    for (let dy = -R - 3; dy <= R + 3; dy++) for (let dx = -R - 3; dx <= R + 3; dx++) {
+      const r = Math.hypot(dx, dy), X = S.x + dx, Y = Math.round(sunY) + dy;
+      if (r <= R) px(X, Y, r < R - 3 ? mixHex('#fffbe0', '#ffb070', d) : mixHex('#ffe98a', '#ff8a50', d));
+      else if (r <= R + 3 && bayer(X, Y) < 0.25 * (1 - (r - R) / 3) * (0.7 + 0.3 * Math.sin(world.t * 2 + Math.atan2(dy, dx) * 6))) px(X, Y, '#fff4b0');
+    }
+  }
+  if (d > 0.35) {
+    const mx = W - S.x, my = Math.round(HY + 10 - (d - 0.35) / 0.65 * (HY - 24)), MR = 6;
+    for (let dy = -MR; dy <= MR; dy++) for (let dx = -MR; dx <= MR; dx++) {
+      if (dx * dx + dy * dy > MR * MR) continue;
+      if ((dx - 3) ** 2 + (dy + 1) ** 2 < 30) continue;   // crescent
+      px(mx + dx, my + dy, (dx + dy) < -3 ? '#fffbe8' : '#f4e6b0');
+    }
+  }
+  if (world.rainbow > 0.01) drawRainbow(world.rainbow);
+  for (const cl of scene.clouds) {
+    const X = Math.round(cl.x), Y = Math.round(cl.y);
+    if (world.gloom < 0.99) ctx.drawImage(cl.white, X, Y);
+    if (world.gloom > 0.01) { ctx.globalAlpha = world.gloom; ctx.drawImage(cl.gray, X, Y); ctx.globalAlpha = 1; }
+  }
+}
+const RAINBOW = ['#ff5a5a', '#ffa23a', '#ffe14a', '#6ad66a', '#4ab0ff', '#8a6aff'];
+function drawRainbow(a) {
+  const cx = W * 0.5, cy = HY + 30, R0 = W * 0.34;
+  for (let b = 0; b < RAINBOW.length; b++) {
+    const R = R0 - b * 2;
+    for (let i = 0; i < R * 3.2; i++) {
+      const ang = Math.PI + (i / (R * 3.2)) * Math.PI;
+      for (let th = 0; th < 2; th++) {
+        const X = Math.round(cx + Math.cos(ang) * (R - th)), Y = Math.round(cy + Math.sin(ang) * (R - th) * 0.85);
+        if (Y > HY + 2) continue;
+        if (bayer(X, Y) < a * 0.75) px(X, Y, RAINBOW[b]);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- pond shimmer, apples on tree
+function drawPondShimmer() {
+  const P = scene.pond;
+  for (let i = 0; i < 6; i++) {
+    const a = world.t * 0.3 + i * 1.7, X = Math.round(P.x + Math.cos(a) * P.rx * 0.6), Y = Math.round(P.y + Math.sin(a * 1.3) * P.ry * 0.5);
+    if (Math.sin(world.t * 2 + i) > 0.3) { px(X, Y, '#c8ecff'); px(X + 1, Y, '#a8dcf8'); }
+  }
+}
+function drawTreeApples(dt) {
+  for (const a of scene.tree.apples) {
+    if (!a.on) { if ((a.regrow -= dt) <= 0) a.on = true; continue; }
+    px(a.x, a.y, '#e8403a'); px(a.x + 1, a.y, '#c42e2e'); px(a.x, a.y - 1, '#ff7a6a');
+  }
+}
+
+// ---------------------------------------------------------------- lighting
+function drawLighting() {
+  const d = world.dark, g = world.gloom;
+  ctx.globalCompositeOperation = 'multiply';
+  if (d > 0.01) {
+    ctx.fillStyle = d < 0.4 ? mixHex('#ffffff', '#ffb890', d / 0.4) : mixHex('#ffb890', '#3c4884', (d - 0.4) / 0.6);
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (g > 0.01) { ctx.fillStyle = mixHex('#ffffff', '#a2adbf', g); ctx.fillRect(0, 0, W, H); }
+  ctx.globalCompositeOperation = 'source-over';
+  if (world.flash > 0.01) { ctx.globalAlpha = world.flash * 0.6; ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+}
+
+// ---------------------------------------------------------------- sprite builder
+// Animals are built from little shaded ellipses, then given a soft dark outline.
+const INK = '#3b2b33', EYE = '#241820', BLUSH = '#ffa6bc';
+class SB {
+  constructor(w, h) { this.w = w; this.h = h; this.g = new Array(w * h).fill(null); }
+  set(x, y, c) { x = Math.round(x); y = Math.round(y); if (x >= 0 && y >= 0 && x < this.w && y < this.h) this.g[y * this.w + x] = c; return this; }
+  get(x, y) { return x >= 0 && y >= 0 && x < this.w && y < this.h ? this.g[y * this.w + x] : null; }
+  ell(cx, cy, rx, ry, c, shade, hi) {
+    for (let y = Math.floor(cy - ry - 1); y <= Math.ceil(cy + ry + 1); y++)
+      for (let x = Math.floor(cx - rx - 1); x <= Math.ceil(cx + rx + 1); x++) {
+        const dx = (x - cx) / (rx + 0.35), dy = (y - cy) / (ry + 0.35);
+        if (dx * dx + dy * dy > 1) continue;
+        let col = c;
+        if (shade && dx * 0.45 + dy * 0.9 > 0.45) col = shade;
+        if (hi && dx * 0.5 + dy * 0.9 < -0.62) col = hi;
+        this.set(x, y, col);
+      }
+    return this;
+  }
+  rect(x, y, w, h, c) { for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.set(x + i, y + j, c); return this; }
+  outline(c = INK) {
+    const add = [];
+    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
+      if (this.get(x, y)) continue;
+      if (this.get(x - 1, y) || this.get(x + 1, y) || this.get(x, y - 1) || this.get(x, y + 1)) add.push([x, y]);
+    }
+    for (const [x, y] of add) this.set(x, y, c);
+    return this;
+  }
+}
+function bake(b, ax, ay) {
+  const r = mk(b.w, b.h), l = mk(b.w, b.h), rc = r.getContext('2d'), lc = l.getContext('2d');
+  for (let y = 0; y < b.h; y++) for (let x = 0; x < b.w; x++) {
+    const c = b.g[y * b.w + x];
+    if (!c) continue;
+    rc.fillStyle = c; rc.fillRect(x, y, 1, 1);
+    lc.fillStyle = c; lc.fillRect(b.w - 1 - x, y, 1, 1);
+  }
+  return { r, l, w: b.w, h: b.h, ax, ay };
+}
+function makeSet(fn, frames, ax, ay) {
+  const o = {};
+  for (const [name, opt] of Object.entries(frames)) o[name] = bake(fn(opt).outline(), ax, ay);
+  return o;
+}
+// Draw a baked sprite with its feet at (x, y). clip = number of rows to show from the top (for burrows/ponds).
+function drawSpr(s, x, y, facing = 1, clip = null) {
+  const X = Math.round(x - (facing > 0 ? s.ax : s.w - 1 - s.ax)), Y = Math.round(y - s.ay);
+  const img = facing > 0 ? s.r : s.l;
+  if (clip === null) ctx.drawImage(img, X, Y);
+  else if (clip > 0) { const hgt = Math.min(s.h, Math.round(clip)); ctx.drawImage(img, 0, 0, s.w, hgt, X, Y, s.w, hgt); }
+}
+
+// ---------------------------------------------------------------- animals
+function bunny(v, o) {
+  const b = new SB(17, 16), E = EYE;
+  if (o.hop) {
+    b.ell(7, 9, 5, 2.8, v.B, v.S);
+    b.ell(2, 8, 1.5, 1.5, v.L);
+    b.ell(3.5, 12, 2.2, 0.9, v.B, v.S);
+    b.ell(12, 11.5, 1.5, 0.8, v.L);
+    b.ell(11.5, 6.5, 3.2, 2.8, v.B, v.S);
+    b.ell(8.5, 3.2, 2.4, 0.9, v.B); b.ell(9.5, 1.9, 2.2, 0.8, v.B);
+    b.set(7, 3, v.P).set(8, 3, v.P);
+    b.set(13, 6, E).set(13, 7, E).set(14, 8, BLUSH).set(15, 7, '#ff7b9a');
+    return b;
+  }
+  const hy = o.eat ? 1 : 0;
+  b.ell(7, 10.5, 4.5, 3.4, v.B, v.S);
+  b.ell(2.6, 11, 1.7, 1.7, v.L);
+  b.ell(9.5, 11.5, 2, 2, v.L);
+  b.ell(5, 13.2, 2.4, 1, v.B, v.S);
+  b.ell(10.5, 13.4, 1.4, 0.8, v.L);
+  b.ell(11, 7 + hy, 3.3, 3, v.B, v.S);
+  b.ell(10, 3.4 + hy, 0.9, 2.3, v.B).set(10, 3 + hy, v.P).set(10, 4 + hy, v.P);
+  if (o.flop) b.ell(14.5, 5 + hy, 1.8, 0.8, v.B).set(14, 5 + hy, v.P);
+  else b.ell(13, 3.6 + hy, 0.9, 2.3, v.B).set(13, 3 + hy, v.P).set(13, 4 + hy, v.P);
+  if (o.blink) b.set(12, 8 + hy, E).set(13, 8 + hy, E);
+  else b.set(12, 7 + hy, E).set(12, 8 + hy, E);
+  b.set(13, 9 + hy, BLUSH).set(14, o.chew ? 7 + hy : 8 + hy, '#ff7b9a');
+  return b;
+}
+function prairieDog(o) {
+  const b = new SB(12, 18), B = '#d19c5e', S = '#b07c42', L = '#f0cc92', up = o.chirp ? -1 : 0;
+  b.ell(2.5, 15, 1.2, 1.5, S);
+  b.ell(6, 11.5, 3.3, 4.5, B, S);
+  b.ell(7, 12, 1.8, 3, L);
+  b.rect(5, 16, 3, 1, S);
+  b.ell(8, 9, 1, 0.7, S);
+  b.ell(6.5, 5.5 + up, 3, 2.6, B, S);
+  b.set(4, 3 + up, S);
+  if (o.blink) b.set(7, 5 + up, EYE).set(8, 5 + up, EYE);
+  else b.set(8, 4 + up, EYE).set(8, 5 + up, EYE);
+  b.set(9, 6 + up, '#5a3a2a').set(7, 7 + up, BLUSH);
+  if (o.chirp) b.set(9, 7 + up, '#8a3a3a');
+  return b;
+}
+function duck(o) {
+  const b = new SB(16, 13), Wd = '#fffdf5', S = '#e2d6c0';
+  b.ell(2.5, 6, 1.3, 1, Wd);
+  b.ell(7, 7.5, 5, 2.8, Wd, S);
+  b.ell(6, 7, 2.8, 1.4, S);
+  b.ell(11, 4, 2.3, 2.3, Wd, S);
+  b.rect(13, 4, 2, 1, '#ff9f2e');
+  b.set(11, 3, EYE).set(12, 5, BLUSH);
+  if (o.step === 1) b.set(5, 11, '#ff8a1a').set(8, 11, '#ff8a1a');
+  if (o.step === 2) b.set(6, 11, '#ff8a1a').set(7, 11, '#ff8a1a');
+  return b;
+}
+function duckling(o) {
+  const b = new SB(10, 9), Y = '#ffd84a', S = '#f0b52e';
+  b.ell(4, 4.6, 2.8, 1.7, Y, S);
+  b.ell(6, 2.4, 1.6, 1.5, Y);
+  b.set(8, 3, '#ff9a2a').set(6, 2, EYE).set(3, 4, S).set(4, 5, S);
+  if (o.step === 1) b.set(3, 7, '#ff9a2a').set(5, 7, '#ff9a2a');
+  if (o.step === 2) b.set(4, 7, '#ff9a2a');
+  return b;
+}
+function hedgehog(o) {
+  const b = new SB(16, 11), Sp = '#8a6a52', SpS = '#6a4e3a', SpH = '#a88a70';
+  if (o.ball) {
+    b.ell(7, 5.5, 4, 3.6, Sp, SpS, SpH);
+    for (let y = 2; y < 10; y++) for (let x = 2; x < 12; x++) if (b.get(x, y) && (x * 2 + y) % 4 === 0) b.set(x, y, '#c4a88e');
+    return b;
+  }
+  b.ell(6, 5.4, 5, 3.2, Sp, SpS, SpH);
+  for (let y = 2; y < 8; y++) for (let x = 1; x < 10; x++) if (b.get(x, y) && (x * 2 + y) % 4 === 0) b.set(x, y, '#c4a88e');
+  b.ell(10.5, 6.2, 2.4, 2, '#f2d8b4', '#d8b890');
+  b.set(14, 6, '#2a1a1a').set(11, 5, EYE).set(12, 7, BLUSH);
+  const f = '#5a3a2a';
+  if (o.step === 1) b.set(5, 9, f).set(9, 9, f); else b.set(6, 9, f).set(10, 9, f);
+  return b;
+}
+function foxSpr(o) {
+  const b = new SB(22, 15), O = '#f28a3a', S = '#d06a28', C = '#fff6ea', D = '#4a2a1e';
+  if (o.sleep) {
+    b.ell(11, 10, 6, 2.8, O, S);
+    b.ell(7, 9.5, 2.6, 2.2, O);
+    b.ell(12.5, 11.5, 5, 1.3, O, S);
+    b.ell(17, 11, 1.5, 1, C);
+    b.set(6, 7, D).set(8, 7, D).set(6, 9, D).set(7, 9, D).set(5, 10, C);
+    return b;
+  }
+  if (o.sit) {
+    b.ell(7, 12, 3.5, 1.2, O, S); b.ell(4.5, 12, 1.2, 1, C);
+    b.ell(11, 9, 3.5, 3.8, O, S);
+    b.ell(13, 9, 1.6, 2.5, C);
+    b.set(11, 13, D).set(13, 13, D);
+    b.ell(13, 4.5, 2.9, 2.5, O, S);
+    b.ell(15.5, 6, 1.6, 1, C);
+    b.set(11, 1, D).set(11, 2, O).set(12, 2, O).set(14, 1, D).set(14, 2, O).set(15, 2, O);
+    b.set(17, 5, D).set(14, 4, EYE).set(14, 5, EYE).set(13, 6, BLUSH);
+    return b;
+  }
+  const st = o.pounce ? 2 : o.step || 1;
+  b.ell(3.5, 6, 3, 1.8, O, S); b.ell(1.8, 5.4, 1.2, 1.1, C);
+  if (o.pounce) b.ell(10, 6.5, 6, 2.3, O, S); else b.ell(10, 7.5, 5, 2.8, O, S);
+  b.ell(11, o.pounce ? 8 : 9.5, 3, 1.1, C);
+  if (o.pounce) { b.rect(17, 9, 2, 1, D); b.rect(3, 9, 2, 1, D); }
+  else if (st === 1) { b.rect(6, 11, 1, 2, D); b.rect(13, 11, 1, 2, D); b.set(8, 11, D); b.set(11, 11, D); }
+  else { b.rect(8, 11, 1, 2, D); b.rect(11, 11, 1, 2, D); b.set(6, 11, D); b.set(13, 11, D); }
+  const hy = o.pounce ? -0.5 : 0;
+  b.ell(16, 5.5 + hy, 2.9, 2.5, O, S);
+  b.ell(18.5, 7 + hy, 1.6, 1, C);
+  b.set(14, 1, D).set(14, 2, O).set(15, 2, O).set(17, 1, D).set(17, 2, O).set(16, 2, O);
+  b.set(20, 6 + hy, D).set(17, 4 + hy, EYE).set(17, 5 + hy, EYE).set(16, 7 + hy, BLUSH);
+  return b;
+}
+function turtle(o) {
+  const b = new SB(17, 11);
+  b.ell(6.5, 5.2, 5, 3.2, '#72b050', '#548a3a', '#9ad470');
+  for (const [x, y] of [[4, 4], [7, 3], [9, 5], [5, 6], [8, 7]]) b.set(x, y, '#5a9a3e');
+  b.rect(2, 8, 10, 1, '#d8c07a');
+  if (!o.hide) {
+    b.ell(12.6, 6, 1.8, 1.5, '#b8dc88', '#98bc68');
+    b.set(13, 5, EYE).set(14, 7, BLUSH);
+    const f = '#a8cc78';
+    if (o.step === 1) b.set(3, 9, f).set(9, 9, f); else b.set(4, 9, f).set(10, 9, f);
+  }
+  return b;
+}
+function bird(v, o) {
+  const b = new SB(11, 9);
+  b.set(1, 4, v.S).set(1, 3, v.S);
+  b.ell(4.5, 4.5, 3, 2, v.B, v.S);
+  b.ell(5, 5.5, 1.8, 0.9, '#fff4e8');
+  b.ell(7, 3, 1.8, 1.7, v.B);
+  b.set(9, 3, '#ffb030').set(8, 2, EYE);
+  if (o.wing === 'up') b.ell(4, 1.8, 2, 0.8, v.S);
+  else if (o.wing === 'down') b.ell(4, 6.5, 2, 0.9, v.S);
+  else { b.ell(4, 4.5, 2, 1.2, v.S); b.set(5, 7, '#ffb030'); }
+  return b;
+}
+function frog(o) {
+  const b = new SB(12, 9), G = '#72c64e', S = '#52a43a';
+  b.ell(5.5, 5, 4, 2.3, G, S);
+  b.ell(6, 6.2, 2.2, 1, '#dff4a8');
+  b.ell(3.5, 2.5, 1.3, 1.2, G).ell(7.5, 2.5, 1.3, 1.2, G);
+  b.set(4, 2, EYE).set(8, 2, EYE).set(2, 5, BLUSH).set(9, 5, BLUSH);
+  if (o.jump) b.rect(1, 7, 3, 1, S);
+  if (o.croak) b.ell(6, 7, 1.5, 1, '#f4ffd0');
+  return b;
+}
+function cow(o) {
+  const b = new SB(21, 15), Wc = '#ffffff', S = '#dcdce6', Sp = '#3a3038';
+  b.set(1, 6, S).set(1, 7, S).set(1, 8, Sp);
+  b.ell(8, 7, 6, 3.2, Wc, S);
+  b.ell(6, 6, 1.8, 1.3, Sp).ell(11, 8, 1.4, 1, Sp).set(4, 9, Sp);
+  const legs = o.step === 2 ? [5, 8, 12, 14] : [4, 7, 11, 13];
+  for (const x of legs) { b.rect(x, 11, 1, 1, S); b.set(x, 12, '#6a5a5a'); }
+  b.ell(15.5, 5.5, 2.6, 2.4, Wc, S);
+  b.ell(17, 7, 1.4, 1, '#ffb4c6');
+  b.set(14, 2, '#f0e2b0').set(17, 2, '#f0e2b0').set(13, 4, S).set(18, 4, S);
+  b.set(16, 5, EYE).set(18, 7, '#e08aa0').set(15, 7, BLUSH);
+  if (o.float) b.set(16, 4, EYE).set(17, 8, '#8a3a4a');
+  if (o.crown) for (const [x, c] of [[13, '#ff6a8a'], [14, '#ffe14a'], [15, '#ffffff'], [16, '#8ea6ff'], [17, '#ff6a8a'], [18, '#ffe14a']]) b.set(x, 3, c);
+  return b;
+}
+function bisonSpr(o) {
+  if (o.calf) {
+    const b = new SB(15, 12);
+    b.ell(6, 6, 4, 2.6, '#b07a4a', '#8a5a36');
+    b.ell(10.5, 6.5, 2, 1.8, '#9a6a40');
+    b.set(11, 6, EYE).set(12, 7, '#4a2a1a').set(10, 8, BLUSH);
+    const f = '#5a3a24', legs = o.step === 2 ? [4, 9] : [3, 8];
+    for (const x of legs) b.rect(x, 9, 1, 1, f);
+    return b;
+  }
+  const b = new SB(22, 16), B = '#8a5a36', S = '#6a4226', F = '#5a3620';
+  b.set(2, 7, F).set(1, 8, F);
+  b.ell(9, 7.5, 7, 4, B, S);
+  b.ell(13.5, 8, 3.5, 3.5, F);
+  const legs = o.step === 2 ? [5, 8, 13, 15] : [4, 7, 12, 14];
+  for (const x of legs) b.rect(x, 12, 1, 2, '#4a2c1a');
+  b.ell(17, 10, 2.4, 2.2, F);
+  b.set(16, 7, '#f0e6d0').set(18, 7, '#f0e6d0').set(18, 9, EYE).set(19, 11, '#3a2418').set(17, 11, '#b0706a');
+  return b;
+}
+function unicornSpr(o) {
+  const b = new SB(24, 21), Wn = '#ffffff', S = '#e6e0f4', oy = 1, hoof = '#c8b8e8';
+  const tail = [[3, 9], [2, 10], [2, 11], [1, 12], [2, 13], [1, 14]];
+  tail.forEach(([x, y], i) => b.set(x, y + oy, RAINBOW[i % 6]).set(x + 1, y + oy, RAINBOW[(i + 1) % 6]));
+  b.ell(10, 10 + oy, 6, 3.2, Wn, S);
+  const legs = o.step === 2 ? [[4, 1], [8, 0], [14, 1], [16, 0]] : [[5, 0], [7, 1], [13, 0], [15, 1]];
+  for (const [x, lift] of legs) { b.rect(x, 14 + oy, 1, 3 - lift, S); b.set(x + (lift ? 1 : 0), 16 + oy - lift, hoof); }
+  b.ell(15, 7 + oy, 1.8, 3, Wn, S);
+  b.ell(17.5, 4 + oy, 2.6, 2, Wn, S);
+  b.ell(19.5, 5 + oy, 1.3, 1, '#ffe8f0');
+  for (let i = 0; i < 7; i++) b.set(13 - (i > 3 ? 1 : 0), 2 + i + oy, RAINBOW[i % 6]);
+  b.set(18, 1 + oy, '#ffd84a').set(19, 0 + oy, '#fff3a0');
+  b.set(18, 3 + oy, EYE).set(18, 4 + oy, EYE).set(19, 6 + oy, BLUSH).set(16, 2 + oy, S);
+  return b;
+}
+
+// ---------------------------------------------------------------- emote icons
+const ICONS = {};
+function icon(name, rows, col) {
+  const b = new SB(rows[0].length + 2, rows.length + 2);
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== '.') b.set(x + 1, y + 1, ch === 'o' ? '#ffffff' : col); }));
+  ICONS[name] = bake(b.outline('#ffffff'), Math.floor(b.w / 2), b.h - 1);
+}
+icon('heart', ['.X.X.', 'XoXXX', 'XXXXX', '.XXX.', '..X..'], '#ff5a8a');
+icon('note', ['..XX', '..XX', '..X.', 'XXX.', 'XX..'], '#6a5aff');
+icon('bang', ['X', 'X', 'X', '.', 'X'], '#ff4a3a');
+icon('q', ['XXX', '..X', '.X.', '...', '.X.'], '#3a6aff');
+icon('z', ['XXX', '..X', '.X.', 'XXX'], '#7a8aff');
+icon('sparkle', ['.X.', 'XoX', '.X.'], '#ffc83a');
+
+const BUNNY_COLORS = [
+  { B: '#fbf6ef', S: '#e2d6cc', L: '#ffffff', P: '#ffb0c4' },
+  { B: '#c89a70', S: '#a67a52', L: '#f4e6d4', P: '#ffb0c4' },
+  { B: '#b8b4c0', S: '#948ea0', L: '#f0eef4', P: '#ffb0c4' },
+];
+const BIRD_COLORS = [
+  { B: '#5aa8ea', S: '#3f86c8' }, { B: '#ee5f4e', S: '#c8443a' }, { B: '#ffc83a', S: '#e0a020' },
+];
+const SPR = {
+  bunny: BUNNY_COLORS.map(v => makeSet(o => bunny(v, o), { sit: {}, blink: { blink: 1 }, eat: { eat: 1 }, chew: { eat: 1, chew: 1 }, hop: { hop: 1 }, flop: { flop: 1 }, sleep: { eat: 1, blink: 1 } }, 8, 14)),
+  pdog: makeSet(prairieDog, { stand: {}, blink: { blink: 1 }, chirp: { chirp: 1 } }, 6, 16),
+  duck: makeSet(duck, { swim: {}, a: { step: 1 }, b: { step: 2 } }, 7, 11),
+  duckling: makeSet(duckling, { swim: {}, a: { step: 1 }, b: { step: 2 } }, 4, 7),
+  hedgehog: makeSet(hedgehog, { a: { step: 1 }, b: { step: 2 }, ball: { ball: 1 } }, 7, 9),
+  fox: makeSet(foxSpr, { a: { step: 1 }, b: { step: 2 }, pounce: { pounce: 1 }, sit: { sit: 1 }, sleep: { sleep: 1 } }, 11, 13),
+  turtle: makeSet(turtle, { a: { step: 1 }, b: { step: 2 }, hide: { hide: 1 } }, 7, 9),
+  bird: BIRD_COLORS.map(v => makeSet(o => bird(v, o), { up: { wing: 'up' }, down: { wing: 'down' }, perch: { wing: 'perch' } }, 5, 7)),
+  frog: makeSet(frog, { sit: {}, jump: { jump: 1 }, croak: { croak: 1 } }, 5, 7),
+  cow: makeSet(cow, { a: { step: 1 }, b: { step: 2 }, float: { float: 1 }, crown: { crown: 1 }, crownB: { crown: 1, step: 2 } }, 9, 13),
+  bison: makeSet(bisonSpr, { a: { step: 1 }, b: { step: 2 } }, 10, 14),
+  calf: makeSet(o => bisonSpr({ ...o, calf: 1 }), { a: { step: 1 }, b: { step: 2 } }, 6, 10),
+  unicorn: makeSet(unicornSpr, { a: { step: 1 }, b: { step: 2 } }, 11, 18),
+};
+
+// ---------------------------------------------------------------- creatures
+class Critter {
+  constructor(kind, o = {}) {
+    this.kind = kind; this.set = o.set || SPR[kind];
+    this.frame = o.frame || Object.keys(this.set)[0];
+    this.x = o.x ?? 0; this.y = o.y ?? 0; this.z = o.z ?? 0;
+    this.vx = 0; this.vy = 0; this.vz = 0; this.grav = o.grav ?? 260;
+    this.facing = o.facing ?? 1; this.layer = o.layer || 'ground'; this.shadow = o.shadow ?? true;
+    this.flyer = o.flyer ?? false; this.clip = null; this.age = rand(0, 5); this.dead = false;
+    this.brain = null; this.life = null; this.emotes = []; this.tags = {}; this.landed = true; this.extraDraw = null;
+    world.ents.push(this);
+  }
+  act(gen) { this.brain = gen; return this; }
+  resume() { if (this.life) this.brain = this.life(); return this; }
+  update(dt) {
+    this.age += dt;
+    if (this.brain) {
+      let r;
+      try { r = this.brain.next(dt); } catch (e) { console.error(this.kind, e); r = { done: true }; }
+      if (r.done) this.brain = null;
+    }
+    if (!this.flyer && (this.z > 0 || this.vz > 0)) {
+      this.vz -= this.grav * dt; this.z += this.vz * dt;
+      if (this.z <= 0) { this.z = 0; this.vz = 0; this.landed = true; }
+    }
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    for (const e of this.emotes) e.t += dt;
+    this.emotes = this.emotes.filter(e => e.t < e.dur);
+  }
+  emote(name, dur = 1.6) { if (!this.emotes.some(e => e.name === name && e.t < 0.5)) this.emotes.push({ name, t: 0, dur }); }
+  spr() { return this.set[this.frame] || Object.values(this.set)[0]; }
+  draw() {
+    const s = this.spr();
+    if (this.shadow && this.clip === null && this.layer === 'ground') {
+      const w = Math.max(3, Math.round(s.w * 0.55 - this.z * 0.12));
+      ctx.globalAlpha = 0.2; rect(this.x - w / 2, this.y + 1, w, 1, '#14331a'); ctx.globalAlpha = 1;
+    }
+    drawSpr(s, this.x, this.y - this.z, this.facing, this.clip);
+    if (this.extraDraw) this.extraDraw(this, s);
+    for (const e of this.emotes) {
+      const k = e.t / e.dur;
+      if (k > 0.75 && Math.floor(world.t * 12) % 2) continue;
+      drawSpr(ICONS[e.name], this.x + this.facing * 3, this.y - this.z - s.ay - 1 - Math.min(1, k * 3) * 4, 1);
+    }
+  }
+}
+
+// ---- movement helpers (generators)
+function* idleBlink(c, secs, base, blink) {
+  let t = 0, nb = rand(0.8, 2.5);
+  while (t < secs) {
+    const dt = yield; t += dt; nb -= dt;
+    c.frame = nb < 0 && blink ? blink : base;
+    if (nb < -0.15) nb = rand(1.5, 4);
+  }
+  c.frame = base;
+}
+function* anim(c, frames, fps, secs) {
+  let t = 0;
+  while (t < secs) { c.frame = frames[Math.floor(t * fps) % frames.length]; t += yield; }
+}
+function* walkTo(c, tx, ty, speed, frames, fps = 6) {
+  for (let guard = 0; guard < 2000; guard++) {
+    const dx = tx - c.x, dy = ty - c.y, d = Math.hypot(dx, dy);
+    if (d < 1) break;
+    if (Math.abs(dx) > 0.5) c.facing = Math.sign(dx);
+    c.vx = (dx / d) * speed; c.vy = (dy / d) * speed;
+    c.frame = frames[Math.floor(c.age * fps) % frames.length];
+    const dt = yield;
+    if (Math.hypot(tx - c.x, ty - c.y) < speed * dt) { c.x = tx; c.y = ty; break; }
+  }
+  c.vx = c.vy = 0;
+}
+function* hopTo(c, tx, ty, o = {}) {
+  const len = o.len ?? 12, vz = o.vz ?? 50, air = (2 * vz) / c.grav;
+  for (let guard = 0; guard < 200; guard++) {
+    const dx = tx - c.x, dy = ty - c.y, d = Math.hypot(dx, dy);
+    if (d < 1.5) break;
+    const step = Math.min(d, len);
+    if (Math.abs(dx) > 0.5) c.facing = Math.sign(dx);
+    c.vx = ((dx / d) * step) / air; c.vy = ((dy / d) * step) / air;
+    c.vz = vz; c.landed = false; c.frame = o.hop || 'hop';
+    yield* until(() => c.landed, 3);
+    c.vx = c.vy = 0; c.frame = o.sit || 'sit';
+    yield* wait(o.pause ?? rand(0.06, 0.22));
+  }
+}
+const hopper = (c, x, y) => hopTo(c, x, y);
+const fastHopper = (c, x, y) => hopTo(c, x, y, { len: 18, vz: 60, pause: 0.03 });
+function crossesPond(x0, y0, x1, y1) {
+  for (let i = 1; i < 12; i++) { const u = i / 12; if (inPond(lerp(x0, x1, u), lerp(y0, y1, u), 8)) return true; }
+  return false;
+}
+function* travel(c, tx, ty, mover) {
+  if (crossesPond(c.x, c.y, tx, ty)) {
+    const P = scene.pond, s = Math.sign(c.x - P.x) || 1;
+    const below = ty + c.y > 2 * P.y && P.y + P.ry + 9 < GY1;
+    const wy = below ? P.y + P.ry + 9 : Math.max(GY0, P.y - P.ry - 7);
+    yield* mover(c, P.x + s * P.rx * 0.8, wy);
+    yield* mover(c, P.x - s * P.rx * 0.8, wy);
+  }
+  yield* mover(c, tx, ty);
+}
+function groundSpot(pad = 10) {
+  for (let i = 0; i < 40; i++) {
+    const x = rand(pad, W - pad), y = rand(GY0 + 4, GY1);
+    if (!inPond(x, y, 10)) return { x, y };
+  }
+  return { x: W / 2, y: GY1 - 4 };
+}
+const critters = kind => world.ents.filter(e => e.kind === kind && !e.dead);
+
+// ---- burrows: peeking in and out
+function setPeek(c, b, k) {
+  const s = c.spr(), vis = Math.round((s.ay + 1) * clamp(k, 0, 1));
+  c.x = b.x; c.y = b.y; c.clip = vis; c.z = vis - s.ay - 1;
+}
+function* popUp(c, b, dur = 0.35) {
+  let t = 0;
+  while (t < dur) { setPeek(c, b, t / dur); t += yield; }
+  setPeek(c, b, 1); c.clip = null; c.z = 0;
+}
+function* popDown(c, b, dur = 0.3) {
+  let t = 0;
+  while (t < dur) { setPeek(c, b, 1 - t / dur); t += yield; }
+  setPeek(c, b, 0);
+}
+function freeBurrow(x, y) {
+  let best = null, bd = 1e9;
+  for (const b of scene.burrows) { if (b.busy) continue; const d = Math.hypot(b.x - x, b.y - y); if (d < bd) { bd = d; best = b; } }
+  return best;
+}
+// A bunny (or anyone) dives into a burrow and waits until tags.hide is cleared
+function* hideInBurrow(c) {
+  const b = freeBurrow(c.x, c.y);
+  if (!b) { c.frame = 'sleep'; yield* until(() => !c.tags.hide, 60); return; }
+  b.busy = c;
+  yield* travel(c, b.x, b.y + 0.5, fastHopper);
+  c.shadow = false;
+  yield* popDown(c, b, 0.25);
+  yield* until(() => !c.tags.hide, 90);
+  yield* wait(rand(0, 1.2));
+  yield* popUp(c, b, 0.3);
+  c.shadow = true; b.busy = false;
+  const p = { x: clamp(c.x + rand(-30, 30), 10, W - 10), y: clamp(c.y + rand(4, 14), GY0 + 4, GY1) };
+  if (!inPond(p.x, p.y, 8)) yield* hopTo(c, p.x, p.y);
+}
+
+// ---- bunny
+function* bunnyLife(c) {
+  for (;;) {
+    if (c.tags.hide) { yield* hideInBurrow(c); continue; }
+    const choice = weighted({ wander: 4, nibble: 3, flop: 1, look: 1.5, nap: world.dark > 0.5 ? 6 : 0.6, friend: 1.2, binky: 0.7 });
+    if (choice === 'wander') {
+      const tx = clamp(c.x + rand(-80, 80), 10, W - 10), ty = clamp(c.y + rand(-25, 25), GY0 + 4, GY1);
+      if (inPond(tx, ty, 10)) { yield; continue; }
+      yield* travel(c, tx, ty, hopper);
+    } else if (choice === 'nibble') {
+      const f = nearestFlower(c.x, c.y, 90);
+      if (!f) { yield* idleBlink(c, 1, 'sit', 'blink'); continue; }
+      const side = Math.sign(c.x - f.x) || 1;
+      yield* travel(c, f.x + side * 6, f.y + 0.5, hopper);
+      if (f.eaten > 0) continue;
+      c.facing = -side;
+      yield* anim(c, ['eat', 'chew'], 5, rand(1.5, 3));
+      f.eaten = rand(25, 45);
+      if (chance(0.4)) c.emote('heart');
+      c.frame = 'sit';
+    } else if (choice === 'flop') {
+      yield* idleBlink(c, rand(2, 4), 'flop', null);
+    } else if (choice === 'look') {
+      for (let i = 0; i < randi(1, 3); i++) { yield* idleBlink(c, rand(0.8, 1.8), 'sit', 'blink'); c.facing *= -1; }
+    } else if (choice === 'nap') {
+      c.frame = 'sleep';
+      let t = 0; const dur = rand(4, 8);
+      while (t < dur && !c.tags.hide) { if (Math.floor(t / 1.6) !== Math.floor((t + 1 / 30) / 1.6)) c.emote('z', 1.4); t += yield; }
+    } else if (choice === 'friend') {
+      const other = critters('bunny').find(o => o !== c && Math.abs(o.x - c.x) < 120 && o.z === 0 && o.clip === null);
+      if (!other) continue;
+      const side = Math.sign(c.x - other.x) || 1;
+      yield* travel(c, other.x + side * 12, other.y, hopper);
+      c.facing = -side;
+      if (Math.abs(c.x - other.x) < 20) { other.facing = side; c.emote('heart', 2); yield* wait(0.4); other.emote('heart', 2); }
+      yield* idleBlink(c, 2, 'sit', 'blink');
+    } else if (choice === 'binky') {   // happy bunny jump-twist
+      c.emote('sparkle', 1.2);
+      for (let i = 0; i < 2; i++) {
+        c.vz = 75; c.landed = false; c.frame = 'hop';
+        yield* wait(0.2); c.facing *= -1;
+        yield* until(() => c.landed, 2); c.frame = 'sit';
+        yield* wait(0.15);
+      }
+    }
+    yield;
+  }
+}
+function spawnBunny(x, y) {
+  const c = new Critter('bunny', { set: pick(SPR.bunny), x, y, facing: coin() });
+  c.life = () => bunnyLife(c);
+  return c.resume();
+}
+
+// ---- prairie dogs
+function* pdogLife(c, b) {
+  c.shadow = false;
+  setPeek(c, b, 0);
+  for (;;) {
+    yield* wait(rand(2, 10));
+    if (c.tags.stayDown || (b.busy && b.busy !== c)) continue;
+    b.busy = c;
+    yield* popUp(c, b);
+    for (let i = randi(1, 3); i > 0 && !c.tags.stayDown; i--) {
+      yield* idleBlink(c, rand(0.8, 2), 'stand', 'blink');
+      c.facing *= -1;
+      if (chance(0.35)) { c.emote('note', 1.2); yield* anim(c, ['chirp', 'stand'], 6, 0.7); }
+    }
+    yield* popDown(c, b);
+    b.busy = false;
+  }
+}
+
+// ---- ducks swimming in circles on the pond
+function* duckLife(c, i, fam) {
+  c.shadow = false;
+  for (;;) {
+    const P = scene.pond, a = fam.a - i * 0.42;
+    const x = P.x + Math.cos(a) * P.rx * 0.55, y = P.y + Math.sin(a) * P.ry * 0.42 + 2;
+    const dx = x - c.x;
+    if (Math.abs(dx) > 0.05) c.facing = Math.sign(dx);
+    c.x = x; c.y = y; c.frame = 'swim';
+    c.clip = c.spr().ay - 1 + Math.round(Math.sin(world.t * 3 + i) * 0.4);
+    yield;
+  }
+}
+function rippleDraw(c, s) {
+  const X = Math.round(c.x), Y = Math.round(c.y - 1), w = Math.round(s.w * 0.4) + (Math.floor(world.t * 3) % 2);
+  ctx.globalAlpha = 0.8;
+  rect(X - w, Y, 2, 1, '#c8ecff'); rect(X + w - 1, Y, 2, 1, '#c8ecff');
+  ctx.globalAlpha = 1;
+}
+function spawnDuckFamily() {
+  const fam = { a: rand(0, 6.28), speed: coin() * 0.12, pause: 0 };
+  const mama = new Critter('duck', { frame: 'swim' });
+  mama.life = () => duckLife(mama, 0, fam); mama.resume(); mama.extraDraw = rippleDraw;
+  mama.fam = fam;
+  const kids = [];
+  for (let i = 1; i <= randi(2, 3); i++) {
+    const k = new Critter('duckling', { frame: 'swim' });
+    k.life = () => duckLife(k, i, fam); k.resume(); k.extraDraw = rippleDraw;
+    kids.push(k);
+  }
+  fam.update = dt => {
+    if ((fam.pause -= dt) > 0) return;
+    fam.a += fam.speed * dt;
+    if (chance(0.002)) { fam.pause = rand(1.5, 3); mama.emote('note', 1.4); }
+  };
+  return { mama, kids, fam };
+}
+
+// ---- butterflies & bees (small ambient flyers)
+const BUTTERFLY_COLS = [['#ffb13a', '#ff7a1a'], ['#8ad4ff', '#4a9aff'], ['#ffc6ea', '#ff7ac8'], ['#fff29a', '#ffd23a'], ['#d6b8ff', '#9a6aff']];
+class Butterfly {
+  constructor(x, y, o = {}) {
+    Object.assign(this, { x, y, layer: 'air', dead: false, col: pick(BUTTERFLY_COLS), perch: null, rest: 0, ph: rand(0, 6.28), speed: rand(14, 22), leaving: false, tx: x, ty: y, swarm: null }, o);
+    world.ents.push(this);
+  }
+  pickTarget() {
+    const f = nearestFlower(this.x + rand(-80, 80), this.y + rand(-30, 30), 200);
+    if (f) { this.perch = f; this.tx = f.x; this.ty = f.y - f.h - 1; }
+    else { this.tx = rand(0, W); this.ty = rand(GY0 - 30, GY1); }
+  }
+  update(dt) {
+    this.ph += dt;
+    if (this.swarm) { const s = this.swarm; this.tx = s.x + Math.cos(this.ph * 1.3 + s.i) * s.r; this.ty = s.y + Math.sin(this.ph * 1.7 + s.i) * s.r * 0.6; }
+    else if (this.leaving) { this.tx = this.x < W / 2 ? -20 : W + 20; this.ty = this.y - 30; }
+    if (this.rest > 0) { this.rest -= dt; if (this.rest <= 0 || world.wind > 1.1) { this.perch = null; this.pickTarget(); } return; }
+    const dx = this.tx - this.x, dy = this.ty - this.y, d = Math.hypot(dx, dy);
+    if (d < 1.5 && this.perch && !this.swarm && !this.leaving) { this.rest = rand(2, 6); return; }
+    if (d < 3 && !this.perch && !this.swarm && !this.leaving) this.pickTarget();
+    const k = Math.min(1, dt * 2);
+    this.vx = lerp(this.vx || 0, (dx / (d || 1)) * this.speed, k);
+    this.vy = lerp(this.vy || 0, (dy / (d || 1)) * this.speed, k);
+    this.x += (this.vx + world.wind * 6) * dt;
+    this.y += (this.vy + Math.sin(this.ph * 7) * 14) * dt;
+    if (this.leaving && (this.x < -15 || this.x > W + 15)) this.dead = true;
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y), open = this.rest > 0 ? Math.sin(this.ph * 2) > 0.6 : Math.sin(this.ph * 22) > 0;
+    const [c1, c2] = this.col;
+    if (open) { px(X - 1, Y - 1, c1); px(X + 1, Y - 1, c1); px(X - 1, Y, c2); px(X + 1, Y, c2); }
+    else { px(X, Y - 2, c1); px(X, Y - 1, c2); }
+    px(X, Y, '#3a2a2a');
+  }
+}
+class Bee {
+  constructor(x, y) {
+    Object.assign(this, { x, y, layer: 'air', dead: false, ph: rand(0, 6.28), home: null, t: 0, leaving: false });
+    world.ents.push(this);
+    this.pick();
+  }
+  pick() { this.home = nearestFlower(this.x + rand(-60, 60), this.y + rand(-20, 20), 150) || { x: rand(0, W), y: rand(GY0, GY1), h: 2 }; this.t = rand(2, 5); }
+  update(dt) {
+    this.ph += dt; this.t -= dt;
+    if (this.t <= 0) this.pick();
+    const tx = this.leaving ? (this.x < W / 2 ? -10 : W + 10) : this.home.x + Math.cos(this.ph * 3) * 5;
+    const ty = this.leaving ? this.y : this.home.y - this.home.h - 3 + Math.sin(this.ph * 5) * 3;
+    this.x += (tx - this.x) * Math.min(1, dt * 1.5) + rand(-0.4, 0.4);
+    this.y += (ty - this.y) * Math.min(1, dt * 1.5) + rand(-0.4, 0.4);
+    if (this.leaving && (this.x < -5 || this.x > W + 5)) this.dead = true;
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y);
+    px(X, Y, '#ffd23a'); px(X + 1, Y, '#2a2020');
+    if (Math.floor(this.ph * 20) % 2) px(X, Y - 1, '#eaf8ff');
+  }
+}
+
+// ---- birds: fly across, sometimes stop on the tree
+function* birdLife(c, o = {}) {
+  const dir = o.dir ?? coin(), T = scene.tree;
+  c.facing = dir; c.x = dir > 0 ? -8 : W + 8; c.y = o.y ?? rand(10, HY - 10);
+  const perch = o.perch ?? chance(0.35);
+  const flap = () => { c.frame = Math.floor(c.age * 9) % 2 ? 'up' : 'down'; };
+  if (perch) {
+    const px0 = T.branch.x + randi(-6, 6), py0 = T.branch.y + randi(-3, 3);
+    for (let g = 0; g < 1500; g++) {
+      const dx = px0 - c.x, dy = py0 - c.y, d = Math.hypot(dx, dy);
+      if (d < 2) break;
+      c.facing = Math.sign(dx) || c.facing;
+      c.x += (dx / d) * 40 * (yield); c.y += (dy / d) * 40 * (1 / 30) + Math.sin(c.age * 5) * 0.3;
+      flap();
+    }
+    c.x = px0; c.y = py0; c.frame = 'perch';
+    let t = 0; const dur = rand(3, 8);
+    while (t < dur && !c.tags.flee) { if (chance(0.01)) { c.facing *= -1; } if (chance(0.006)) c.emote('note', 1.2); t += yield; }
+  }
+  const out = coin();
+  for (let g = 0; g < 1500; g++) {
+    const dt = yield;
+    c.facing = perch ? out : dir;
+    c.x += c.facing * 45 * dt; c.y += (Math.sin(c.age * 3) * 8 - (perch ? 10 : 0)) * dt;
+    flap();
+    if (c.x < -12 || c.x > W + 12) break;
+  }
+  c.dead = true;
+}
+function spawnBird(o = {}) {
+  const c = new Critter('bird', { set: pick(SPR.bird), layer: 'air', flyer: true, shadow: false });
+  c.act(birdLife(c, o));
+  return c;
+}
+
+// ---- wanderers: hedgehog or turtle strolling across
+function* strollLife(c) {
+  const dir = coin(), speed = c.kind === 'turtle' ? 5 : 9, y = rand(GY0 + 8, GY1 - 2);
+  c.x = dir > 0 ? -10 : W + 10; c.y = y; c.facing = dir;
+  const end = dir > 0 ? W + 12 : -12;
+  for (let g = 0; g < 20000; g++) {
+    // hedgehogs curl up if a bunny lands next to them
+    if (c.kind === 'hedgehog' && critters('bunny').some(b => b.z > 2 && Math.abs(b.x - c.x) < 14 && Math.abs(b.y - c.y) < 8)) {
+      c.vx = 0; c.frame = 'ball'; c.emote('bang', 1);
+      yield* wait(2.5);
+    }
+    c.vx = dir * speed; c.facing = dir;
+    c.frame = Math.floor(c.age * 4) % 2 ? 'a' : 'b';
+    if (inPond(c.x + dir * 8, c.y, 6)) c.y += (c.y < scene.pond.y ? -1 : 1) * 12 * (1 / 30);
+    if (chance(0.004)) { c.vx = 0; c.frame = 'a'; c.emote(chance(0.5) ? 'heart' : 'note'); yield* wait(rand(1, 2.5)); }
+    yield;
+    if ((dir > 0 && c.x > end) || (dir < 0 && c.x < end)) break;
+  }
+  c.dead = true;
+}
+
+// ---- ambient director
+const amb = { birdT: rand(3, 8), walkT: rand(12, 25), family: null };
+function ambientTick(dt) {
+  if (amb.family) amb.family.fam.update(dt);
+  const calm = world.rain < 0.2 && world.dark < 0.5;
+  const flyers = world.ents.filter(e => e instanceof Butterfly && !e.leaving && !e.swarm);
+  if (calm && flyers.length < 5 && chance(dt * 0.4)) new Butterfly(chance(0.5) ? -5 : W + 5, rand(GY0 - 20, GY1)).pickTarget();
+  if (!calm) flyers.forEach(b => { b.leaving = true; b.perch = null; b.rest = 0; });
+  const bees = world.ents.filter(e => e instanceof Bee && !e.leaving);
+  if (calm && bees.length < 2 && chance(dt * 0.3)) new Bee(chance(0.5) ? -3 : W + 3, rand(GY0, GY1));
+  if (!calm) bees.forEach(b => (b.leaving = true));
+  if ((amb.birdT -= dt) <= 0) {
+    amb.birdT = rand(8, 18);
+    if (calm) { spawnBird(); if (chance(0.3)) setTimeoutish(() => spawnBird(), 0.4); }
+  }
+  if ((amb.walkT -= dt) <= 0) {
+    amb.walkT = rand(30, 60);
+    if (calm && !director.cur && !critters('hedgehog').length && !critters('turtle').length) {
+      const c = new Critter(chance(0.6) ? 'hedgehog' : 'turtle');
+      c.act(strollLife(c));
+    }
+  }
+}
+// tiny scheduler that runs on world time (so it respects #speed and test stepping)
+function setTimeoutish(fn, secs) { addFx({ dur: secs, layer: 'none', draw() {}, done: fn }); }
+
+function populate() {
+  for (let i = 0; i < 3; i++) { const p = groundSpot(20); spawnBunny(p.x, p.y); }
+  scene.burrows.forEach((b, i) => {
+    if (i === scene.burrows.length - 1) return;   // leave one burrow free for bunnies
+    const c = new Critter('pdog', { frame: 'stand', facing: coin() });
+    c.act(pdogLife(c, b)); c.life = () => pdogLife(c, b);
+  });
+  amb.family = spawnDuckFamily();
+  for (let i = 0; i < 4; i++) new Butterfly(rand(0, W), rand(GY0 - 10, GY1)).pickTarget();
+  new Bee(rand(0, W), rand(GY0, GY1));
+}
+
+// ---------------------------------------------------------------- event helpers
+const walker = (speed, frames = ['a', 'b'], fps = 6) => (c, x, y) => walkTo(c, x, y, speed, frames, fps);
+const freeBunnies = () => critters('bunny').filter(b => b.clip === null && !b.tags.hide && !b.tags.busy);
+function alarm(on) {
+  for (const b of critters('bunny')) {
+    if (on && !b.tags.hide && !b.tags.busy) { b.tags.hide = true; b.emote('bang', 1); b.resume(); }
+    if (!on) b.tags.hide = false;
+  }
+  for (const p of critters('pdog')) p.tags.stayDown = on;
+  for (const b of world.ents) if (b.kind === 'bird') b.tags.flee = on;
+}
+function confetti(x, y, n = 40) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(-2.8, -0.3), sp = rand(25, 60);
+    addPart(x, y, Math.cos(a) * sp, Math.sin(a) * sp, rand(2, 3.5), pick(['#ff5a8a', '#ffd23a', '#6ad66a', '#4ab0ff', '#c77dff', '#ffffff']),
+      { drag: 0.3, grav: 30, flutter: 8, floor: y + rand(4, 14) });
+  }
+}
+function laneY() {   // a horizontal lane across the meadow that misses the pond
+  const P = scene.pond, below = P.y + P.ry + 12, above = P.y - P.ry - 9;
+  return below < GY1 - 4 ? rand(below, GY1 - 2) : Math.max(GY0 + 6, above);
+}
+
+// ---------------------------------------------------------------- COMMON EVENTS
+// Duck parade: mama leads a line of ducklings across; one gets distracted and has to catch up
+function* ducks() {
+  const dir = coin(), y0 = laneY(), speed = 15;
+  const mama = new Critter('duck', { frame: 'a', x: dir > 0 ? -10 : W + 10, y: y0, facing: dir });
+  const kids = [];
+  for (let i = 0; i < randi(4, 6); i++) kids.push(new Critter('duckling', { frame: 'a', x: mama.x - dir * (11 + i * 8), y: y0, facing: dir }));
+  const lagger = kids[kids.length - 1];
+  let stopped = 0, quacked = false, lagPhase = 0, lagT = 0;
+  for (let g = 0; g < 9000; g++) {
+    const dt = yield;
+    if (!quacked && Math.abs(mama.x - W / 2) < 8) {
+      quacked = true; stopped = 2.2; mama.emote('note', 2);
+      kids.forEach((k, i) => setTimeoutish(() => { if (k.clip === null && k.landed && k !== lagger) { k.vz = 40; k.landed = false; } }, 0.4 + i * 0.15));
+    }
+    if (stopped > 0) { stopped -= dt; mama.frame = 'a'; }
+    else { mama.x += dir * speed * dt; mama.frame = Math.floor(world.t * 6) % 2 ? 'a' : 'b'; }
+    mama.y = y0 + Math.sin(mama.x * 0.03) * 3;
+    kids.forEach((k, i) => {
+      const lead = i === 0 ? mama : kids[i - 1], dx = lead.x - k.x, dy = lead.y - k.y, d = Math.hypot(dx, dy);
+      let sp = speed * 1.15;
+      if (k === lagger) {
+        if (lagPhase === 0 && (dir > 0 ? k.x > W * 0.3 : k.x < W * 0.7)) { lagPhase = 1; lagT = 2.8; k.emote('sparkle', 2); }
+        if (lagPhase === 1) { lagT -= dt; k.frame = 'a'; k.facing = -dir; if (lagT <= 0) { lagPhase = 2; k.emote('bang', 1); } return; }
+        if (lagPhase === 2) { sp = speed * 3; if (k.landed && chance(0.15)) { k.vz = 30; k.landed = false; } if (d < 10) { lagPhase = 3; k.emote('heart', 1.6); } }
+      }
+      if (d > 8) {
+        k.x += (dx / d) * sp * dt; k.y += (dy / d) * sp * dt;
+        k.facing = Math.sign(dx) || k.facing; k.frame = Math.floor(world.t * 8 + i) % 2 ? 'a' : 'b';
+      } else k.frame = 'a';
+    });
+    if ([mama, ...kids].every(k => (dir > 0 ? k.x > W + 10 : k.x < -10))) break;
+  }
+  [mama, ...kids].forEach(k => (k.dead = true));
+}
+
+// Fox visit: fox spots a bunny, everyone dives into burrows, a prairie dog startles the fox, fox naps then leaves
+function* fox() {
+  const dir = coin(), mover = walker(22, ['a', 'b'], 8);
+  const f = new Critter('fox', { frame: 'a', x: dir > 0 ? -14 : W + 14, y: rand(GY0 + 10, GY1 - 4), facing: dir });
+  yield* travel(f, dir > 0 ? W * 0.28 : W * 0.72, f.y, mover);
+  f.frame = 'sit';
+  yield* wait(1.2);
+  const target = freeBunnies().sort((a, b) => Math.abs(a.x - f.x) - Math.abs(b.x - f.x))[0];
+  if (target) {
+    f.facing = Math.sign(target.x - f.x) || f.facing; f.emote('bang', 1.2);
+    yield* wait(0.6);
+    alarm(true);
+    f.frame = 'pounce'; f.vz = 45; f.landed = false;
+    let t = 0;
+    while (t < 6 && target.clip !== 0) {
+      const dt = yield; t += dt;
+      const dx = target.x - f.x, dy = target.y - f.y, d = Math.hypot(dx, dy);
+      if (d > 14) { f.facing = Math.sign(dx) || f.facing; f.x += (dx / d) * 30 * dt; f.y += (dy / d) * 30 * dt; }
+      if (f.landed) f.frame = Math.floor(world.t * 10) % 2 ? 'a' : 'b';
+    }
+    const b = scene.burrows.slice().sort((a, c) => Math.hypot(a.x - f.x, a.y - f.y) - Math.hypot(c.x - f.x, c.y - f.y))[0];
+    if (b) yield* travel(f, b.x - f.facing * 12, b.y, mover);
+    f.frame = 'sit'; f.emote('q', 2);
+    yield* wait(2);
+    const pd = critters('pdog').find(p => p.clip === 0);
+    if (pd) {
+      const burrow = scene.burrows.find(bb => bb.x === pd.x && bb.y === pd.y);
+      if (burrow && !burrow.busy) {
+        pd.brain = null; burrow.busy = pd;
+        yield* popUp(pd, burrow);
+        pd.facing = Math.sign(f.x - pd.x) || 1;
+        pd.emote('note', 1.5);
+        yield* anim(pd, ['chirp', 'stand'], 8, 1);
+        f.emote('bang', 1); f.vz = 70; f.landed = false; f.facing = Math.sign(pd.x - f.x) || f.facing;
+        yield* until(() => f.landed, 2);
+        yield* popDown(pd, burrow);
+        burrow.busy = false; pd.resume();
+      }
+    }
+  }
+  f.frame = 'sleep';
+  for (let i = 0; i < 4; i++) { f.emote('z', 1.4); yield* wait(1.5); }
+  f.frame = 'sit';
+  yield* wait(0.8);
+  const out = f.x < W / 2 ? -1 : 1;
+  yield* travel(f, out > 0 ? W + 16 : -16, f.y, mover);
+  f.dead = true;
+  yield* wait(1.5);
+  alarm(false);
+}
+
+// Windy day: a gust shakes apples loose, they bounce and roll, a hedgehog and bunny come to snack
+class Apple {
+  constructor(x, z, groundY) { Object.assign(this, { x, y: groundY, z, vx: rand(-6, 6), vz: 0, layer: 'ground', dead: false, bites: 0, rest: false }); world.ents.push(this); }
+  update(dt) {
+    if (this.rest) return;
+    this.vz -= 220 * dt; this.z += this.vz * dt; this.x += this.vx * dt;
+    if (this.z <= 0) {
+      this.z = 0;
+      if (Math.abs(this.vz) > 20) { this.vz *= -0.45; this.vx += rand(-10, 10); addPart(this.x, this.y, rand(-8, 8), -10, 0.4, '#7fc865', { grav: 60 }); }
+      else { this.vz = 0; this.vx *= 0.92; if (Math.abs(this.vx) < 0.5) this.rest = true; }
+    }
+    this.x = clamp(this.x, 2, W - 2);
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y - this.z);
+    ctx.globalAlpha = 0.2; rect(X - 1, this.y + 1, 3, 1, '#14331a'); ctx.globalAlpha = 1;
+    if (this.bites >= 3) return;
+    rect(X, Y - 1, 2, 2, '#e8403a'); px(X, Y - 2, '#6a4226'); px(X, Y - 1, '#ff7a6a');
+    if (this.bites >= 1) px(X + 1, Y - 1, '#fff2d0');
+    if (this.bites >= 2) px(X + 1, Y, '#fff2d0');
+  }
+}
+function* apples() {
+  world.gust = 1.3;
+  const T = scene.tree;
+  for (const f of scene.flowers) if (f.puff && chance(0.7)) {
+    f.puff = false;
+    for (let i = 0; i < 4; i++) addPart(f.x, f.y - f.h - 1, rand(8, 20), rand(-12, -4), rand(3, 5), '#ffffff', { drag: 0.6, grav: 2, wind: 1, flutter: 10 });
+  }
+  for (let i = 0; i < 30; i++) addPart(T.x + rand(-22, 22), T.top + rand(8, 40), rand(10, 25), rand(-6, 6), rand(2, 4), pick(['#64b452', '#94d86c', '#4e9a44']), { drag: 0.7, grav: 15, wind: 1, flutter: 12 });
+  const dropped = [];
+  for (const a of T.apples) if (a.on && chance(0.6) && dropped.length < 4) {
+    a.on = false; a.regrow = rand(60, 120);
+    yield* wait(rand(0.2, 0.7));
+    const gy = T.y + rand(2, 14);
+    dropped.push(new Apple(a.x, gy - a.y, gy));
+  }
+  yield* wait(3);
+  if (!dropped.length) return;
+  const hog = new Critter('hedgehog', { frame: 'a' });
+  const dir = dropped[0].x < W / 2 ? 1 : -1;
+  hog.x = dir > 0 ? -10 : W + 10; hog.y = dropped[0].y; hog.facing = dir;
+  const muncher = freeBunnies()[0];
+  if (muncher) { muncher.tags.busy = true; muncher.brain = null; }
+  const eat = function* (c, a, frames, walkFn) {
+    yield* travel(c, a.x - (Math.sign(a.x - c.x) || 1) * 7, a.y, walkFn);
+    c.facing = Math.sign(a.x - c.x) || c.facing;
+    for (let i = 0; i < 3; i++) { yield* anim(c, frames, 5, 0.9); a.bites++; }
+    a.dead = true; c.emote('heart', 1.8);
+  };
+  const jobs = [eat(hog, dropped[0], ['a', 'b'], walker(9))];
+  if (muncher && dropped[1]) jobs.push(eat(muncher, dropped[1], ['eat', 'chew'], hopper));
+  let active = jobs.length;
+  hog.act(jobs[0]);
+  if (jobs[1]) muncher.act(jobs[1]);
+  yield* until(() => !hog.brain && (!muncher || !jobs[1] || !muncher.brain), 60);
+  if (muncher) { muncher.tags.busy = false; muncher.resume(); }
+  yield* wait(1);
+  hog.act((function* () { yield* walkTo(hog, dir > 0 ? W + 12 : -12, hog.y, 9, ['a', 'b'], 4); hog.dead = true; })());
+  dropped.forEach(a => { if (!a.dead) setTimeoutish(() => (a.dead = true), 30); });
+  void active;
+}
+
+// Rain shower: clouds darken, everyone hides, frogs come out to play, then a rainbow
+function* rain() {
+  const P = scene.pond, puddles = [], drops = [];
+  for (let i = 0; i < 3; i++) { const p = groundSpot(20); puddles.push({ x: p.x, y: p.y, r: 0, max: rand(5, 9) }); }
+  addFx({
+    layer: 'ground', dur: 1e9, puddles, draw(f) {
+      for (const p of puddles) {
+        const r = Math.round(p.r); if (r < 1) continue;
+        for (let dx = -r; dx <= r; dx++) {
+          const hh = Math.round(Math.sqrt(1 - (dx * dx) / (r * r)) * r * 0.35);
+          rect(p.x + dx, p.y - hh, 1, hh * 2 + 1, dx < -r * 0.3 ? '#8ecff0' : '#6cb8e4');
+        }
+      }
+      if (world.rain < 0.05 && puddles.every(p => p.r < 0.5) && f.t > 5) f.dur = 0;
+    },
+  });
+  addFx({
+    layer: 'front', dur: 1e9, draw(f) {
+      ctx.fillStyle = '#d4ecff';
+      for (const d of drops) { ctx.fillRect(Math.round(d.x), Math.round(d.y), 1, 2); ctx.fillRect(Math.round(d.x) - 1, Math.round(d.y) + 2, 1, 1); }
+      if (world.rain < 0.02 && !drops.length && f.t > 5) f.dur = 0;
+    },
+  });
+  const stepRain = dt => {
+    const n = world.rain * W * 0.03;
+    for (let i = 0; i < n; i++) drops.push({ x: rand(-10, W + 30), y: rand(-20, HY * 0.5), vy: rand(150, 190), floor: rand(HY + 6, H) });
+    for (const d of drops) {
+      d.y += d.vy * dt; d.x -= (20 + world.wind * 20) * dt;
+      if (d.y >= d.floor) {
+        d.dead = true;
+        if (inPond(d.x, d.y)) { if (chance(0.3)) addFx({ layer: 'ground', dur: 0.5, x: d.x, y: d.y, draw(f) { const r = 1 + Math.round(f.t * 6); ctx.globalAlpha = 1 - f.t * 2; rect(f.x - r, f.y, 1, 1, '#d4ecff'); rect(f.x + r, f.y, 1, 1, '#d4ecff'); ctx.globalAlpha = 1; } }); }
+        else if (chance(0.4)) { addPart(d.x, d.y, -8, -18, 0.25, '#d4ecff', { grav: 150, fade: false }); addPart(d.x, d.y, 8, -18, 0.25, '#d4ecff', { grav: 150, fade: false }); }
+      }
+    }
+    for (let i = drops.length - 1; i >= 0; i--) if (drops[i].dead) drops.splice(i, 1);
+    for (const p of puddles) p.r = world.rain > 0.5 ? Math.min(p.max, p.r + dt * 0.6) : Math.max(0, p.r - dt * 0.25);
+  };
+  let t = 0;
+  // clouds gather
+  while (t < 4) { const dt = yield; t += dt; world.gloom = t / 4; world.windBase = 0.3 + t * 0.1; stepRain(dt); }
+  alarm(true);
+  amb.family?.mama.emote('note', 2);
+  // frogs appear
+  const frogs = [];
+  for (let i = 0; i < randi(2, 3); i++) {
+    const a = rand(0, 6.28), fr = new Critter('frog', { frame: 'sit', x: P.x + Math.cos(a) * (P.rx + 4), y: P.y + Math.sin(a) * (P.ry + 3), facing: coin() });
+    fr.z = 0; fr.vz = 60; fr.landed = false; fr.grav = 300;
+    fr.act((function* () {
+      for (;;) {
+        const target = chance(0.5) && puddles.length ? pick(puddles) : groundSpot(20);
+        const tx = clamp(target.x + rand(-4, 4), 8, W - 8), ty = target.y;
+        yield* travel(fr, clamp(fr.x + clamp(tx - fr.x, -50, 50), 8, W - 8), clamp(fr.y + clamp(ty - fr.y, -20, 20), GY0 + 4, GY1), (c, x, y) => hopTo(c, x, y, { hop: 'jump', sit: 'sit', len: 14, vz: 60, pause: rand(0.3, 0.9) }));
+        if (chance(0.6)) { fr.emote('note', 1.2); yield* anim(fr, ['croak', 'sit'], 4, 1.5); }
+        yield* wait(rand(0.3, 1));
+      }
+    })());
+    frogs.push(fr);
+    yield* wait(0.5);
+  }
+  t = 0;
+  const dur = rand(16, 24);
+  while (t < dur) { const dt = yield; t += dt; world.rain = Math.min(1, t / 2); stepRain(dt); if (chance(dt * 0.3)) pick(frogs).emote('heart', 1.4); }
+  // clearing up
+  t = 0;
+  while (t < 4) { const dt = yield; t += dt; world.rain = Math.max(0, 1 - t / 2.5); world.gloom = Math.max(0, 1 - t / 4); world.windBase = 0.3 + (1 - t / 4) * 0.4; stepRain(dt); }
+  world.rain = 0; world.gloom = 0; world.windBase = 0.3;
+  // frogs hop home
+  for (const fr of frogs) fr.act((function* () {
+    const a = Math.atan2(fr.y - P.y, fr.x - P.x);
+    yield* travel(fr, P.x + Math.cos(a) * (P.rx - 3), P.y + Math.sin(a) * (P.ry - 2), (c, x, y) => hopTo(c, x, y, { hop: 'jump', sit: 'sit', len: 16, vz: 60, pause: 0.2 }));
+    fr.dead = true;
+    for (let i = 0; i < 6; i++) addPart(fr.x, fr.y, rand(-15, 15), rand(-30, -10), 0.5, '#d4ecff', { grav: 150 });
+  })());
+  alarm(false);
+  t = 0;
+  while (t < 3) { const dt = yield; t += dt; world.rainbow = t / 3; stepRain(dt); }
+  if (chance(0.3)) yield* unicorn();
+  else yield* wait(10);
+  t = 0;
+  while (t < 4) { const dt = yield; t += dt; world.rainbow = Math.max(0, 1 - t / 4); stepRain(dt); }
+  world.rainbow = 0;
+  yield* until(() => frogs.every(f => f.dead), 15);
+  frogs.forEach(f => (f.dead = true));
+}
+
+// Butterfly bloom: a patch of flowers blooms in a wave and a swirl of butterflies arrives; one lands on a bunny's head
+function* butterflies() {
+  const c = groundSpot(40);
+  for (const f of scene.flowers) {
+    const d = Math.hypot(f.x - c.x, (f.y - c.y) * 1.6);
+    if (d < 45) { f.eaten = 0; f.bloom = -d / 30; if (f.type === 'grass' && chance(0.4)) { f.type = pick(['daisy', 'tulip', 'clover', 'bell']); f.col = pick(TULIPS); } }
+  }
+  for (let i = 0; i < 30; i++) setTimeoutish(() => addPart(c.x + rand(-40, 40), c.y + rand(-15, 15), 0, rand(-12, -4), rand(1, 2), '#fff6a0', { drag: 0.5 }), rand(0, 3));
+  yield* wait(2.5);
+  const center = { x: c.x, y: c.y - 16 }, flock = [];
+  for (let i = 0; i < 10; i++) {
+    const b = new Butterfly(i % 2 ? -5 : W + 5, rand(GY0 - 30, GY1));
+    b.swarm = { x: center.x, y: center.y, r: rand(10, 24), i: i * 0.63 };
+    b.speed = 32; flock.push(b);
+  }
+  const bun = freeBunnies().sort((a, b) => Math.abs(a.x - c.x) - Math.abs(b.x - c.x))[0];
+  let t = 0, landed = null;
+  while (t < 14) {
+    const dt = yield; t += dt;
+    center.y = c.y - 16 + Math.sin(t * 0.8) * 5;
+    for (const b of flock) { b.swarm.x = center.x + Math.sin(t * 0.3) * 10; b.swarm.y = center.y; }
+    if (bun && !landed && t > 5 && bun.clip === null && !bun.tags.hide) {
+      landed = flock[0]; landed.swarm = { x: bun.x, y: bun.y, r: 0, i: 0 }; landed.speed = 20;
+      bun.tags.busy = true; bun.brain = null; bun.frame = 'sit';
+    }
+    if (landed && bun) {
+      landed.swarm.x = bun.x + bun.facing * 2; landed.swarm.y = bun.y - bun.z - 15;
+      if (Math.hypot(landed.x - landed.swarm.x, landed.y - landed.swarm.y) < 2 && chance(dt * 0.8)) { bun.emote('heart', 1.5); bun.frame = chance(0.5) ? 'blink' : 'sit'; }
+    }
+  }
+  if (bun && landed) { bun.tags.busy = false; bun.resume(); }
+  for (const b of flock) { b.swarm = null; if (chance(0.6)) b.leaving = true; else b.pickTarget(); }
+  yield* wait(3);
+}
+
+// The tortoise and the hare
+function* race() {
+  const bun = freeBunnies()[0];
+  if (!bun) return;
+  bun.tags.busy = true; bun.brain = null;
+  const ly = laneY(), startX = W * 0.1, finishX = W * 0.9, flip = chance(0.5);
+  const sx = flip ? W - startX : startX, fx = flip ? W - finishX : finishX, dir = flip ? -1 : 1;
+  const flagFx = addFx({
+    layer: 'ground', dur: 1e9, draw() {
+      for (const [x, col] of [[sx, '#ffffff'], [fx, '#ff5a5a']]) {
+        const X = Math.round(x), Y = Math.round(ly + 9);
+        rect(X, Y - 18, 1, 19, '#8a5a34');
+        const wave = Math.floor(world.t * 4) % 2;
+        rect(X + 1, Y - 18, 5, 2 + wave, col); rect(X + 1, Y - 16 + wave, 3, 2, col);
+        if (x === fx) for (let i = 0; i < 5; i++) rect(X + 1 + i, Y - 18 + ((i % 2) ? 1 : 0), 1, 1, '#ffffff');
+      }
+    },
+  });
+  const tur = new Critter('turtle', { frame: 'a', x: dir > 0 ? -10 : W + 10, y: ly + 7, facing: dir });
+  yield* walkTo(tur, sx, ly + 7, 8, ['a', 'b'], 4);
+  yield* travel(bun, sx, ly, hopper);
+  bun.facing = dir; tur.facing = dir;
+  bun.emote('sparkle', 1.5); yield* wait(1); tur.emote('heart', 1.5); yield* wait(1.2);
+  world.flash = 0.15;
+  const tj = walkTo(tur, fx, ly + 7, 5.5, ['a', 'b'], 3);
+  tur.act(tj);
+  yield* hopTo(bun, lerp(sx, fx, 0.55), ly, { len: 20, vz: 60, pause: 0.02 });
+  bun.facing = -dir; bun.emote('q', 1.5);
+  yield* wait(1.5);
+  bun.facing = dir; bun.frame = 'sleep';
+  while (Math.abs(tur.x - fx) > 40) { if (chance(1 / 45)) bun.emote('z', 1.4); yield; }
+  bun.frame = 'sit'; bun.emote('bang', 1.2);
+  yield* wait(0.5);
+  yield* hopTo(bun, fx - dir * 4, ly, { len: 22, vz: 65, pause: 0.01 });
+  yield* until(() => !tur.brain, 30);
+  confetti(fx, ly - 10);
+  tur.emote('sparkle', 2.5); bun.frame = 'flop';
+  yield* wait(1); tur.emote('heart', 2);
+  yield* wait(2.5);
+  bun.tags.busy = false; bun.resume();
+  tur.act((function* () { yield* walkTo(tur, dir > 0 ? W + 12 : -12, tur.y, 6, ['a', 'b'], 3); tur.dead = true; })());
+  yield* until(() => tur.dead, 60);
+  flagFx.dur = 0;
+}
+
+// Nap time under the tree: bunnies snooze in the shade, a leaf lands on one's head, a bird sings
+function* nap() {
+  const T = scene.tree, sleepers = freeBunnies().slice(0, 3);
+  sleepers.forEach((b, i) => {
+    b.tags.busy = true;
+    const x = clamp(T.x + (i - 1) * 16 + rand(-3, 3), 8, W - 8), y = T.y + 6 + (i % 2) * 6;
+    b.act((function* () {
+      yield* travel(b, x, y, hopper);
+      b.facing = Math.sign(T.x - b.x) || 1;
+      yield* idleBlink(b, 1, 'sit', 'blink');
+      b.frame = 'sleep';
+      for (;;) { if (chance(1 / 60)) b.emote('z', 1.4); yield; }
+    })());
+  });
+  yield* wait(5);
+  spawnBird({ perch: true, dir: T.x < W / 2 ? 1 : -1 });
+  yield* wait(3);
+  const b = sleepers[randi(0, sleepers.length - 1)];
+  if (b) {
+    const s = b.spr(), leafY = b.y - s.ay + 2;
+    let lx = b.x + rand(-6, 6), ly = T.top + 20;
+    const leaf = addFx({ layer: 'front', dur: 1e9, draw() { rect(lx, ly, 2, 1, '#64b452'); px(lx, ly - 1, '#94d86c'); } });
+    while (ly < leafY) { const dt = yield; ly += 7 * dt; lx += Math.sin(world.t * 2) * 10 * dt + (b.x - lx) * dt * 0.5; }
+    yield* wait(1.5);
+    b.brain = null; b.frame = 'blink'; b.emote('bang', 1);
+    b.vz = 50; b.landed = false; leaf.dur = 0;
+    addPart(lx, ly, rand(-10, 10), -12, 2, '#64b452', { grav: 10, flutter: 10, drag: 0.5 });
+    yield* until(() => b.landed, 2);
+    yield* idleBlink(b, 1.2, 'sit', 'blink');
+    b.frame = 'sleep';
+  }
+  yield* wait(8);
+  sleepers.forEach(s => { s.tags.busy = false; s.resume(); });
+}
+
+// A murmuration of little birds sweeps across the sky
+function* flock() {
+  const dir = coin(), n = randi(16, 26), birds = [];
+  for (let i = 0; i < n; i++) birds.push({ x: dir > 0 ? rand(-60, -10) : rand(W + 10, W + 60), y: rand(15, HY - 20), ph: rand(0, 6.28), o: i * 2.39996 });
+  const C = { x: dir > 0 ? -35 : W + 35, y: HY * 0.45 };
+  const fx = addFx({
+    layer: 'sky', dur: 1e9, draw() {
+      for (const b of birds) {
+        const X = Math.round(b.x), Y = Math.round(b.y), up = Math.sin(world.t * 14 + b.ph) > 0;
+        px(X, Y, '#3a3a4e');
+        px(X - 1, Y + (up ? -1 : 0), '#3a3a4e'); px(X + 1, Y + (up ? -1 : 0), '#3a3a4e');
+      }
+    },
+  });
+  let t = 0;
+  while (t < 60) {
+    const dt = yield; t += dt;
+    C.x += dir * 28 * dt; C.y = HY * 0.42 + Math.sin(t * 0.7) * HY * 0.18;
+    const spread = 14 + Math.sin(t * 0.9) * 8, squash = 0.5 + Math.sin(t * 0.5) * 0.3;
+    for (const b of birds) {
+      const r = spread * (0.4 + (b.o % 1)), tx = C.x + Math.cos(b.o + t * 0.8) * r * 1.6, ty = C.y + Math.sin(b.o * 1.3 + t * 1.1) * r * squash;
+      b.x += (tx - b.x) * Math.min(1, dt * 2.2); b.y += (ty - b.y) * Math.min(1, dt * 2.2);
+    }
+    if (dir > 0 ? C.x > W + 70 : C.x < -70) break;
+    if (Math.abs(C.x - scene.tree.x) < 6 && !fx.sent) { fx.sent = true; for (let i = 0; i < 2; i++) setTimeoutish(() => spawnBird({ perch: true, dir }), i * 0.5); }
+  }
+  fx.dur = 0;
+}
+
+const COMMON = { ducks: 2, fox: 2, apples: 1.5, rain: 1.4, butterflies: 2, race: 1.5, nap: 1.2, flock: 1.6 };
+const RARE = { night: 1, unicorn: 1, ufo: 1, balloon: 1, bison: 1 };
+const EVENTS = { ducks, fox, apples, rain, butterflies, race, nap, flock, night, unicorn, ufo, balloon, bison };
+const ALL_EVENTS = Object.keys(EVENTS);
+
+// ---------------------------------------------------------------- RARE EVENTS
+// Nightfall: sunset, stars and moon, fireflies, an owl on the tree, a shooting star, then dawn
+SPR.owl = makeSet(o => {
+  const b = new SB(11, 13);
+  b.ell(5, 7.5, 3.8, 4.5, '#9a7a5a', '#7a5a3e');
+  b.ell(5, 8.8, 2.4, 2.8, '#e8d4b0');
+  b.set(2, 2, '#7a5a3e').set(8, 2, '#7a5a3e');
+  if (o.blink) { b.rect(2, 5, 3, 1, '#5a3e2a'); b.rect(6, 5, 3, 1, '#5a3e2a'); }
+  else { b.ell(3.3, 5, 1.1, 1.1, '#ffe14a').ell(6.7, 5, 1.1, 1.1, '#ffe14a'); b.set(3, 5, EYE).set(7, 5, EYE); }
+  b.set(5, 6, '#ffb030').set(4, 12, '#ffb030').set(6, 12, '#ffb030');
+  return b;
+}, { open: {}, blink: { blink: 1 } }, 5, 12);
+function* night() {
+  const T = scene.tree, flies = [];
+  let t = 0;
+  while (t < 10) { t += yield; world.dark = Math.min(1, t / 10); }
+  critters('bunny').forEach(b => { if (!b.tags.busy && !b.tags.hide) b.resume(); });
+  for (let i = 0; i < 28; i++) flies.push({ x: rand(0, W), y: rand(GY0 - 25, GY1), ph: rand(0, 6.28), sp: rand(0.6, 1.4), a: 0 });
+  const owl = new Critter('owl', { frame: 'open', x: T.branch.x, y: T.branch.y, layer: 'air', flyer: true, shadow: false });
+  owl.act((function* () { for (;;) { yield* idleBlink(owl, rand(2, 4), 'open', 'blink'); if (chance(0.3)) owl.emote('note', 1.4); } })());
+  const glow = addFx({
+    layer: 'glow', dur: 1e9, draw() {
+      for (const f of flies) {
+        if (f.a <= 0.02) continue;
+        const X = Math.round(f.x), Y = Math.round(f.y), p = (Math.sin(world.t * 2.5 * f.sp + f.ph) * 0.5 + 0.5) * f.a;
+        if (p < 0.15) continue;
+        px(X, Y, '#fffbb0');
+        if (p > 0.5) { ctx.globalAlpha = 0.5; rect(X - 1, Y, 3, 1, '#d8ff70'); rect(X, Y - 1, 1, 3, '#d8ff70'); ctx.globalAlpha = 1; }
+      }
+      const O = owl.dead ? null : owl;
+      if (O && O.frame === 'open') { px(O.x - 2, O.y - 7, '#fff27a'); px(O.x + 2, O.y - 7, '#fff27a'); }
+    },
+  });
+  let shot = false;
+  t = 0;
+  while (t < 30) {
+    const dt = yield; t += dt;
+    for (const f of flies) {
+      f.a = Math.min(1, f.a + dt * 0.3);
+      f.x += (Math.cos(world.t * 0.6 * f.sp + f.ph) * 8 + world.wind * 3) * dt;
+      f.y += Math.sin(world.t * 0.9 * f.sp + f.ph * 2) * 5 * dt;
+      if (f.x > W + 5) f.x = -5; if (f.x < -5) f.x = W + 5;
+    }
+    if (!shot && t > 12) {
+      shot = true;
+      const sx = rand(W * 0.2, W * 0.8), sy = rand(10, HY * 0.4), d = coin();
+      addFx({ layer: 'sky', dur: 0.9, draw(f) { for (let i = 0; i < 14; i++) { const k = f.t * 1.2 - i * 0.02; if (k < 0 || k > 1) continue; ctx.globalAlpha = 1 - i / 14; px(sx + d * k * 90, sy + k * 30, i < 3 ? '#ffffff' : '#fff2a0'); } ctx.globalAlpha = 1; } });
+      critters('bunny').filter(b => b.clip === null).slice(0, 1).forEach(b => setTimeoutish(() => b.emote('sparkle', 2), 0.6));
+    }
+  }
+  t = 0;
+  while (t < 9) {
+    const dt = yield; t += dt;
+    world.dark = Math.max(0, 1 - t / 9);
+    for (const f of flies) f.a = Math.max(0, f.a - dt * 0.25);
+  }
+  world.dark = 0; glow.dur = 0; owl.dead = true;
+  addFx({ layer: 'front', dur: 0.1, draw() {}, done() { for (let i = 0; i < 6; i++) addPart(owl.x, owl.y - 6, rand(-20, 20), rand(-20, 0), 0.8, '#9a7a5a', { drag: 0.4 }); } });
+  critters('bunny').forEach(b => { if (!b.tags.busy && !b.tags.hide) b.resume(); });
+  spawnBird({ perch: true }); setTimeoutish(() => spawnBird({}), 1);
+}
+
+// Unicorn: gallops across leaving sparkles, flowers bloom where it steps
+function* unicorn() {
+  const raised = world.rainbow < 0.5;
+  let t = 0;
+  if (raised) while (t < 3) { t += yield; world.rainbow = Math.min(1, t / 3); }
+  const dir = coin(), y = laneY();
+  const u = new Critter('unicorn', { frame: 'a', x: dir > 0 ? -14 : W + 14, y, facing: dir });
+  let reared = false;
+  for (let g = 0; g < 9000; g++) {
+    const dt = yield;
+    if (!reared && Math.abs(u.x - W / 2) < 6) {
+      reared = true; u.vz = 70; u.landed = false; u.frame = 'b'; u.emote('sparkle', 2.2);
+      for (let i = 0; i < 40; i++) addPart(u.x, u.y - 10, rand(-40, 40), rand(-50, -10), rand(1, 2), RAINBOW, { drag: 0.4, grav: 30, flutter: 6 });
+      critters('bunny').filter(b => b.clip === null).forEach((b, i) => setTimeoutish(() => b.emote('heart', 2), 0.4 + i * 0.3));
+      yield* until(() => u.landed, 3);
+      yield* wait(1);
+    }
+    u.x += dir * 38 * dt;
+    u.z = Math.abs(Math.sin(world.t * 10)) * 2;
+    u.frame = Math.floor(world.t * 10) % 2 ? 'a' : 'b';
+    if (chance(0.7)) addPart(u.x - dir * 10, u.y - rand(4, 14), -dir * rand(5, 15), rand(-10, 2), rand(0.6, 1.3), pick([...RAINBOW, '#ffffff']), { drag: 0.5 });
+    for (const f of scene.flowers) if (Math.abs(f.x - u.x) < 3 && Math.abs(f.y - u.y) < 10 && f.type === 'grass' && chance(0.3)) {
+      f.type = pick(['tulip', 'daisy', 'clover', 'bell']); f.col = pick(TULIPS); f.bloom = 0; f.h = randi(3, 4);
+    }
+    if (dir > 0 ? u.x > W + 16 : u.x < -16) break;
+  }
+  u.dead = true;
+  if (raised) { t = 0; while (t < 4) { t += yield; world.rainbow = Math.max(0, 1 - t / 4); } world.rainbow = 0; }
+}
+
+// UFO: a flying saucer beams up a cow... and brings her back wearing a flower crown
+function drawUfo(x, y, t) {
+  const X = Math.round(x), Y = Math.round(y);
+  for (let dy = -3; dy <= 0; dy++) for (let dx = -5; dx <= 5; dx++) if ((dx * dx) / 30 + (dy * dy) / 12 <= 1) px(X + dx, Y - 2 + dy, dx + dy < -4 ? '#ffffff' : '#bfeaff');
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -13; dx <= 13; dx++) {
+    if ((dx * dx) / 170 + (dy * dy) / 6.5 > 1) continue;
+    px(X + dx, Y + dy, dy < 0 ? '#d8dce6' : dy === 0 ? '#b0b4c4' : '#8a8ea0');
+  }
+  for (let i = 0; i < 6; i++) {
+    const lx = X - 10 + i * 4, on = Math.floor(t * 6 + i) % 3 === 0;
+    px(lx, Y, on ? ['#ff5a8a', '#ffe14a', '#6ad66a'][i % 3] : '#6a6e80');
+  }
+  rect(X - 3, Y + 3, 7, 1, '#9affc8');
+}
+function* ufo() {
+  const spot = groundSpot(40);
+  const cw = new Critter('cow', { frame: 'a', x: spot.x < W / 2 ? -12 : W + 12, y: spot.y, facing: spot.x < W / 2 ? 1 : -1 });
+  yield* travel(cw, spot.x, spot.y, walker(8, ['a', 'b'], 4));
+  cw.frame = 'a';
+  for (let i = 0; i < 2; i++) { yield* wait(1.5); cw.facing *= -1; }
+  const U = { x: cw.x + rand(-30, 30), y: -15, beam: 0 };
+  const hoverY = Math.max(12, cw.y - 55);
+  const ufx = addFx({
+    layer: 'air', dur: 1e9, draw() {
+      if (U.beam > 0.01) {
+        const top = U.y + 3, bot = cw.y + 1;
+        for (let y = Math.round(top); y <= bot; y++) {
+          const k = (y - top) / (bot - top || 1), hw = Math.round(3 + k * 10);
+          for (let dx = -hw; dx <= hw; dx++) {
+            const X = Math.round(U.x) + dx;
+            if (bayer(X, y) < U.beam * (0.25 + 0.2 * Math.sin(y * 0.6 - world.t * 10)) * (1 - Math.abs(dx) / (hw + 1) * 0.5)) px(X, y, '#b8ffd8');
+          }
+        }
+      }
+      drawUfo(U.x, U.y + Math.sin(world.t * 2) * 1.5, world.t);
+    },
+  });
+  // descend
+  while (U.y < hoverY) { const dt = yield; U.y += 25 * dt; U.x += (cw.x - U.x) * dt; }
+  alarm(true);
+  cw.emote('q', 2); yield* wait(1);
+  let t = 0;
+  while (t < 1) { t += yield; U.beam = t; }
+  cw.frame = 'float'; cw.shadow = true; cw.flyer = true;
+  while (cw.z < cw.y - U.y - 4) { const dt = yield; cw.z += 12 * dt; cw.x += Math.sin(world.t * 3) * 3 * dt; if (chance(dt * 1.5)) cw.emote('q', 1); }
+  cw.clip = 0; cw.shadow = false; world.flash = 0.2;
+  t = 0; while (t < 0.6) { t += yield; U.beam = 1 - t / 0.6; }
+  U.beam = 0;
+  while (U.y > -20) { const dt = yield; U.y -= 90 * dt; U.x += 30 * dt; }
+  yield* wait(3);
+  alarm(false);
+  yield* wait(3);
+  // return trip
+  U.x = cw.x + 60; U.y = -15;
+  while (U.y < hoverY) { const dt = yield; U.y += 30 * dt; U.x += (cw.x - U.x) * dt * 1.5; }
+  t = 0; while (t < 0.8) { t += yield; U.beam = t / 0.8; }
+  cw.clip = null; cw.frame = 'crown'; cw.shadow = true;
+  while (cw.z > 0) { const dt = yield; cw.z = Math.max(0, cw.z - 14 * dt); }
+  cw.flyer = false;
+  confetti(cw.x, cw.y - 12, 30);
+  cw.emote('heart', 2.5);
+  t = 0; while (t < 0.6) { t += yield; U.beam = 1 - t / 0.6; }
+  U.beam = 0;
+  for (let i = 0; i < 3; i++) { yield* wait(0.3); U.y -= 3; yield* wait(0.3); U.y += 3; }
+  while (U.y > -20) { const dt = yield; U.y -= 110 * dt; U.x -= 40 * dt; }
+  ufx.dur = 0;
+  yield* wait(2);
+  cw.emote('heart', 2);
+  const out = cw.x < W / 2 ? -14 : W + 14;
+  yield* travel(cw, out, cw.y, walker(8, ['crown', 'crownB'], 4));
+  cw.dead = true;
+}
+
+// Hot air balloon with a cat in the basket, sprinkling petals
+function* balloon() {
+  const dir = coin(), stripes = chance(0.5) ? ['#ff5a5a', '#ffffff'] : RAINBOW;
+  const B = { x: dir > 0 ? -20 : W + 20, y: HY * rand(0.3, 0.5), burn: 0, wave: 0 };
+  const bfx = addFx({
+    layer: 'sky', dur: 1e9, draw() {
+      const X = Math.round(B.x), Y = Math.round(B.y + Math.sin(world.t * 0.8) * 3);
+      for (let dy = -13; dy <= 11; dy++) {
+        const hw = dy < 0 ? Math.round(Math.sqrt(1 - (dy * dy) / 169) * 11) : Math.round(11 * (1 - dy / 14));
+        for (let dx = -hw; dx <= hw; dx++) {
+          const band = Math.floor(((dx / (hw + 1)) + 1) * 2.5);
+          let col = stripes[band % stripes.length];
+          if (dx < -hw * 0.4 && dy < -4) col = mixHex(col.length === 7 ? col : '#ffffff', '#ffffff', 0.35);
+          if (dx > hw * 0.6) col = mixHex(col.length === 7 ? col : '#ffffff', '#3a2a40', 0.2);
+          px(X + dx, Y + dy, col);
+        }
+      }
+      rect(X - 3, Y + 12, 7, 1, '#8a5a34');
+      px(X - 3, Y + 13, '#6a4a3a'); px(X + 3, Y + 13, '#6a4a3a'); px(X - 3, Y + 14, '#6a4a3a'); px(X + 3, Y + 14, '#6a4a3a');
+      if (B.burn > 0 && Math.floor(world.t * 12) % 2) { px(X, Y + 12, '#ffe14a'); px(X, Y + 11, '#ff8a3a'); }
+      // cat
+      rect(X - 2, Y + 15, 4, 3, '#f2a04a'); px(X - 2, Y + 14, '#f2a04a'); px(X + 1, Y + 14, '#f2a04a');
+      px(X - 1, Y + 16, EYE); px(X + 1, Y + 16, EYE); px(X, Y + 17, '#ff9ab0');
+      const waveUp = B.wave > 0 && Math.floor(world.t * 6) % 2;
+      px(X + 3, Y + (waveUp ? 14 : 16), '#f2a04a');
+      rect(X - 4, Y + 17, 9, 4, '#a8764a'); rect(X - 4, Y + 17, 9, 1, '#c89a6a'); rect(X - 4, Y + 20, 9, 1, '#7a4e2e');
+      if (B.wave > 0) drawSpr(ICONS.heart, X + 5, Y + 10 - Math.round((1 - B.wave / 3) * 4), 1);
+    },
+  });
+  let waved = false;
+  for (let g = 0; g < 20000; g++) {
+    const dt = yield;
+    B.x += dir * 9 * dt; B.y += (Math.sin(world.t * 0.3) * 1.5) * dt;
+    B.burn = Math.max(0, B.burn - dt);
+    if (chance(dt * 0.3)) { B.burn = 0.8; B.y -= 1; }
+    B.wave = Math.max(0, B.wave - dt);
+    if (!waved && Math.abs(B.x - W / 2) < 20) {
+      waved = true; B.wave = 3;
+      critters('bunny').filter(b => b.clip === null).forEach((b, i) => setTimeoutish(() => { b.facing = Math.sign(B.x - b.x) || 1; b.emote('heart', 2); }, 0.5 + i * 0.4));
+    }
+    if (Math.abs(B.x - W / 2) < W * 0.3 && chance(dt * 4)) addPart(B.x + rand(-4, 4), B.y + 20, dir * rand(2, 8), rand(2, 8), rand(5, 8), pick(['#ffc6ea', '#ffffff', '#ff8ac8', '#fff29a']), { drag: 0.8, grav: 6, wind: 0.6, flutter: 10, floor: rand(GY0, GY1) });
+    if (dir > 0 ? B.x > W + 24 : B.x < -24) break;
+  }
+  bfx.dur = 0;
+}
+
+// Bison herd: a friendly herd trots across the back of the meadow; prairie dogs pop up to watch
+function* bison() {
+  const dir = coin(), P = scene.pond;
+  const top = P.y - P.ry < GY0 + 24 ? laneY() - 6 : GY0 + 2;
+  const herd = [], n = randi(6, 9);
+  for (let i = 0; i < n; i++) {
+    const calf = i > 1 && chance(0.3);
+    const c = new Critter(calf ? 'calf' : 'bison', { frame: 'a', x: (dir > 0 ? -16 : W + 16) - dir * (i * 20 + rand(0, 8)), y: top + rand(0, 14), facing: dir });
+    c.calf = calf; c.speed = rand(16, 19); herd.push(c);
+  }
+  const watchers = critters('pdog');
+  watchers.forEach(p => {
+    const b = scene.burrows.find(bb => bb.x === p.x && bb.y === p.y);
+    if (!b || (b.busy && b.busy !== p)) return;
+    p.act((function* () {
+      yield* wait(rand(1, 4));
+      b.busy = p;
+      if (p.clip !== null) yield* popUp(p, b);
+      for (let t = 0; t < 22; t += 1 / 30) {
+        const near = nearest(p, herd);
+        if (near) p.facing = Math.sign(near.x - p.x) || p.facing;
+        if (chance(1 / 90)) { p.emote(chance(0.5) ? 'bang' : 'note', 1.2); yield* anim(p, ['chirp', 'stand'], 8, 0.6); }
+        else { p.frame = 'stand'; yield; }
+      }
+      yield* popDown(p, b);
+      b.busy = false; p.resume();
+    })());
+  });
+  const dawdler = herd.find(c => c.calf);
+  let phase = 0, phT = 0;
+  for (let g = 0; g < 20000; g++) {
+    const dt = yield;
+    for (const c of herd) {
+      if (c === dawdler) {
+        if (phase === 0 && Math.abs(c.x - W / 2) < 10) { phase = 1; phT = 2.5; c.emote('sparkle', 2); }
+        if (phase === 1) { phT -= dt; c.frame = 'a'; if (phT <= 0) { phase = 2; c.emote('bang', 1); } continue; }
+        if (phase === 2) { c.x += dir * c.speed * 2 * dt; if (c.landed && chance(0.2)) { c.vz = 35; c.landed = false; } }
+      }
+      c.x += dir * c.speed * dt;
+      c.frame = Math.floor(world.t * 7 + c.speed) % 2 ? 'a' : 'b';
+      if (chance(dt * 6)) addPart(c.x - dir * 6, c.y, -dir * rand(4, 12), rand(-6, -1), rand(0.6, 1.2), ['#e8d8a8', '#d8c08a', '#c8b07a'], { drag: 0.4 });
+    }
+    if (herd.every(c => (dir > 0 ? c.x > W + 20 : c.x < -20))) break;
+  }
+  herd.forEach(c => (c.dead = true));
+}
+function nearest(s, list) {
+  let best = null, bd = 1e9;
+  for (const o of list) { if (o.dead) continue; const d = Math.hypot(o.x - s.x, o.y - s.y); if (d < bd) { bd = d; best = o; } }
+  return best;
+}
+
+// ---------------------------------------------------------------- director
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+const director = { cur: null, name: '', cool: 5, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 3 : rand(12, 26); }
+  } else if ((director.cool -= dt) <= 0) {
+    let name;
+    if (FORCE) name = FORCE === 'all' ? ALL_EVENTS[director.idx++ % ALL_EVENTS.length] : FORCE;
+    else do { name = chance(0.15) ? weighted(RARE) : weighted(COMMON); } while (name === director.last);
+    if (!EVENTS[name]) return;
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; }
+  }
+}
+
+// ---------------------------------------------------------------- main loop
+function update(dt) {
+  world.t += dt;
+  world.gust = Math.max(0, world.gust - dt * 0.25);
+  world.wind = world.windBase + Math.sin(world.t * 0.23) * 0.15 + world.gust;
+  for (const cl of scene.clouds) {
+    cl.x += cl.speed * (0.6 + world.wind) * dt;
+    if (cl.x > W + 4) { cl.x = -cl.w - rand(0, 40); cl.y = rand(4, HY - 30); }
+  }
+  for (const f of scene.flowers) {
+    if (f.eaten > 0) { f.eaten -= dt; if (f.eaten <= 0) f.bloom = 0; }
+    else if (f.bloom < 1) f.bloom = Math.min(1, f.bloom + dt * 0.5);
+  }
+  runDirector(dt);
+  ambientTick(dt);
+  for (const e of [...world.ents]) e.update(dt);
+  for (const p of world.parts) {
+    p.life -= dt;
+    if (p.drag !== 1) { const k = Math.pow(p.drag, dt); p.vx *= k; p.vy *= k; }
+    p.vy += p.grav * dt;
+    p.x += (p.vx + p.wind * world.wind * 20 + (p.flutter ? Math.sin(world.t * 4 + p.ph) * p.flutter : 0)) * dt;
+    p.y += p.vy * dt;
+    if (p.floor !== null && p.y > p.floor) {
+      p.y = p.floor;
+      if (p.bounce > 0 && Math.abs(p.vy) > 8) { p.vy *= -p.bounce; p.vx *= 0.7; } else { p.vy = 0; p.vx *= 0.8; }
+    }
+  }
+  for (const f of world.fx) f.t += dt;
+  world.ents = world.ents.filter(e => !e.dead);
+  world.parts = world.parts.filter(p => p.life > 0);
+  const finished = world.fx.filter(f => f.t > f.dur && f.done);
+  world.fx = world.fx.filter(f => f.t <= f.dur);
+  for (const f of finished) f.done();
+  world.flash = Math.max(0, world.flash - dt * 1.5);
+}
+function drawParts(glow) {
+  for (const p of world.parts) {
+    if (p.glow !== glow) continue;
+    const k = p.life / p.max, X = Math.round(p.x), Y = Math.round(p.y);
+    if (p.fade && k < 0.4 && bayer(X, Y) > k * 2.5) continue;
+    ctx.fillStyle = Array.isArray(p.col) ? p.col[Math.min(p.col.length - 1, Math.floor((1 - k) * p.col.length))] : p.col;
+    ctx.fillRect(X, Y, p.size, p.size);
+  }
+}
+function drawFx(layer) { for (const f of world.fx) if (f.layer === layer && f.t >= 0) f.draw(f); }
+function render(dt) {
+  drawSky();
+  drawFx('sky');
+  for (const e of world.ents) if (e.layer === 'sky') e.draw();
+  ctx.drawImage(scene.land, 0, 0);
+  drawTreeApples(dt);
+  drawPondShimmer();
+  drawFx('ground');
+  const list = world.ents.filter(e => e.layer === 'ground').sort((a, b) => a.y - b.y);
+  const F = scene.flowers;
+  let i = 0;
+  for (const e of list) {
+    while (i < F.length && F[i].y <= e.y) drawFlower(F[i++]);
+    e.draw();
+  }
+  while (i < F.length) drawFlower(F[i++]);
+  for (const e of world.ents) if (e.layer === 'air') e.draw();
+  drawParts(false);
+  drawFx('front');
+  drawLighting();
+  for (const e of world.ents) if (e.layer === 'glow') e.draw();
+  drawParts(true);
+  drawFx('glow');
+  if (DEBUG) {
+    ctx.fillStyle = '#000'; ctx.font = '8px monospace';
+    ctx.fillText(`${director.name || '-'}  ents:${world.ents.length} parts:${world.parts.length}`, 3, 9);
+  }
+}
+function resize() {
+  H = ROWS;
+  W = Math.round((ROWS * innerWidth) / innerHeight);
+  HY = Math.round(H * 0.46);
+  GY0 = Math.round(H * 0.56);
+  GY1 = H - 6;
+  canvas.width = W; canvas.height = H;
+  ctx.imageSmoothingEnabled = false;
+  scene.sun = { x: Math.round(W * rand(0.3, 0.7)), y: Math.round(HY * 0.3) };
+  world.ents = []; world.parts = []; world.fx = [];
+  buildSky(); buildLand(); buildFlowers(); buildClouds();
+  populate();
+}
+addEventListener('resize', resize);
+resize();
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  try { update(dt); render(dt); } catch (e) { console.error(e); }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

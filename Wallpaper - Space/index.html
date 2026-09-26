@@ -1,0 +1,1431 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel Space Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #07051a; }
+  canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL SPACE — a living retro wallpaper
+   Options (add to the end of the address):
+     #pixels=270        vertical resolution in big pixels (smaller = chunkier)
+     #event=battle      test mode: repeat one event (or "all" to cycle through every event)
+     #speed=3           run time faster (for testing)
+     #debug             show the current event name
+   Events: battle chase orbit fleet asteroids borg | rare: supernova wormhole blackhole whale armada
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const ROWS = parseInt(params.get('pixels')) || 270;
+const FORCE = params.get('event');
+const TIME_SCALE = parseFloat(params.get('speed')) || 1;
+const DEBUG = params.has('debug');
+const FPS = 30;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H;
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const coin = () => (Math.random() < 0.5 ? 1 : -1);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+function px(x, y, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+
+const PERM = Array.from({ length: 512 }, () => Math.random());
+const h2 = (x, y) => PERM[((x * 73856093) ^ (y * 19349663)) & 511];
+function noise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = h2(xi, yi), b = h2(xi + 1, yi), c = h2(xi, yi + 1), d = h2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y) {
+  let s = 0, amp = 0.5;
+  for (let i = 0; i < 5; i++) { s += amp * noise(x, y); x *= 2.03; y *= 2.03; amp *= 0.5; }
+  return s;
+}
+function ditherRing(cx, cy, r, color, alpha) {
+  if (alpha <= 0 || r < 0.5) return;
+  const n = Math.max(8, Math.ceil(r * 7));
+  ctx.fillStyle = color;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const X = Math.round(cx + Math.cos(a) * r), Y = Math.round(cy + Math.sin(a) * r);
+    if (bayer(X, Y) < alpha) ctx.fillRect(X, Y, 1, 1);
+  }
+}
+function beamLine(x0, y0, x1, y1, color, t) {
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, i = 0;
+  const shift = Math.floor(t * 40);
+  for (;;) {
+    if ((i + shift) % 6 !== 0) px(x0, y0, (i + shift) % 3 === 0 ? '#ffffff' : color);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+    if (++i > 800) break;
+  }
+  px(x1 - 1, y1, color); px(x1 + 1, y1, color); px(x1, y1 - 1, color); px(x1, y1 + 1, color); px(x1, y1, '#ffffff');
+}
+
+// ---------------------------------------------------------------- world
+const world = { t: 0, ships: [], rocks: [], shots: [], ents: [], parts: [], fx: [], flash: 0, hole: null };
+
+function addPart(x, y, vx, vy, life, col, o = {}) {
+  if (world.parts.length > 1400) world.parts.splice(0, 200);
+  world.parts.push({ x, y, vx, vy, life, max: life, col, drag: o.drag ?? 1, size: o.size || 1, grav: o.grav ?? false, fade: o.fade ?? true });
+}
+function addFx(f) { f.t = f.t ?? 0; f.layer = f.layer || 'front'; world.fx.push(f); return f; }
+function gravityAt(x, y) {
+  const h = world.hole;
+  if (!h || h.GM <= 0) return null;
+  const dx = h.x - x, dy = h.y - y, d2 = dx * dx + dy * dy + 30, d = Math.sqrt(d2);
+  const f = h.GM / d2;
+  return { x: (dx / d) * f, y: (dy / d) * f, d };
+}
+
+// ---------------------------------------------------------------- backdrop (gradient + nebulae)
+let backdrop;
+function buildBackdrop() {
+  backdrop = document.createElement('canvas');
+  backdrop.width = W; backdrop.height = H;
+  const b = backdrop.getContext('2d');
+  const img = b.createImageData(W, H);
+  const hex = s => [1, 3, 5].map(i => parseInt(s.slice(i, i + 2), 16));
+  const bg = ['#07051a', '#0d0822', '#140a2e'].map(hex);
+  const nebulae = [
+    { cx: W * rand(0.15, 0.4), cy: H * rand(0.25, 0.6), rx: W * 0.32, ry: H * 0.38,
+      pal: ['#1f0f3d', '#34185a', '#562578', '#83338a', '#c05a96', '#f09ab8'].map(hex) },
+    { cx: W * rand(0.6, 0.85), cy: H * rand(0.3, 0.75), rx: W * 0.28, ry: H * 0.34,
+      pal: ['#0c1a38', '#10305a', '#16507a', '#22798f', '#3fa8a8', '#9fe0cf'].map(hex) },
+  ];
+  const ox = rand(0, 100), oy = rand(0, 100);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const dth = bayer(x, y);
+      let col = bg[Math.min(2, Math.floor((y / H) * 2 + dth))];
+      const f = fbm(x / 70 + ox + fbm(x / 40, y / 40), y / 70 + oy);
+      const cloud = Math.max(0, (f - 0.35) * 2.2);
+      const m = nebulae.map(n => {
+        const dx = (x - n.cx) / n.rx, dy = (y - n.cy) / n.ry;
+        return Math.exp(-(dx * dx + dy * dy) * 1.6);
+      });
+      const d = cloud * Math.min(1, m[0] + m[1]);
+      const pal0 = nebulae[0].pal, pal1 = nebulae[1].pal;
+      const lvl = Math.floor(d * pal0.length + dth - 0.5);
+      if (lvl >= 0) {
+        const i = Math.min(pal0.length - 1, lvl);
+        const q = Math.round((m[1] / (m[0] + m[1] + 1e-6)) * 4) / 4;
+        col = pal0[i].map((v, k) => Math.round(v + (pal1[i][k] - v) * q));
+      }
+      const o = (y * W + x) * 4;
+      img.data[o] = col[0]; img.data[o + 1] = col[1]; img.data[o + 2] = col[2]; img.data[o + 3] = 255;
+    }
+  }
+  b.putImageData(img, 0, 0);
+}
+
+// ---------------------------------------------------------------- planet + moon (rotating)
+const planet = { x: 0, y: 0, r: 0, rot: 0, img: null, redraw: 0, spotLon: rand(0, 6), spotLat: rand(-0.3, 0.3) };
+const moon = { a: rand(0, 6.28), img: null, r: 4 };
+const BANDS = ['#c7743a', '#e0a35a', '#a24f2e', '#f0c98a', '#b8683a', '#d98f4e'];
+function shadeHex(h, k) {
+  const v = [1, 3, 5].map(i => Math.round(parseInt(h.slice(i, i + 2), 16) * k));
+  return `rgb(${v})`;
+}
+const BANDS_DARK = BANDS.map(c => shadeHex(c, 0.5));
+function renderPlanet() {
+  const r = planet.r, cw = r * 4 + 8, ch = r * 3 + 8, cx = Math.floor(cw / 2), cy = Math.floor(ch / 2);
+  if (!planet.img) { planet.img = document.createElement('canvas'); planet.img.width = cw; planet.img.height = ch; }
+  const c = planet.img.getContext('2d');
+  c.clearRect(0, 0, cw, ch);
+  const P = (x, y, col) => { c.fillStyle = col; c.fillRect(x, y, 1, 1); };
+  const ring = front => {
+    for (let a = 0; a < 900; a++) {
+      const t = (a / 900) * Math.PI * 2;
+      for (const [col, rr] of [['#d9c2a0', 1.55], ['#9c8466', 1.72], ['#c9b08a', 1.88]]) {
+        const rx = Math.cos(t) * r * rr, ry = Math.sin(t) * r * rr * 0.28;
+        if ((ry > 0) !== front) continue;
+        P(Math.round(cx + rx * 0.97 - ry * 0.25), Math.round(cy + ry + rx * 0.18), col);
+      }
+    }
+  };
+  ring(false);
+  for (let y = -r; y <= r; y++) {
+    const rowR = Math.sqrt(r * r - y * y);
+    for (let x = -r; x <= r; x++) {
+      if (x * x + y * y > r * r) continue;
+      const lat = Math.asin(y / r);
+      const lon = Math.asin(clamp(x / (rowR || 1), -1, 1)) + planet.rot;
+      const nz = Math.sqrt(Math.max(0, r * r - x * x - y * y));
+      const light = (-x * 0.6 - y * 0.5 + nz * 0.62) / r;
+      const dth = bayer(x + cx, y + cy);
+      const band = Math.floor(((lat * 4.5 + noise(lon * 2.2, lat * 3) * 1.6 + 8) % BANDS.length + BANDS.length) % BANDS.length);
+      const sl = ((lon - planet.spotLon) % 6.283 + 6.283) % 6.283;
+      const sd = Math.hypot((sl > 3.14 ? sl - 6.283 : sl) * 1.3, (lat - planet.spotLat) * 3.2);
+      const spot = sd < 0.32;
+      let col;
+      if (light + dth * 0.25 < 0.12) col = '#140a1f';
+      else if (light + dth * 0.25 < 0.4) col = spot ? '#7a2e2a' : BANDS_DARK[band];
+      else col = spot ? (sd < 0.18 ? '#f07a5a' : '#c9503a') : BANDS[band];
+      P(cx + x, cy + y, col);
+    }
+  }
+  ring(true);
+  planet.ox = cx; planet.oy = cy;
+}
+function renderMoon() {
+  const r = moon.r, s = r * 2 + 1;
+  moon.img = document.createElement('canvas'); moon.img.width = s; moon.img.height = s;
+  const c = moon.img.getContext('2d');
+  for (let y = -r; y <= r; y++) for (let x = -r; x <= r; x++) {
+    if (x * x + y * y > r * r + 1) continue;
+    const l = (-x - y) / r + bayer(x + 8, y + 8) * 0.6;
+    c.fillStyle = l > 0.4 ? '#d4cfe0' : l > -0.5 ? '#8a8399' : '#2e283c';
+    if ((x === 1 && y === 0) || (x === -1 && y === 2)) c.fillStyle = '#6a6379';
+    c.fillRect(x + r, y + r, 1, 1);
+  }
+}
+function moonPos() {
+  const x = planet.x + Math.cos(moon.a) * planet.r * 3.4;
+  const y = planet.y + Math.sin(moon.a) * planet.r * 0.9;
+  return { x, y, back: Math.sin(moon.a) < 0 };
+}
+function drawPlanet() {
+  ctx.drawImage(planet.img, Math.round(planet.x - planet.ox), Math.round(planet.y - planet.oy));
+}
+function drawMoon() {
+  const m = moonPos();
+  ctx.drawImage(moon.img, Math.round(m.x - moon.r), Math.round(m.y - moon.r));
+}
+
+// ---------------------------------------------------------------- stars, comets
+let stars = [];
+const STAR_COLS = ['#ffffff', '#cfe8ff', '#fff2c2', '#ffd0e0', '#a9c8ff'];
+function buildStars() {
+  stars = [];
+  const count = Math.round((W * H) / 250);
+  for (let i = 0; i < count; i++) {
+    const layer = Math.random() < 0.7 ? 0 : Math.random() < 0.75 ? 1 : 2;
+    stars.push({
+      x: Math.random() * W, y: Math.floor(Math.random() * H), layer,
+      speed: [0.6, 1.5, 3.5][layer], col: pick(STAR_COLS),
+      twinkle: Math.random() < 0.15 ? rand(0.5, 2.5) : 0, phase: rand(0, 6.28),
+      big: layer === 2 && Math.random() < 0.45,
+    });
+  }
+}
+function drawStars(dt) {
+  const h = world.hole;
+  for (const s of stars) {
+    const on = s.twinkle ? Math.sin(world.t * s.twinkle + s.phase) : 1;
+    if (on < -0.6) continue;
+    let x = s.x, y = s.y;
+    if (h && h.str > 0) { // gravitational lensing: push stars outward around the hole
+      const dx = x - h.x, dy = y - h.y, d = Math.hypot(dx, dy);
+      const R = 40 * h.str;
+      if (d < h.r * h.str + 1) continue;
+      if (d < R) { const nd = d + (R * R * 0.18) / Math.max(d, 1) * (1 - d / R); x = h.x + (dx / d) * nd; y = h.y + (dy / d) * nd; }
+    }
+    x = Math.round(x); y = Math.round(y);
+    ctx.globalAlpha = s.layer === 0 ? 0.55 : 1;
+    ctx.fillStyle = s.col;
+    ctx.fillRect(x, y, 1, 1);
+    if (s.big && on > 0.3) {
+      ctx.globalAlpha = 0.6;
+      ctx.fillRect(x - 1, y, 1, 1); ctx.fillRect(x + 1, y, 1, 1); ctx.fillRect(x, y - 1, 1, 1); ctx.fillRect(x, y + 1, 1, 1);
+      if (on > 0.85) {
+        ctx.globalAlpha = 0.3;
+        ctx.fillRect(x - 2, y, 1, 1); ctx.fillRect(x + 2, y, 1, 1); ctx.fillRect(x, y - 2, 1, 1); ctx.fillRect(x, y + 2, 1, 1);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+let comets = [], nextComet = rand(4, 12), nextShooting = rand(2, 5);
+const TAIL = ['#ffffff', '#dff8ff', '#9fe4ff', '#5fb8f0', '#3a7bd5', '#2a4a9a', '#241f5c'];
+function spawnComet(shooting) {
+  const fromLeft = Math.random() < 0.5, speed = shooting ? rand(180, 260) : rand(28, 50), angle = rand(0.25, 0.6);
+  comets.push({
+    x: fromLeft ? rand(-20, W * 0.5) : rand(W * 0.5, W + 20), y: rand(-20, H * 0.3),
+    vx: (fromLeft ? 1 : -1) * Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+    trail: [], shooting, life: shooting ? rand(0.4, 0.8) : 999,
+  });
+}
+function updateSky(dt) {
+  for (const s of stars) {
+    s.x -= s.speed * dt;
+    if (s.x < -2) { s.x = W + 2; s.y = Math.floor(Math.random() * H); }
+  }
+  for (const c of comets) {
+    c.x += c.vx * dt; c.y += c.vy * dt; c.life -= dt;
+    const pxx = Math.round(c.x), pyy = Math.round(c.y), last = c.trail[0];
+    if (!last || last[0] !== pxx || last[1] !== pyy) c.trail.unshift([pxx, pyy]);
+    const maxLen = c.shooting ? 14 : 46;
+    if (c.trail.length > maxLen) c.trail.length = maxLen;
+  }
+  comets = comets.filter(c => c.life > 0 && c.x > -80 && c.x < W + 80 && c.y < H + 80);
+}
+function drawComets() {
+  for (const c of comets) {
+    const pxx = Math.round(c.x), pyy = Math.round(c.y), maxLen = c.shooting ? 14 : 46;
+    for (let i = c.trail.length - 1; i >= 0; i--) {
+      const [x, y] = c.trail[i], k = i / maxLen;
+      if (k > 0.35 && bayer(x, y) < k - 0.3) continue;
+      ctx.fillStyle = TAIL[Math.min(TAIL.length - 1, Math.floor(k * TAIL.length))];
+      ctx.fillRect(x, y, 1, 1);
+      if (!c.shooting && i < maxLen * 0.3) ctx.fillRect(x, y - 1, 1, 1);
+    }
+    if (!c.shooting) {
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(pxx - 1, pyy - 1, 2, 2);
+      ctx.globalAlpha = 0.35; ctx.fillStyle = '#bff4ff'; ctx.fillRect(pxx - 2, pyy - 2, 4, 4); ctx.globalAlpha = 1;
+    }
+  }
+  comets = comets.filter(c => c.life > 0 && c.x > -80 && c.x < W + 80 && c.y < H + 80);
+}
+
+// ---------------------------------------------------------------- sprites
+// Rows use run-length shorthand: "12w" = 12 pixels of palette color w. "." is empty.
+// Palette entries with two colors animate between them (lights, glows).
+const SPR_PAL = {
+  W: ['#f4f6fb'], w: ['#cdd3de'], g: ['#9aa1b2'], d: ['#6b7285'], k: ['#474d5e'], K: ['#2c303c'],
+  y: ['#ffe08a', '#fff4c8'], o: ['#ffb347', '#ffd28a'], O: ['#e0793a'], T: ['#3a8a9a'], B: ['#d6f6ff'],
+  b: ['#6fd3ff', '#b8ecff'], N: ['#ff4a3a', '#ff9a6a'], L: ['#ff3355', '#474d5e'], M: ['#474d5e', '#44ff88'],
+  G: ['#6a8a52'], H: ['#45603a'], J: ['#9cbf78'], E: ['#2e3f27'], R: ['#ff5a3a', '#ffaa6a'],
+  c: ['#1e2124'], x: ['#3f444b'], X: ['#5d636b'], v: ['#3cff7a', '#1f8a44'], V: ['#1f8a44', '#3cff7a'],
+};
+function parseRows(rows) {
+  const out = rows.map(r => r.replace(/(\d+)(\D)/g, (m, n, c) => c.repeat(+n)));
+  const w = Math.max(...out.map(r => r.length));
+  return out.map(r => r.padEnd(w, '.'));
+}
+function makeSprite(rows, pal = SPR_PAL) {
+  const R = parseRows(rows), w = R[0].length, h = R.length, frames = [];
+  for (let fi = 0; fi < 2; fi++) {
+    const f = {};
+    for (const flip of [false, true]) {
+      const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+      const c = cv.getContext('2d');
+      R.forEach((row, y) => [...row].forEach((ch, x) => {
+        if (ch === '.' || !pal[ch]) return;
+        c.fillStyle = pal[ch][fi % pal[ch].length];
+        c.fillRect(flip ? w - 1 - x : x, y, 1, 1);
+      }));
+      f[flip ? 'l' : 'r'] = cv;
+    }
+    frames.push(f);
+  }
+  return { w, h, frames };
+}
+const CRUISER = [
+  '2.L24wWWN15.5W',
+  '2.b25gwNN12.9w',
+  '3.25dkN6.25w',
+  '9.2k9.2k12.3gy4gy4gy4gy4gy5g',
+  '10.2k9.2k13.25dL',
+  '11.2k9.2k18.5k3b5k',
+  '12.2k9.2k17.3d',
+  '10.27W2.3d',
+  '7.k31w',
+  '6.b2k30g2oB',
+  '7.k30d2o',
+  '9.26K',
+];
+const EXPLORER = [
+  '20.12W',
+  '16.20w',
+  '14.3gy3gy3gy3gy3gy4g',
+  '4.12wNN2.18dL',
+  '3.b13gN5.10k',
+  '8.3k7.12d',
+  '6.b20wo',
+  '7.18gB',
+  '9.14K',
+];
+const RAIDER = [
+  'M2E', '.3E', '2.E2H', '3.E3H', '4.E3GH',
+  '5.E5G2J5GH',
+  '6.2K5J6GyGR',
+  '5.E5G2J5GH',
+  '4.E3GH', '3.E3H', '2.E2H', '.3E', 'L2E',
+];
+const SHUTTLE = ['4.9W', '2.12wyy', '1.o3O10wB', 'o14g', '2.12k'];
+const FREIGHTER = ['5.20kL', '3.b2K5O5T5O2wW', '3.b2K5O5T5O2wy', '5.20kM', '8.2d10.2d'];
+function cubeRows() {
+  const n = 17, rows = [];
+  for (let y = 0; y < n; y++) {
+    let row = '';
+    for (let x = 0; x < n; x++) {
+      if (x === 0 || y === 0 || x === n - 1 || y === n - 1) row += 'x';
+      else if (x % 4 === 0 || y % 4 === 0) row += Math.random() < 0.15 ? 'X' : 'x';
+      else row += Math.random() < 0.18 ? (Math.random() < 0.5 ? 'v' : 'V') : 'c';
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+function alienSprite() {
+  const w = 26, hh = 7, hue = Math.floor(rand(0, 360));
+  const pal = {
+    ...SPR_PAL,
+    Q: [`hsl(${hue},45%,50%)`], q: [`hsl(${hue},45%,30%)`], z: [`hsl(${hue},55%,74%)`], P: [`hsl(${hue},40%,14%)`],
+    e: [`hsl(${(hue + 180) % 360},95%,62%)`, `hsl(${(hue + 180) % 360},95%,86%)`],
+  };
+  const top = [];
+  for (let y = 0; y < hh; y++) {
+    let row = '';
+    for (let x = 0; x < w; x++) {
+      const shape = Math.pow(Math.sin((Math.PI * (x + 0.5)) / w), 0.7);
+      const p = (y / (hh - 1)) * 0.95 * shape + 0.05;
+      if (y === hh - 1 && x > 1 && x < w - 2) row += chance(0.3) ? 'z' : 'Q';
+      else if (Math.random() < p * p * 1.3) row += chance(0.06) ? 'e' : pick(['Q', 'Q', 'q', 'z']);
+      else row += '.';
+    }
+    top.push(row);
+  }
+  let rows = top.concat(top.slice(0, -1).reverse()).map(r => [...r]);
+  rows[hh - 1][w - 3] = 'e'; rows[hh - 1][w - 2] = 'e';
+  const filled = (x, y) => rows[y] && rows[y][x] && rows[y][x] !== '.' && rows[y][x] !== 'P';
+  rows = rows.map((r, y) => r.map((ch, x) => (ch === '.' && (filled(x - 1, y) || filled(x + 1, y) || filled(x, y - 1) || filled(x, y + 1)) ? 'P' : ch)));
+  return makeSprite(rows.map(r => r.join('')), pal);
+}
+
+const SHIPDEF = {
+  cruiser:   { spr: makeSprite(CRUISER),   speed: 40, accel: 30, hp: 8,   shields: 8,   team: 'fed',   glow: '#6fd3ff', phaser: '#ff9a3a', emit: [0.88, 0.45], shieldCol: '#8fe0ff' },
+  explorer:  { spr: makeSprite(EXPLORER),  speed: 44, accel: 32, hp: 7,   shields: 7,   team: 'fed',   glow: '#6fd3ff', phaser: '#ff9a3a', emit: [0.92, 0.3],  shieldCol: '#8fe0ff' },
+  raider:    { spr: makeSprite(RAIDER),    speed: 50, accel: 45, hp: 3,   shields: 2,   team: 'kl',    glow: '#8aff6a', bolt: true,        emit: [0.95, 0.5],  shieldCol: '#b0ff8a' },
+  shuttle:   { spr: makeSprite(SHUTTLE),   speed: 35, accel: 30, hp: 1,   shields: 0,   team: 'civ',   glow: '#ffb347', emit: [0.9, 0.5] },
+  freighter: { spr: makeSprite(FREIGHTER), speed: 28, accel: 22, hp: 3,   shields: 0,   team: 'civ',   glow: '#6fd3ff', emit: [0.9, 0.5] },
+  cube:      { spr: makeSprite(cubeRows()),speed: 9,  accel: 5,  hp: 999, shields: 999, team: 'borg',  glow: '#3cff7a', phaser: '#3cff7a', emit: [0.5, 0.5], shieldCol: '#3cff7a', noFlip: true, noExhaust: true },
+  alien:     { spr: null,                  speed: 16, accel: 14, hp: 30,  shields: 30,  team: 'alien', glow: '#c8a0ff', phaser: '#c8a0ff', emit: [0.9, 0.5], shieldCol: '#e0c8ff' },
+};
+const HULL_DEBRIS = ['#cdd3de', '#9aa1b2', '#6b7285', '#474d5e'];
+
+// Dithered transparency (for cloaking): 17 Bayer mask patterns
+const tmp = document.createElement('canvas'); tmp.width = 96; tmp.height = 48;
+const tctx = tmp.getContext('2d');
+const MASKS = [];
+for (let lvl = 0; lvl <= 16; lvl++) {
+  const m = document.createElement('canvas'); m.width = 4; m.height = 4;
+  const mc = m.getContext('2d'); mc.fillStyle = '#fff';
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) if (bayer(x, y) < lvl / 16) mc.fillRect(x, y, 1, 1);
+  MASKS.push(tctx.createPattern(m, 'repeat'));
+}
+function drawDithered(img, X, Y, alpha) {
+  const lvl = Math.round(clamp(alpha, 0, 1) * 16);
+  if (lvl <= 0) return;
+  if (lvl >= 16) { ctx.drawImage(img, X, Y); return; }
+  tctx.globalCompositeOperation = 'source-over';
+  tctx.clearRect(0, 0, img.width, img.height);
+  tctx.drawImage(img, 0, 0);
+  tctx.globalCompositeOperation = 'destination-in';
+  tctx.fillStyle = MASKS[lvl];
+  tctx.fillRect(0, 0, img.width, img.height);
+  tctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(tmp, 0, 0, img.width, img.height, X, Y, img.width, img.height);
+}
+
+// ---------------------------------------------------------------- effects
+const FIRE = ['#ffffff', '#fff3b0', '#ffc94a', '#ff8a2a', '#e0482a', '#8a2438', '#3a1830'];
+function explosion(x, y, size, o = {}) {
+  addFx({
+    dur: 0.5 + size * 0.06, draw(f) {
+      const k = f.t / f.dur, r = size * (k < 0.2 ? 0.4 + k * 3 : 1 - (k - 0.2) * 0.4), R = Math.ceil(r);
+      const X = Math.round(x), Y = Math.round(y);
+      for (let j = -R; j <= R; j++) for (let i = -R; i <= R; i++) {
+        const d = Math.hypot(i, j) / r;
+        if (d > 1) continue;
+        const heat = (1 - d) * (1 - k * 1.1) + noise((X + i) * 0.45, (Y + j) * 0.45 + f.t * 3) * 0.35;
+        if (heat < 0.08 + bayer(X + i, Y + j) * 0.25) continue;
+        ctx.fillStyle = FIRE[clamp(Math.floor((1 - heat) * FIRE.length), 0, FIRE.length - 1)];
+        ctx.fillRect(X + i, Y + j, 1, 1);
+      }
+      if (k < 0.6 && size >= 4) ditherRing(X, Y, size * (0.6 + k * 2.5), '#ffd9a0', (0.6 - k) * 1.2);
+    },
+  });
+  const n = Math.round(size * 5);
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, 6.283), sp = rand(4, 16) * Math.sqrt(size);
+    addPart(x, y, Math.cos(a) * sp, Math.sin(a) * sp, rand(0.3, 1), FIRE.slice(1), { drag: 0.15 });
+  }
+  if (o.debris) for (let i = 0; i < size * 1.5; i++) {
+    const a = rand(0, 6.283), sp = rand(3, 14);
+    addPart(x + rand(-3, 3), y + rand(-2, 2), Math.cos(a) * sp, Math.sin(a) * sp, rand(2.5, 6), pick(HULL_DEBRIS), { drag: 0.7, size: chance(0.4) ? 2 : 1 });
+  }
+  if (size >= 8) world.flash = Math.min(0.5, world.flash + 0.12);
+}
+function addFlash(x, y, color = '#ffffff', scale = 1) {
+  addFx({
+    dur: 0.4, draw(f) {
+      const k = 1 - f.t / f.dur, L = Math.round(22 * k * scale), X = Math.round(x), Y = Math.round(y), v = Math.round(L / 3);
+      ctx.globalAlpha = k; ctx.fillStyle = color;
+      ctx.fillRect(X - L, Y, L * 2 + 1, 1); ctx.fillRect(X, Y - v, 1, v * 2 + 1);
+      ctx.fillStyle = '#fff'; const c = Math.round(2 * k * scale); ctx.fillRect(X - c, Y - c, c * 2 + 1, c * 2 + 1);
+      ctx.globalAlpha = 1;
+    },
+  });
+}
+function tractor(src, dst, color, width = 6) {
+  const tr = { on: true };
+  addFx({
+    dur: 1e9, draw(f) {
+      if (!tr.on || src.dead) { f.dur = 0; return; }
+      const a = src.emitPoint ? src.emitPoint() : src, b = typeof dst === 'function' ? dst() : dst;
+      const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1, nx = -dy / len, ny = dx / len;
+      ctx.fillStyle = color;
+      for (let s = 0; s <= len; s++) {
+        const u = s / len, cx = a.x + dx * u, cy = a.y + dy * u, hw = 0.5 + width * u * 0.5;
+        const wave = 0.5 + 0.5 * Math.sin(s * 0.6 - f.t * 10);
+        for (let o = -hw; o <= hw; o += 1) {
+          const X = Math.round(cx + nx * o), Y = Math.round(cy + ny * o);
+          if (bayer(X, Y) < 0.15 + 0.5 * wave * (1 - Math.abs(o) / (hw + 0.5))) ctx.fillRect(X, Y, 1, 1);
+        }
+      }
+    },
+  });
+  return tr;
+}
+function songRings(x, y) {
+  for (let i = 0; i < 3; i++) addFx({ t: -i * 0.6, dur: 3, draw(f) { ditherRing(x, y, 3 + f.t * 16, '#6fe8ff', (1 - f.t / 3) * 0.8); } });
+}
+
+// ---------------------------------------------------------------- ships
+class Ship {
+  constructor(kind, o = {}) {
+    const d = (this.def = SHIPDEF[kind]);
+    this.kind = kind;
+    this.spr = o.spr || d.spr;
+    this.w = this.spr.w; this.h = this.spr.h;
+    this.x = o.x ?? 0; this.y = o.y ?? 0; this.vx = o.vx ?? 0; this.vy = o.vy ?? 0;
+    this.facing = o.facing ?? 1; this.team = o.team ?? d.team;
+    this.hp = d.hp; this.shields = d.shields; this.shieldFlash = 0; this.shieldHitAngle = 0;
+    this.maxSpeed = o.speed ?? d.speed; this.accel = d.accel;
+    this.cloak = o.cloak ?? 0; this.cloakTarget = o.cloakTarget ?? this.cloak;
+    this.brain = o.brain || null; this.target = null; this.layer = o.layer || 'front';
+    this.age = 0; this.warp = null; this.dead = false; this.exploding = false; this.cool = {};
+    this.faceLock = null; this.phase = Math.random() * 9; this.kinematic = false; this.leaving = o.leaving ?? false; this.gravK = 0;
+    if (o.warpIn) { this.warp = { type: 'in', t: 0 }; addFlash(this.x, this.y, d.glow); }
+    world.ships.push(this);
+  }
+  get alive() { return !this.dead && !this.exploding; }
+  warpOut() { if (!this.warp && this.alive) this.warp = { type: 'out', t: 0, sx: this.x }; }
+  emitPoint() {
+    const e = this.def.emit;
+    return { x: this.x + (e[0] - 0.5) * this.w * this.facing, y: this.y + (e[1] - 0.5) * this.h };
+  }
+  update(dt) {
+    this.age += dt;
+    if (this.cloak !== this.cloakTarget) {
+      const s = dt / 1.4;
+      this.cloak = this.cloak < this.cloakTarget ? Math.min(this.cloakTarget, this.cloak + s) : Math.max(this.cloakTarget, this.cloak - s);
+      if (chance(0.6)) addPart(this.x + rand(-this.w / 2, this.w / 2), this.y + rand(-this.h / 2, this.h / 2), rand(-3, 3), rand(-3, 3), 0.5, ['#d6ffd0', '#8aff6a', '#2e5f2a']);
+    }
+    if (this.cloak >= 1 && this.cloakTarget >= 1 && this.leaving) { this.dead = true; return; }
+    if (this.exploding) {
+      this.expT += dt;
+      this.x += this.vx * 0.4 * dt; this.y += this.vy * 0.4 * dt;
+      if ((this.expCool -= dt) <= 0) {
+        this.expCool = 0.12;
+        explosion(this.x + rand(-this.w / 2, this.w / 2), this.y + rand(-this.h / 2, this.h / 2), rand(2, 3.5));
+      }
+      if (this.expT > 0.9) {
+        this.dead = true;
+        explosion(this.x, this.y, Math.max(4, Math.min(14, this.w / 4.5)), { debris: true });
+      }
+      return;
+    }
+    if (this.warp) {
+      const wp = this.warp; wp.t += dt;
+      if (wp.type === 'in') {
+        if (wp.t >= 0.45) { this.warp = null; if (!this.kinematic) this.vx = this.facing * this.maxSpeed * 0.5; }
+      } else {
+        this.x += this.facing * (this.maxSpeed + 12000 * wp.t * wp.t * wp.t) * dt;
+        if (wp.t >= 0.5) { addFlash(clamp(this.x, 4, W - 4), this.y, this.def.glow); this.dead = true; }
+      }
+      return;
+    }
+    if (this.brain) this.brain(this, dt);
+    if (this.dead) return;
+    if (!this.kinematic) {
+      if (this.target) {
+        const dx = this.target.x - this.x, dy = this.target.y - this.y, dist = Math.hypot(dx, dy) || 1;
+        const sp = Math.min(this.maxSpeed, dist * 0.9), a = this.accel * dt;
+        this.vx += clamp((dx / dist) * sp - this.vx, -a, a);
+        this.vy += clamp((dy / dist) * sp - this.vy, -a, a);
+      }
+      if (this.gravK) { const g = gravityAt(this.x, this.y); if (g) { this.vx += g.x * this.gravK * dt; this.vy += g.y * this.gravK * dt; } }
+      this.x += this.vx * dt; this.y += this.vy * dt;
+    }
+    if (this.faceLock) this.facing = this.faceLock;
+    else if (!this.def.noFlip && Math.abs(this.vx) > 3) this.facing = Math.sign(this.vx);
+    this.shieldFlash = Math.max(0, this.shieldFlash - dt * 2.5);
+    if (!this.def.noExhaust && this.cloak < 0.5 && chance(0.6)) {
+      addPart(this.x - this.facing * (this.w / 2 + 1), this.y + rand(-this.h * 0.3, this.h * 0.3), -this.facing * 8 + this.vx * 0.3, rand(-1, 1), rand(0.3, 0.8), this.def.glow, { drag: 0.5 });
+    }
+    if (this.hp < this.def.hp * 0.5 && chance(0.35)) {
+      addPart(this.x + rand(-this.w / 3, this.w / 3), this.y + rand(-this.h / 3, this.h / 3), -this.facing * 4, rand(-4, -1), rand(0.8, 1.6), ['#ffb347', '#8a8a8a', '#4a4a55'], { drag: 0.5 });
+    }
+    if (this.leaving && (this.x < -this.w - 40 || this.x > W + this.w + 40 || this.y < -60 || this.y > H + 60)) this.dead = true;
+  }
+  hit(dmg, sx, sy) {
+    if (!this.alive || this.warp) return;
+    this.shieldHitAngle = Math.atan2(sy - this.y, sx - this.x);
+    if (this.shields > 0) {
+      this.shields -= dmg; this.shieldFlash = 1;
+      return;
+    }
+    this.hp -= dmg;
+    explosion(this.x + rand(-this.w / 3, this.w / 3), this.y + rand(-this.h / 3, this.h / 3), 2.5);
+    if (this.hp <= 0) this.explode();
+  }
+  explode() { if (this.exploding || this.dead) return; this.exploding = true; this.expT = 0; this.expCool = 0; this.brain = null; this.target = null; }
+  draw() {
+    let dx = this.x;
+    const f = this.spr.frames[Math.floor((world.t + this.phase) * 1.6) % 2];
+    const img = this.facing > 0 ? f.r : f.l;
+    if (this.warp) {
+      const wp = this.warp;
+      if (wp.type === 'in') {
+        const k = 1 - wp.t / 0.45, off = Math.pow(k, 3) * 260;
+        dx = this.x - this.facing * off;
+        this.streak(dx - this.facing * (this.w / 2 + off * 0.6), dx - this.facing * this.w / 2);
+      } else {
+        this.streak(wp.sx, this.x - this.facing * this.w / 2);
+      }
+    }
+    const X = Math.round(dx - this.w / 2), Y = Math.round(this.y - this.h / 2);
+    if (this.exploding && Math.floor(world.t * 20) % 2) return;
+    if (this.cloak <= 0.001) ctx.drawImage(img, X, Y);
+    else if (this.cloak < 0.999) drawDithered(img, X, Y, 1 - this.cloak);
+    if (this.shieldFlash > 0 && this.def.shieldCol) {
+      const rx = this.w / 2 + 3, ry = this.h / 2 + 3, n = Math.ceil((rx + ry) * 3);
+      ctx.fillStyle = this.def.shieldCol;
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * 6.283, SX = Math.round(this.x + Math.cos(a) * rx), SY = Math.round(this.y + Math.sin(a) * ry);
+        if (bayer(SX, SY) < this.shieldFlash * (0.2 + 0.8 * Math.max(0, Math.cos(a - this.shieldHitAngle)))) ctx.fillRect(SX, SY, 1, 1);
+      }
+    }
+  }
+  streak(x0, x1) {
+    const a = Math.min(x0, x1), len = Math.abs(x1 - x0);
+    for (let i = 0; i < this.h; i += 2) {
+      ctx.globalAlpha = 0.6 - (i / this.h) * 0.3;
+      ctx.fillStyle = i % 4 === 0 ? '#ffffff' : this.def.glow;
+      ctx.fillRect(Math.round(a), Math.round(this.y - this.h / 2 + i), Math.round(len), 1);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+const enterX = (dir, kind) => { const w = SHIPDEF[kind].spr.w; return dir > 0 ? -w / 2 - 6 : W + w / 2 + 6; };
+const onScreen = s => s.x > 0 && s.x < W && s.y > 0 && s.y < H;
+function goOff(s, dir = s.facing) {
+  s.brain = null; s.faceLock = null; s.kinematic = false; s.leaving = true;
+  s.target = { x: dir > 0 ? W + s.w + 80 : -s.w - 80, y: s.y };
+}
+function nearest(s, list) {
+  let best = null, bd = 1e9;
+  for (const o of list) { const d = Math.hypot(o.x - s.x, o.y - s.y); if (d < bd) { bd = d; best = o; } }
+  return best;
+}
+
+// ---------------------------------------------------------------- weapons
+class Shot {
+  constructor(x, y, vx, vy, o) {
+    Object.assign(this, { x, y, vx, vy, dead: false, life: 4, dmg: 1, kind: 'bolt', speed: Math.hypot(vx, vy) }, o);
+    world.shots.push(this);
+  }
+  update(dt) {
+    this.life -= dt;
+    const h = this.homing;
+    if (h && h.alive) {
+      const dx = h.x - this.x, dy = h.y - this.y, d = Math.hypot(dx, dy) || 1, k = Math.min(1, dt * 2.5);
+      this.vx += ((dx / d) * this.speed - this.vx) * k;
+      this.vy += ((dy / d) * this.speed - this.vy) * k;
+    }
+    const g = gravityAt(this.x, this.y);
+    if (g) { this.vx += g.x * dt; this.vy += g.y * dt; }
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    if (this.kind === 'torp' && chance(0.8)) addPart(this.x, this.y, rand(-3, 3), rand(-3, 3), 0.35, ['#ffd0a0', '#ff5a3a', '#8a2a2a'], { drag: 0.2 });
+    for (const s of world.ships) {
+      if (!s.alive || s.team === this.team || s.cloak >= 0.5 || s.warp) continue;
+      if (Math.abs(this.x - s.x) < s.w / 2 + 1 && Math.abs(this.y - s.y) < s.h / 2 + 1) {
+        s.hit(this.dmg, this.x - this.vx * 0.1, this.y - this.vy * 0.1);
+        this.impact(); return;
+      }
+    }
+    for (const r of world.rocks) {
+      if (!r.dead && Math.hypot(this.x - r.x, this.y - r.y) < r.r + 1) { r.hit(); this.impact(); return; }
+    }
+    if (this.life <= 0) { if (this.kind === 'torp') explosion(this.x, this.y, 2); this.dead = true; }
+    if (this.x < -30 || this.x > W + 30 || this.y < -30 || this.y > H + 30) this.dead = true;
+  }
+  impact() { this.dead = true; explosion(this.x, this.y, this.kind === 'torp' ? 3.5 : 2); }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y);
+    if (this.kind === 'torp') {
+      const p = Math.floor(world.t * 12) % 2;
+      ctx.fillStyle = p ? '#ffffff' : '#ffd0a0'; ctx.fillRect(X, Y, 2, 2);
+      ctx.fillStyle = '#ff5a3a'; ctx.fillRect(X - 1, Y, 1, 2); ctx.fillRect(X + 2, Y, 1, 2); ctx.fillRect(X, Y - 1, 2, 1); ctx.fillRect(X, Y + 2, 2, 1);
+    } else {
+      const d = Math.hypot(this.vx, this.vy) || 1, ux = this.vx / d, uy = this.vy / d;
+      for (let i = 0; i < 4; i++) px(X - ux * i, Y - uy * i, i === 0 ? '#eaffd8' : this.color);
+    }
+  }
+}
+function firePhaser(s, tgt, dmg, acc, dur = 0.45) {
+  const hit = chance(acc), mx = rand(-14, 14), my = rand(-10, 10);
+  const color = s.def.phaser || '#ff9a3a';
+  addFx({ dur, draw(f) { if (s.dead) return; const a = s.emitPoint(); beamLine(a.x, a.y, tgt.x + (hit ? 0 : mx), tgt.y + (hit ? 0 : my), color, f.t); } });
+  if (hit) tgt.hit(dmg, s.x, s.y);
+}
+function fireTorpedo(s, tgt) {
+  const e = s.emitPoint();
+  new Shot(e.x, e.y, s.facing * 60, rand(-12, 12), { team: s.team, dmg: 2, kind: 'torp', homing: tgt, life: 5, speed: 75 });
+}
+function fireBolt(s, tgt, spread = 0.12) {
+  const e = s.emitPoint(), sp = 110, dist = Math.hypot(tgt.x - e.x, tgt.y - e.y), t = dist / sp;
+  const ang = Math.atan2(tgt.y + (tgt.vy || 0) * t - e.y, tgt.x + (tgt.vx || 0) * t - e.x) + rand(-spread, spread);
+  new Shot(e.x, e.y, Math.cos(ang) * sp, Math.sin(ang) * sp, { team: s.team, dmg: 1, kind: 'bolt', color: '#7aff4a', life: 3 });
+}
+
+// ---------------------------------------------------------------- asteroids (light physics)
+const ROCK_COLS = ['#241e2b', '#3d3542', '#5f5560', '#8a7d80', '#b3a49c'];
+const rockCache = {};
+function rockSprite(r) {
+  const key = r + '_' + randi(0, 2);
+  if (rockCache[key]) return rockCache[key];
+  const S = 12, radii = Array.from({ length: S }, () => r * rand(0.72, 1.05));
+  const craters = Array.from({ length: Math.max(1, Math.floor(r / 2)) }, () => ({ a: rand(0, 6.28), d: rand(0, r * 0.6), cr: rand(0.8, r * 0.35) }));
+  const size = r * 2 + 3, c0 = Math.floor(size / 2), frames = [];
+  for (let fi = 0; fi < 16; fi++) {
+    const rot = (fi / 16) * Math.PI * 2, cv = document.createElement('canvas');
+    cv.width = size; cv.height = size;
+    const c = cv.getContext('2d');
+    for (let y = -c0; y <= c0; y++) for (let x = -c0; x <= c0; x++) {
+      const lx = x * Math.cos(rot) + y * Math.sin(rot), ly = -x * Math.sin(rot) + y * Math.cos(rot);
+      let ang = Math.atan2(ly, lx); if (ang < 0) ang += Math.PI * 2;
+      const fpos = (ang / (Math.PI * 2)) * S, i0 = Math.floor(fpos) % S, i1 = (i0 + 1) % S, fr = fpos - Math.floor(fpos);
+      const rr = radii[i0] * (1 - fr) + radii[i1] * fr, d = Math.hypot(x, y);
+      if (d > rr) continue;
+      let l = 0.5 - ((x / rr) * 0.5 + (y / rr) * 0.45) - Math.pow(d / rr, 3) * 0.25;
+      for (const cr of craters) {
+        const cx = Math.cos(cr.a) * cr.d, cy = Math.sin(cr.a) * cr.d;
+        if (Math.hypot(lx - cx, ly - cy) < cr.cr) l -= 0.22;
+      }
+      c.fillStyle = ROCK_COLS[clamp(Math.floor(l * 4 + bayer(x + 8, y + 8) + 0.3), 0, 4)];
+      c.fillRect(x + c0, y + c0, 1, 1);
+    }
+    frames.push(cv);
+  }
+  return (rockCache[key] = { frames, c0 });
+}
+class Rock {
+  constructor(x, y, vx, vy, r) {
+    Object.assign(this, { x, y, vx, vy, r, rot: rand(0, 6.28), rs: rand(-1.5, 1.5), dead: false, leaving: false });
+    this.spr = rockSprite(r);
+    world.rocks.push(this);
+  }
+  get alive() { return !this.dead; }
+  update(dt) {
+    const g = gravityAt(this.x, this.y);
+    if (g) {
+      this.vx += g.x * dt; this.vy += g.y * dt;
+      if (g.d < 10) { // spaghettified
+        this.dead = true;
+        for (let i = 0; i < this.r * 6; i++) addPart(this.x + rand(-this.r, this.r), this.y + rand(-this.r, this.r), this.vx + rand(-6, 6), this.vy + rand(-6, 6), rand(1, 3), ['#b3a49c', '#ffb050', '#ff6a3a'], { grav: true });
+        return;
+      }
+    }
+    this.x += this.vx * dt; this.y += this.vy * dt; this.rot += this.rs * dt;
+    if (onScreen(this)) this.leaving = true;
+    if (this.leaving && (this.x < -40 || this.x > W + 40 || this.y < -40 || this.y > H + 40)) this.dead = true;
+  }
+  hit() {
+    if (this.dead) return;
+    this.dead = true;
+    for (let i = 0; i < this.r * 5; i++) {
+      const a = rand(0, 6.28), sp = rand(3, 18);
+      addPart(this.x, this.y, this.vx + Math.cos(a) * sp, this.vy + Math.sin(a) * sp, rand(0.6, 2), pick(ROCK_COLS.slice(1)), { drag: 0.5 });
+    }
+    explosion(this.x, this.y, Math.min(4, this.r * 0.6), {});
+    if (this.r >= 4) {
+      const a = rand(0, 6.28), sp = rand(6, 12);
+      for (const s of [1, -1]) {
+        const k = new Rock(this.x + Math.cos(a) * s * 2, this.y + Math.sin(a) * s * 2, this.vx + Math.cos(a) * s * sp, this.vy + Math.sin(a) * s * sp, Math.round(this.r * 0.62));
+        k.leaving = true;
+      }
+    }
+  }
+  draw() {
+    const fi = Math.floor(((((this.rot % 6.283) + 6.283) % 6.283) / 6.283) * 16) % 16;
+    ctx.drawImage(this.spr.frames[fi], Math.round(this.x - this.spr.c0), Math.round(this.y - this.spr.c0));
+  }
+}
+function physics() {
+  const R = world.rocks;
+  for (let i = 0; i < R.length; i++) {
+    const a = R[i]; if (a.dead) continue;
+    for (let j = i + 1; j < R.length; j++) {
+      const b = R[j]; if (b.dead) continue;
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy), min = a.r + b.r;
+      if (d >= min || d === 0) continue;
+      const nx = dx / d, ny = dy / d, ma = a.r * a.r, mb = b.r * b.r;
+      const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+      const overlap = (min - d) / 2;
+      a.x -= nx * overlap; a.y -= ny * overlap; b.x += nx * overlap; b.y += ny * overlap;
+      if (rel < 0) {
+        const imp = (-1.8 * rel) / (1 / ma + 1 / mb);
+        a.vx -= (imp / ma) * nx; a.vy -= (imp / ma) * ny; b.vx += (imp / mb) * nx; b.vy += (imp / mb) * ny;
+        a.rs += rand(-0.5, 0.5); b.rs += rand(-0.5, 0.5);
+        for (let k = 0; k < 4; k++) addPart(a.x + nx * a.r, a.y + ny * a.r, rand(-8, 8), rand(-8, 8), 0.6, '#8a7d80', { drag: 0.3 });
+      }
+    }
+    for (const s of world.ships) {
+      if (!s.alive || s.cloak >= 0.5 || s.warp) continue;
+      if (Math.abs(a.x - s.x) < s.w / 2 + a.r && Math.abs(a.y - s.y) < s.h / 2 + a.r) {
+        if (s.def.shields > 0) {
+          const nx = a.x - s.x, ny = a.y - s.y, d = Math.hypot(nx, ny) || 1;
+          const sp = Math.max(8, Math.hypot(a.vx, a.vy));
+          a.vx = (nx / d) * sp + s.vx * 0.5; a.vy = (ny / d) * sp + s.vy * 0.5;
+          a.x += (nx / d) * 2; a.y += (ny / d) * 2;
+          s.shieldFlash = 1; s.shieldHitAngle = Math.atan2(ny, nx);
+        } else { a.hit(); s.hit(1, a.x, a.y); }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- space whale (rare)
+class Whale {
+  constructor(dir, y, x) {
+    this.dir = dir; this.L = 58; this.x = x ?? (dir > 0 ? -this.L - 10 : W + this.L + 10); this.y = y;
+    this.vx = dir * 11; this.t = 0; this.layer = 'front'; this.dead = false; this.songT = rand(3, 6); this.entered = false;
+    world.ents.push(this);
+  }
+  pose(u) {
+    const i = u * (this.L - 1);
+    return {
+      x: this.x + (this.dir > 0 ? i - this.L / 2 : this.L / 2 - i),
+      y: this.y + Math.sin(this.t * 2.2 - u * 4.5) * 4 * Math.pow(1 - u, 2),
+    };
+  }
+  update(dt) {
+    this.t += dt; this.x += this.vx * dt; this.y += Math.sin(this.t * 0.3) * 3 * dt;
+    if ((this.songT -= dt) <= 0) { this.songT = rand(7, 11); const h = this.pose(0.95); songRings(h.x, h.y); }
+    if (chance(0.5)) {
+      const p = this.pose(rand(0.1, 0.9));
+      addPart(p.x, p.y + rand(-4, 4), -this.dir * 3, rand(-1, 1), rand(1, 2), pick(['#6fe8ff', '#ff8ad8', '#d6f6ff']), { drag: 0.6 });
+    }
+    if (this.x > 0 && this.x < W) this.entered = true;
+    if (this.entered && (this.x < -this.L - 30 || this.x > W + this.L + 30)) this.dead = true;
+  }
+  draw() {
+    const L = this.L, t = this.t;
+    for (let i = 0; i < L; i++) {
+      const u = i / (L - 1), p = this.pose(u);
+      let th;
+      if (u < 0.12) th = 1 + ((0.12 - u) / 0.12) * 5 * (0.6 + 0.4 * Math.sin(t * 2.2));
+      else th = 7.5 * Math.pow(Math.sin(Math.PI * Math.min(0.85, (u - 0.12) / 0.95)), 0.7) + 1;
+      const cx = Math.round(p.x), top = Math.round(p.y - th), bot = Math.round(p.y + th * 0.8);
+      for (let y = top; y <= bot; y++) {
+        const v = (y - p.y) / th;
+        let c = v < -0.55 ? '#1f2d5c' : v < 0.15 ? '#35509a' : '#9dbbe8';
+        if (Math.abs(v + 0.55) < 0.15 && bayer(cx, y) < 0.5) c = '#2a3f7a';
+        if (v > 0.3 && (i + y) % 3 === 0) c = '#c9dcf5';
+        px(cx, y, c);
+      }
+      if (i % 5 === 2 && u > 0.15 && u < 0.9 && Math.sin(t * 1.5 + i * 0.4) > 0.1) px(cx, p.y - th * 0.25, i % 10 === 2 ? '#6fe8ff' : '#ff8ad8');
+    }
+    const e = this.pose(0.88);
+    px(e.x, e.y - 1, '#ffffff');
+    const f = this.pose(0.62), swing = Math.sin(t * 1.5) * 2;
+    for (let k = 0; k < 6; k++) px(f.x - this.dir * k, f.y + 5 + k * 0.6 + (swing * k) / 5, '#35509a');
+  }
+}
+
+// ---------------------------------------------------------------- event helpers
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+
+// Ambient: a single ship passing through
+function flyby() {
+  const kind = weighted({ cruiser: 3, explorer: 3, raider: 3, shuttle: 2, freighter: 2 });
+  const dir = coin(), speed = SHIPDEF[kind].speed * rand(0.7, 1.05);
+  const mode = weighted({ cross: 6, warpOut: 3, warpIn: 2, cloak: kind === 'raider' ? 3 : 0 });
+  const y = rand(H * 0.12, H * 0.85);
+  if (mode === 'warpIn') {
+    const s = new Ship(kind, { x: rand(W * 0.2, W * 0.8), y, facing: dir, warpIn: true, leaving: true });
+    s.maxSpeed = speed;
+    return;
+  }
+  const s = new Ship(kind, { x: enterX(dir, kind), y, facing: dir, vx: dir * speed });
+  const trigger = rand(0.3, 0.7);
+  s.brain = (s) => {
+    if (onScreen(s)) s.leaving = true;
+    const prog = dir > 0 ? s.x / W : 1 - s.x / W;
+    if (mode === 'warpOut' && prog > trigger) s.warpOut();
+    if (mode === 'cloak' && prog > trigger) s.cloakTarget = 1;
+  };
+}
+
+// ---------------------------------------------------------------- EVENTS
+function* battle() {
+  const dir = coin(), heroKind = pick(['cruiser', 'explorer']);
+  const hero = new Ship(heroKind, { x: enterX(dir, heroKind), y: rand(H * 0.35, H * 0.6), facing: dir, vx: dir * 30 });
+  const anchor = { x: W * (dir > 0 ? rand(0.3, 0.4) : rand(0.6, 0.7)), y: hero.y };
+  hero.target = anchor;
+  yield* wait(3.5);
+  const n = +weighted({ 1: 3, 2: 4, 3: 2 }), raiders = [];
+  for (let i = 0; i < n; i++) {
+    raiders.push(new Ship('raider', {
+      x: W * (dir > 0 ? rand(0.68, 0.9) : rand(0.1, 0.32)), y: clamp(anchor.y + rand(-70, 70), 20, H - 20),
+      facing: -dir, cloak: 1, cloakTarget: 0,
+    }));
+    yield* wait(0.7);
+  }
+  yield* wait(1);
+  hero.brain = (s, dt) => {
+    s.maxSpeed = 14;
+    s.target = { x: anchor.x + Math.sin(s.age * 0.4) * 12, y: anchor.y + Math.sin(s.age * 0.7) * 10 };
+    const foes = raiders.filter(r => r.alive && r.cloak < 0.5);
+    if (!foes.length) { s.faceLock = null; return; }
+    const tgt = nearest(s, foes);
+    s.faceLock = Math.sign(tgt.x - s.x) || s.facing;
+    s.cool.ph = (s.cool.ph ?? 1) - dt; s.cool.tp = (s.cool.tp ?? 3) - dt;
+    if (s.cool.ph <= 0) { s.cool.ph = rand(1.4, 2.4); firePhaser(s, tgt, 1.5, 0.8); }
+    if (s.cool.tp <= 0) { s.cool.tp = rand(3.5, 6); fireTorpedo(s, tgt); }
+  };
+  for (const r of raiders) {
+    r.maxSpeed = 48; r.accel = 45;
+    r.brain = (s, dt) => {
+      if (!hero.alive) return;
+      if (!s.wp || Math.hypot(s.wp.x - s.x, s.wp.y - s.y) < 10 || s.age - s.wpT > 5) {
+        const side = s.x < hero.x ? 1 : -1;
+        s.wp = { x: clamp(hero.x + side * rand(45, 90), 10, W - 10), y: clamp(hero.y + rand(-55, 55), 12, H - 12) };
+        s.wpT = s.age;
+      }
+      s.target = s.wp;
+      s.cool.b = (s.cool.b ?? rand(1, 2)) - dt;
+      const dx = hero.x - s.x;
+      if (s.cool.b <= 0 && Math.hypot(dx, hero.y - s.y) < 150 && Math.sign(dx) === s.facing) { s.cool.b = rand(0.9, 1.8); fireBolt(s, hero); }
+    };
+  }
+  let t = 0;
+  while (t < 40 && hero.alive && raiders.some(r => r.alive)) t += yield;
+  const live = raiders.filter(r => r.alive);
+  if (!hero.alive) {
+    yield* wait(1.5);
+    live.forEach(r => { goOff(r, r.facing); r.cloakTarget = 1; });
+  } else {
+    live.forEach(r => { goOff(r, r.x < W / 2 ? -1 : 1); r.cloakTarget = 1; });
+    yield* wait(2.5);
+    hero.brain = null; hero.faceLock = null; hero.target = null; hero.facing = dir; hero.vx = dir * 10;
+    yield* wait(0.8);
+    if (chance(0.6)) hero.warpOut(); else goOff(hero, dir);
+  }
+  yield* until(() => [hero, ...raiders].every(s => s.dead), 25);
+}
+
+function* chase() {
+  const dir = coin(), vKind = pick(['freighter', 'shuttle']), baseY = rand(H * 0.25, H * 0.75);
+  const victim = new Ship(vKind, { x: enterX(dir, vKind), y: baseY, facing: dir, vx: dir * 38 });
+  victim.maxSpeed = 38; victim.accel = 40;
+  victim.brain = s => {
+    if (onScreen(s)) s.leaving = true;
+    s.target = { x: dir > 0 ? W + 80 : -80, y: clamp(baseY + Math.sin(s.age * 1.1) * 28, 15, H - 15) };
+  };
+  yield* wait(1.6);
+  const raider = new Ship('raider', { x: enterX(dir, 'raider'), y: baseY, facing: dir, vx: dir * 50 });
+  raider.maxSpeed = 46; raider.accel = 50;
+  let spread = 0.3;
+  raider.brain = (s, dt) => {
+    if (onScreen(s)) s.leaving = true;
+    if (!victim.alive) { s.target = { x: dir > 0 ? W + 80 : -80, y: s.y }; return; }
+    s.target = { x: victim.x - dir * 38, y: victim.y + Math.sin(s.age * 2) * 6 };
+    s.cool.b = (s.cool.b ?? 0.8) - dt;
+    if (s.cool.b <= 0) { s.cool.b = rand(0.5, 1); fireBolt(s, victim, spread); }
+  };
+  yield* until(() => !victim.alive || (dir > 0 ? victim.x > W * 0.45 : victim.x < W * 0.55), 14);
+  const outcome = !victim.alive ? 'destroyed' : weighted({ rescue: 45, escape: 35, destroyed: 20 });
+  if (outcome === 'rescue') {
+    const hk = pick(['cruiser', 'explorer']);
+    const hero = new Ship(hk, { x: W * (dir > 0 ? 0.82 : 0.18), y: clamp(victim.y + rand(-25, 25), 20, H - 20), facing: -dir, warpIn: true });
+    hero.brain = s => { s.x0 ??= s.x; s.y0 ??= s.y; s.target = { x: s.x0, y: s.y0 }; s.maxSpeed = 10; s.faceLock = -dir; };
+    yield* wait(0.8);
+    raider.brain = s => { s.target = { x: s.x - dir * 5, y: s.y }; };
+    for (let i = 0; i < 2 && raider.alive; i++) { firePhaser(hero, raider, 1.5, 0.95); yield* wait(0.9); }
+    if (raider.alive && chance(0.5)) { fireTorpedo(hero, raider); yield* wait(1.5); }
+    if (raider.alive) { goOff(raider, -dir); raider.cloakTarget = 1; }
+    yield* wait(2.5);
+    hero.brain = null; hero.faceLock = null; hero.target = null; hero.facing = dir; hero.vx = dir * 6;
+    yield* wait(1);
+    hero.warpOut();
+    yield* until(() => hero.dead, 5);
+  } else if (outcome === 'escape') {
+    yield* wait(1);
+    victim.warpOut();
+    yield* wait(1.2);
+    raider.brain = null; raider.target = { x: raider.x + dir * 20, y: raider.y };
+    yield* wait(1.5);
+    goOff(raider, -dir); raider.cloakTarget = 1;
+  } else {
+    spread = 0.02;
+    if (victim.alive) fireTorpedo(raider, victim);
+    yield* until(() => !victim.alive, 5);
+    if (victim.alive) victim.explode();
+    yield* wait(1.5);
+    goOff(raider, dir);
+  }
+  yield* until(() => victim.dead && raider.dead, 20);
+}
+
+function* orbit() {
+  const kind = pick(['cruiser', 'explorer']), P = planet, rx = P.r * 2.6, ry = P.r * 0.55;
+  const w = coin() * 0.35;
+  let a = Math.PI * 0.5 + rand(-0.4, 0.4), travelled = 0;
+  const pos = a => ({ x: P.x + Math.cos(a) * rx, y: P.y + Math.sin(a) * ry });
+  const p0 = pos(a);
+  const ship = new Ship(kind, { x: p0.x, y: p0.y, facing: Math.sign(-Math.sin(a) * w) || 1, warpIn: true });
+  ship.kinematic = true;
+  yield* until(() => !ship.warp, 2);
+  ship.brain = (s, dt) => {
+    a += w * dt; travelled += Math.abs(w * dt);
+    const p = pos(a);
+    s.vx = dt > 0 ? (p.x - s.x) / dt : 0; s.x = p.x; s.y = p.y;
+    s.layer = Math.sin(a) < 0 ? 'back' : 'front';
+    const fx = -Math.sin(a) * w;
+    if (Math.abs(fx) > 0.05) s.facing = Math.sign(fx);
+  };
+  yield* until(() => travelled > Math.PI * 0.8, 20);
+  const sh = new Ship('shuttle', { x: ship.x, y: ship.y, facing: ship.facing, layer: ship.layer });
+  sh.maxSpeed = 18; sh.accel = 20;
+  sh.brain = s => {
+    const m = moonPos();
+    s.target = m; s.layer = m.back ? 'back' : 'front';
+    if (Math.hypot(m.x - s.x, m.y - s.y) < 3) { s.dead = true; addFlash(s.x, s.y, '#ffe08a', 0.5); }
+  };
+  yield* until(() => travelled > Math.PI * 2.6 && Math.sin(a) > 0.6, 40);
+  ship.kinematic = false; ship.brain = null; ship.layer = 'front'; ship.vx = ship.facing * 25; ship.vy = 0;
+  yield* wait(1.5);
+  ship.warpOut();
+  yield* until(() => ship.dead && sh.dead, 25);
+  if (!sh.dead) { sh.leaving = true; sh.cloakTarget = 1; }
+}
+
+function* fleet() {
+  const kind = weighted({ cruiser: 3, explorer: 3, raider: 3, freighter: 1 });
+  const n = randi(3, 5), dir = coin(), y0 = rand(H * 0.25, H * 0.7), speed = rand(24, 34), sp = SHIPDEF[kind].spr, ships = [];
+  for (let i = 0; i < n; i++) {
+    const k = Math.ceil(i / 2), side = i % 2 ? 1 : -1;
+    const s = new Ship(kind, { x: enterX(dir, kind) - dir * k * sp.w * 0.9, y: clamp(y0 + side * k * (sp.h + 8), 10, H - 10), facing: dir, vx: dir * speed });
+    s.maxSpeed = speed;
+    s.brain = s => { if (onScreen(s)) s.leaving = true; };
+    ships.push(s);
+  }
+  if (chance(0.45)) {
+    const trig = rand(0.45, 0.7);
+    yield* until(() => ships[0].dead || (dir > 0 ? ships[0].x > W * trig : ships[0].x < W * (1 - trig)), 30);
+    for (const s of ships) { s.warpOut(); yield* wait(0.15); }
+  }
+  yield* until(() => ships.every(s => s.dead), 40);
+}
+
+function* asteroids() {
+  const dir = coin(), n = randi(12, 20), rocks = [];
+  for (let i = 0; i < n; i++) {
+    const r = weighted({ 2: 3, 3: 3, 4: 2, 5: 2, 7: 1, 9: 1 });
+    rocks.push(new Rock(dir > 0 ? rand(-W * 0.7, -10) : rand(W + 10, W * 1.7), rand(10, H - 10), dir * rand(9, 18), rand(-3, 3), +r));
+  }
+  yield* wait(rand(6, 9));
+  const kind = weighted({ cruiser: 2, explorer: 2, shuttle: 2, raider: 1 }), sdir = chance(0.5) ? dir : -dir;
+  const ship = new Ship(kind, { x: enterX(sdir, kind), y: rand(H * 0.25, H * 0.75), facing: sdir, vx: sdir * 30 });
+  ship.maxSpeed = 30; ship.baseY = ship.y;
+  ship.brain = (s, dt) => {
+    if (onScreen(s)) s.leaving = true;
+    s.cool.f = (s.cool.f ?? 0) - dt;
+    let dodge = 0;
+    for (const rk of world.rocks) {
+      if (rk.dead) continue;
+      const ahead = (rk.x - s.x) * s.facing;
+      if (ahead > 0 && ahead < 70 && Math.abs(rk.y - s.y) < rk.r + s.h) {
+        if (s.cool.f <= 0 && ahead < 60) {
+          if (s.def.phaser) { s.cool.f = 0.7; firePhaser(s, rk, 1, 1, 0.3); }
+          else if (s.def.bolt) { s.cool.f = 0.5; fireBolt(s, rk, 0.02); }
+        }
+        dodge += (s.y < rk.y ? -1 : 1) * (1 - ahead / 70);
+      }
+    }
+    s.target = { x: s.facing > 0 ? W + 80 : -80, y: clamp(s.y + dodge * 30 + (s.baseY - s.y) * 0.2, 10, H - 10) };
+  };
+  yield* until(() => rocks.every(r => r.dead) && ship.dead, 90);
+}
+
+function* borg() {
+  const dir = coin();
+  const cube = new Ship('cube', { x: enterX(dir, 'cube'), y: rand(H * 0.3, H * 0.6), facing: 1, vx: dir * 9 });
+  const stop = { x: W * (dir > 0 ? rand(0.35, 0.5) : rand(0.5, 0.65)), y: cube.y };
+  cube.target = stop;
+  yield* until(() => Math.abs(cube.x - stop.x) < 3, 45);
+  if (chance(0.5)) {
+    const fd = coin();
+    const victim = new Ship('freighter', { x: enterX(fd, 'freighter'), y: clamp(cube.y + rand(-50, 50), 15, H - 15), facing: fd, vx: fd * 28 });
+    victim.brain = s => { if (onScreen(s)) s.leaving = true; };
+    yield* until(() => Math.abs(victim.x - cube.x) < 70 || victim.dead, 20);
+    if (!victim.dead) {
+      const tr = tractor(cube, victim, '#3cff7a', 8);
+      victim.maxSpeed = 12; victim.accel = 15; victim.faceLock = victim.facing; victim.leaving = false;
+      victim.brain = s => {
+        s.target = { x: cube.x, y: cube.y };
+        if (chance(0.4)) addPart(s.x - s.facing * s.w / 2, s.y, -s.facing * rand(10, 25), rand(-4, 4), 0.4, '#ffd28a', { drag: 0.3 });
+      };
+      yield* until(() => Math.hypot(victim.x - cube.x, victim.y - cube.y) < 6, 25);
+      tr.on = false; victim.dead = true;
+      addFlash(cube.x, cube.y, '#3cff7a', 1.2);
+      yield* wait(3);
+    }
+  } else {
+    const hdir = cube.x < W / 2 ? 1 : -1, hk = pick(['cruiser', 'explorer']);
+    const hero = new Ship(hk, { x: clamp(cube.x + hdir * rand(90, 120), 30, W - 30), y: clamp(cube.y + rand(-30, 30), 20, H - 20), facing: -hdir, warpIn: true });
+    hero.brain = s => { s.x0 ??= s.x; s.target = { x: s.x0, y: s.y }; s.maxSpeed = 8; s.faceLock = -hdir; };
+    yield* wait(1.5);
+    for (let i = 0; i < 3; i++) { fireTorpedo(hero, cube); yield* wait(0.5); }
+    yield* wait(2);
+    firePhaser(cube, hero, 5, 1, 1.4); yield* wait(1.6);
+    firePhaser(cube, hero, 5, 1, 1.4); yield* wait(1.5);
+    if (hero.alive) {
+      hero.brain = null; hero.faceLock = null; hero.target = null; hero.facing = hdir; hero.vx = hdir * 8;
+      yield* wait(1);
+      hero.warpOut();
+    }
+    yield* wait(2);
+  }
+  if (chance(0.4)) {
+    addFlash(cube.x, cube.y, '#3cff7a', 2); world.flash = Math.min(0.5, world.flash + 0.15);
+    cube.dead = true;
+  } else {
+    cube.target = null; cube.vx = dir * 9; cube.leaving = true;
+    yield* until(() => cube.dead, 60);
+  }
+}
+
+// ---- rare events
+function* supernova() {
+  let x, y, tries = 0;
+  do { x = rand(W * 0.1, W * 0.9); y = rand(H * 0.1, H * 0.5); } while (Math.hypot(x - planet.x, y - planet.y) < planet.r * 5 && ++tries < 20);
+  const sn = { phase: 0, t: 0 };
+  const fx = addFx({
+    layer: 'far', dur: 1e9, draw() {
+      const T = sn.t;
+      if (sn.phase === 0) {
+        const k = T / 6, pulse = Math.sin(T * (2 + k * 18)) * 0.5 + 0.5, L = Math.round(2 + k * 14 * (0.6 + pulse * 0.4));
+        ctx.fillStyle = '#d6f6ff'; ctx.globalAlpha = 0.4 + k * 0.6;
+        ctx.fillRect(Math.round(x) - L, Math.round(y), L * 2 + 1, 1); ctx.fillRect(Math.round(x), Math.round(y) - L, 1, L * 2 + 1);
+        ctx.globalAlpha = 1; ctx.fillStyle = '#fff';
+        const c = Math.round(k * 2 * (0.5 + pulse)); ctx.fillRect(Math.round(x) - c, Math.round(y) - c, c * 2 + 1, c * 2 + 1);
+      } else {
+        const R = 60 * (1 - Math.exp(-T / 6)) + T * 1.2, fade = Math.max(0, 1 - T / 38);
+        const cols = T < 1.5 ? ['#ffffff', '#d6f6ff'] : T < 6 ? ['#9fe4ff', '#ff8ad8'] : ['#ff6ad5', '#c23a5a', '#6a2a8a'];
+        const n = Math.ceil(R * 6);
+        for (let i = 0; i < n; i++) {
+          const a = (i / n) * 6.283;
+          const rr = R * (1 + 0.14 * (noise(Math.cos(a) * 3 + 10, Math.sin(a) * 3 + T * 0.05) - 0.5));
+          for (let th = 0; th < 3; th++) {
+            const X = Math.round(x + Math.cos(a) * (rr - th)), Y = Math.round(y + Math.sin(a) * (rr - th));
+            if (bayer(X, Y) < fade * (1 - th * 0.3)) px(X, Y, cols[(th + i) % cols.length]);
+          }
+        }
+        for (let j = -2; j <= 2; j++) for (let i = -2; i <= 2; i++) if (bayer(i + 50, j + 50) < fade * 0.5 * (1 - Math.hypot(i, j) / 3)) px(x + i, y + j, '#ff8ad8');
+        if (T > 3 && Math.floor(T * 4) % 2 === 0) { // pulsar
+          px(x, y, '#ffffff');
+          const ang = T * 3;
+          ctx.globalAlpha = 0.5 * fade;
+          for (let s = 2; s < 10; s++) { px(x + Math.cos(ang) * s, y + Math.sin(ang) * s, '#d6f6ff'); px(x - Math.cos(ang) * s, y - Math.sin(ang) * s, '#d6f6ff'); }
+          ctx.globalAlpha = 1;
+        }
+      }
+    },
+  });
+  while (sn.t < 6) sn.t += yield;
+  sn.phase = 1; sn.t = 0; world.flash = 0.6;
+  for (let i = 0; i < 160; i++) { const a = rand(0, 6.283), sp = rand(20, 45); addPart(x, y, Math.cos(a) * sp, Math.sin(a) * sp, rand(1.5, 3), ['#ffffff', '#9fe4ff', '#ff8ad8', '#6a2a8a'], { drag: 0.6 }); }
+  while (sn.t < 38) sn.t += yield;
+  fx.dur = 0;
+}
+
+function* wormhole() {
+  const wh = { x: rand(W * 0.25, W * 0.7), y: rand(H * 0.25, H * 0.7), open: 0, R: 18 };
+  const PAL = ['#12092e', '#3b2080', '#7a4ad0', '#c6a8ff', '#ffffff'];
+  const fx = addFx({
+    layer: 'mid', dur: 1e9, draw() {
+      const R = wh.R * (1 - Math.pow(1 - wh.open, 3)), Ri = Math.ceil(R);
+      if (R < 0.5) return;
+      for (let j = -Ri; j <= Ri; j++) for (let i = -Ri; i <= Ri; i++) {
+        const d = Math.hypot(i, j), u = d / R;
+        if (u > 1) continue;
+        const X = Math.round(wh.x + i), Y = Math.round(wh.y + j);
+        if (u < 0.16) { px(X, Y, '#05030c'); continue; }
+        if (bayer(X, Y) > (1 - u * u) * 0.95 + 0.05) continue;
+        const sw = 0.5 + 0.5 * Math.sin(Math.atan2(j, i) * 3 - Math.log(d + 1) * 5 + world.t * 4);
+        px(X, Y, PAL[clamp(Math.floor(sw * (1 - u) * 5.5 + bayer(X, Y) * 0.8), 0, 4)]);
+      }
+    },
+  });
+  while (wh.open < 1) wh.open = Math.min(1, wh.open + (yield) / 3);
+  const what = weighted({ alien: 4, whale: 2, lost: 2 }), actors = [];
+  addFlash(wh.x, wh.y, '#e0c0ff', 1.3); world.flash = Math.min(0.5, world.flash + 0.15);
+  if (what === 'alien') {
+    const d = coin(), a = new Ship('alien', { spr: alienSprite(), x: wh.x, y: wh.y, facing: d });
+    a.target = { x: clamp(wh.x + d * 60, 20, W - 20), y: clamp(wh.y + rand(-25, 25), 20, H - 20) };
+    actors.push(a);
+    yield* wait(3.5);
+    const tr = tractor(a, () => ({ x: planet.x, y: planet.y }), '#c8a0ff', 10);
+    a.faceLock = Math.sign(planet.x - a.x) || d;
+    yield* wait(3.5);
+    tr.on = false; a.faceLock = null; a.target = null; a.vx = a.facing * 6;
+    yield* wait(1);
+    a.warpOut();
+  } else if (what === 'whale') {
+    const wl = new Whale(coin(), wh.y, wh.x);
+    wl.entered = true; wl.vx = wl.dir * 13;
+    actors.push(wl);
+    yield* wait(4);
+  } else {
+    for (let i = 0; i < 3; i++) {
+      const kind = pick(['explorer', 'cruiser', 'shuttle']), d = coin();
+      const s = new Ship(kind, { x: wh.x, y: wh.y, facing: d, vx: d * rand(25, 35), vy: rand(-12, 12), leaving: true });
+      s.hp = Math.max(1, Math.ceil(s.def.hp * 0.4)); s.shields = 0;
+      actors.push(s);
+      addFlash(wh.x, wh.y, '#e0c0ff');
+      yield* wait(1.2);
+    }
+  }
+  while (wh.open > 0) wh.open = Math.max(0, wh.open - (yield) / 2.5);
+  fx.dur = 0;
+  yield* until(() => actors.every(a => a.dead), 60);
+}
+
+function* blackhole() {
+  let x, y, tries = 0;
+  do { x = rand(W * 0.2, W * 0.8); y = rand(H * 0.2, H * 0.75); } while (Math.hypot(x - planet.x, y - planet.y) < planet.r * 4 && ++tries < 20);
+  const hole = (world.hole = { x, y, str: 0, r: 4, GM: 0 });
+  const disk = Array.from({ length: 160 }, () => ({ a: rand(0, 6.283), r: rand(6, 30) }));
+  const DCOL = ['#fff4d0', '#ffd27a', '#ff9a3a', '#e0482a', '#8a2a5a'];
+  const drawDisk = back => {
+    for (const p of disk) {
+      if ((Math.sin(p.a) < 0) !== back) continue;
+      const X = Math.round(x + Math.cos(p.a) * p.r * hole.str), Y = Math.round(y + Math.sin(p.a) * p.r * 0.32 * hole.str);
+      const ci = clamp(Math.floor(((p.r - 5) / 26) * DCOL.length), 0, DCOL.length - 1);
+      ctx.globalAlpha = Math.cos(p.a) > 0 ? 1 : 0.6; // brighter on the approaching side
+      px(X, Y, DCOL[ci]);
+    }
+    ctx.globalAlpha = 1;
+  };
+  const fx = addFx({
+    layer: 'mid', dur: 1e9, draw() {
+      if (hole.str <= 0) return;
+      drawDisk(true);
+      const r = hole.r * hole.str, R = Math.ceil(r) + 1;
+      for (let j = -R; j <= R; j++) for (let i = -R; i <= R; i++) {
+        const d = Math.hypot(i, j);
+        if (d <= r) px(x + i, y + j, '#000000');
+        else if (d <= r + 1.2 && bayer(i + 40, j + 40) < 0.7) px(x + i, y + j, Math.floor(world.t * 8 + i) % 3 ? '#ffd27a' : '#ffffff');
+      }
+      drawDisk(false);
+    },
+  });
+  let t = 0, rocksSent = false, shipSent = false;
+  while (t < 34) {
+    const dt = yield; t += dt;
+    hole.str = t < 4 ? t / 4 : t > 31 ? Math.max(0, (34 - t) / 3) : 1;
+    hole.GM = 2600 * hole.str;
+    for (const p of disk) {
+      p.a += Math.sqrt(2600 / Math.pow(p.r + 2, 3)) * 3 * dt;
+      p.r -= dt * (0.8 + 12 / p.r);
+      if (p.r < hole.r + 1) { p.r = rand(22, 32); p.a = rand(0, 6.283); }
+    }
+    if (!rocksSent && t > 7) {
+      rocksSent = true;
+      const side = x < W / 2 ? -1 : 1;
+      for (let i = 0; i < 5; i++) new Rock(side < 0 ? -10 - i * 16 : W + 10 + i * 16, y + coin() * rand(25, 45), -side * rand(14, 20), rand(-2, 2), randi(2, 4));
+    }
+    if (!shipSent && t > 15) {
+      shipSent = true;
+      const d = coin(), kind = pick(['shuttle', 'freighter', 'explorer']);
+      const s = new Ship(kind, { x: enterX(d, kind), y: clamp(y + coin() * rand(30, 45), 12, H - 12), facing: d, vx: d * 32 });
+      s.gravK = 1;
+      s.brain = s => {
+        if (onScreen(s)) s.leaving = true;
+        if (Math.abs(s.x - x) < 70 && chance(0.5)) addPart(s.x - s.facing * s.w / 2, s.y, -s.facing * rand(10, 25), rand(-3, 3), 0.4, '#ffd28a', { drag: 0.3 });
+        if ((s.x - x) * d > 30) s.warpOut();
+      };
+    }
+  }
+  addFlash(x, y, '#ffe8b0', 1.5);
+  for (let i = 0; i < 60; i++) { const a = rand(0, 6.283), sp = rand(10, 30); addPart(x, y, Math.cos(a) * sp, Math.sin(a) * sp, rand(0.5, 1.5), DCOL, { drag: 0.4 }); }
+  world.hole = null; fx.dur = 0;
+}
+
+function* whale() {
+  const wl = new Whale(coin(), rand(H * 0.3, H * 0.65));
+  if (chance(0.5)) {
+    yield* wait(7);
+    const s = new Ship('shuttle', { x: enterX(wl.dir, 'shuttle'), y: wl.y - 25, facing: wl.dir, vx: wl.dir * 20 });
+    s.brain = s => { if (onScreen(s)) s.leaving = true; s.target = { x: wl.x - wl.dir * 45, y: wl.y - 22 }; s.maxSpeed = 16; };
+    yield* wait(14);
+    goOff(s, wl.dir);
+  }
+  yield* until(() => wl.dead, 90);
+}
+
+function* armada() {
+  const dir = coin(), n = randi(8, 12), cx = W * rand(0.35, 0.65), cy = H * rand(0.35, 0.6), klingon = chance(0.3), ships = [];
+  for (let i = 0; i < n; i++) {
+    const row = i % 3, col = Math.floor(i / 3);
+    const kind = klingon ? 'raider' : pick(['cruiser', 'explorer', 'explorer', 'cruiser', 'shuttle']);
+    const x = clamp(cx + dir * (1.5 - col) * 44 + (row % 2) * 10, 20, W - 20), y = clamp(cy + (row - 1) * 30, 15, H - 15);
+    const s = new Ship(kind, { x, y, facing: dir, warpIn: !klingon, cloak: klingon ? 1 : 0, cloakTarget: 0 });
+    s.brain = s => { s.target = { x, y: y + Math.sin(s.age * 0.8 + i) * 2 }; s.maxSpeed = 6; };
+    ships.push(s);
+    yield* wait(rand(0.2, 0.45));
+  }
+  yield* wait(5);
+  ships.sort((a, b) => (b.x - a.x) * dir);
+  for (const s of ships) { s.brain = null; s.target = null; s.vx = dir * 5; s.warpOut(); yield* wait(0.08); }
+  yield* until(() => ships.every(s => s.dead), 10);
+}
+
+// ---------------------------------------------------------------- director
+const COMMON = { battle: 3, chase: 3, orbit: 2, fleet: 2, asteroids: 2, borg: 1.2 };
+const RARE = { supernova: 1, wormhole: 1, blackhole: 1, whale: 1, armada: 1 };
+const EVENTS = { battle, chase, orbit, fleet, asteroids, borg, supernova, wormhole, blackhole, whale, armada };
+const ALL = Object.keys(EVENTS);
+const AMBIENT_OK = new Set(['orbit', 'supernova', 'whale', 'wormhole']);
+const director = { cur: null, name: '', cool: 6, flyT: 3, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 3 : rand(10, 24); }
+  } else if ((director.cool -= dt) <= 0) {
+    let name;
+    if (FORCE) name = FORCE === 'all' ? ALL[director.idx++ % ALL.length] : FORCE;
+    else do { name = chance(0.15) ? weighted(RARE) : weighted(COMMON); } while (name === director.last);
+    if (!EVENTS[name]) return;
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; }
+  }
+  if ((director.flyT -= dt) <= 0) {
+    director.flyT = rand(5, 10);
+    if (!FORCE && (!director.cur || AMBIENT_OK.has(director.name)) && world.ships.length < 4) flyby();
+  }
+}
+
+// ---------------------------------------------------------------- main loop
+function update(dt) {
+  world.t += dt;
+  planet.rot += dt * 0.05;
+  if ((planet.redraw -= dt) <= 0) { planet.redraw = 0.25; renderPlanet(); }
+  moon.a += dt * 0.05;
+  runDirector(dt);
+  if ((nextComet -= dt) <= 0) { spawnComet(false); nextComet = rand(12, 30); }
+  if ((nextShooting -= dt) <= 0) { spawnComet(true); nextShooting = rand(3, 9); }
+  updateSky(dt);
+  for (const s of [...world.ships]) s.update(dt);
+  for (const r of [...world.rocks]) r.update(dt);
+  physics();
+  for (const s of [...world.shots]) s.update(dt);
+  for (const e of world.ents) e.update(dt);
+  const h = world.hole;
+  for (const p of world.parts) {
+    p.life -= dt;
+    if (p.drag !== 1) { const k = Math.pow(p.drag, dt); p.vx *= k; p.vy *= k; }
+    if (p.grav && h) {
+      const g = gravityAt(p.x, p.y);
+      if (g) { p.vx += g.x * dt; p.vy += g.y * dt; if (g.d < h.r + 1) p.life = 0; }
+    }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const f of world.fx) f.t += dt;
+  world.ships = world.ships.filter(s => !s.dead);
+  world.rocks = world.rocks.filter(r => !r.dead);
+  world.shots = world.shots.filter(s => !s.dead);
+  world.ents = world.ents.filter(e => !e.dead);
+  world.parts = world.parts.filter(p => p.life > 0);
+  world.fx = world.fx.filter(f => f.t <= f.dur);
+  world.flash = Math.max(0, world.flash - dt * 1.2);
+}
+function drawFx(layer) { for (const f of world.fx) if (f.layer === layer && f.t >= 0) f.draw(f); }
+function render(dt) {
+  ctx.drawImage(backdrop, 0, 0);
+  drawFx('far');
+  drawStars(dt);
+  drawComets(dt);
+  const m = moonPos();
+  for (const s of world.ships) if (s.layer === 'back') s.draw();
+  if (m.back) drawMoon();
+  drawPlanet();
+  if (!m.back) drawMoon();
+  drawFx('mid');
+  for (const r of world.rocks) r.draw();
+  for (const e of world.ents) e.draw();
+  for (const s of world.ships) if (s.layer !== 'back') s.draw();
+  for (const s of world.shots) s.draw();
+  for (const p of world.parts) {
+    const k = p.life / p.max, X = Math.round(p.x), Y = Math.round(p.y);
+    if (p.fade && k < 0.5 && bayer(X, Y) > k * 2) continue;
+    ctx.fillStyle = Array.isArray(p.col) ? p.col[Math.min(p.col.length - 1, Math.floor((1 - k) * p.col.length))] : p.col;
+    ctx.fillRect(X, Y, p.size, p.size);
+  }
+  drawFx('front');
+  if (world.flash > 0.01) { ctx.globalAlpha = world.flash * 0.5; ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  if (DEBUG) {
+    ctx.fillStyle = '#fff'; ctx.font = '8px monospace';
+    ctx.fillText(`${director.name || '-'}  ships:${world.ships.length} rocks:${world.rocks.length} parts:${world.parts.length}`, 3, 9);
+  }
+}
+function resize() {
+  H = ROWS;
+  W = Math.round((ROWS * innerWidth) / innerHeight);
+  canvas.width = W; canvas.height = H;
+  ctx.imageSmoothingEnabled = false;
+  planet.r = Math.round(H * 0.085);
+  planet.x = Math.round(W * rand(0.66, 0.82));
+  planet.y = Math.round(H * rand(0.56, 0.72));
+  planet.img = null;
+  buildBackdrop(); buildStars(); renderPlanet(); renderMoon();
+}
+addEventListener('resize', resize);
+resize();
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  try { update(dt); render(dt); } catch (e) { console.error(e); }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

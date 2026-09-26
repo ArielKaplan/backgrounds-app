@@ -1,0 +1,1985 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel City Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #2a2a32; }
+  canvas { position: absolute; left: 0; top: 0; display: block; image-rendering: pixelated; will-change: transform; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL CITY — a slow flyover of a living city grid
+   The camera glides across the whole city for ~10 minutes, then glides back.
+   Options (add to the end of the address):
+     #pixels=200        vertical resolution in big pixels (smaller = zoomed in)
+     #at=0.4            start part-way along the route (0 to 1)
+     #pan=3             pan faster (1 = normal ~10 minute trip)
+     #event=parade      test mode: repeat one event (or "all")
+     #time=night        lock the time of day: day dusk night
+     #speed=3           run time faster (for testing)
+     #debug             show debug info
+   Events: taxi fire performer pigeons delivery dogs foodtruck picnic ferry helicopter
+   Rare:   parade marathon snow chase fireworks
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const ROWS = parseInt(params.get('pixels')) || 200;
+const FORCE = params.get('event');
+const TIME_LOCK = params.get('time');
+const TIME_SCALE = parseFloat(params.get('speed')) || 1;
+const PAN = parseFloat(params.get('pan')) || 1;
+const START_AT = parseFloat(params.get('at')) || 0;
+const DEBUG = params.has('debug');
+const FPS = 30;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let VW, VH;
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const coin = () => (Math.random() < 0.5 ? 1 : -1);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+function mk(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+function mixHex(a, b, t) { const A = hexRgb(a), B = hexRgb(b); return `rgb(${A.map((v, i) => Math.round(v + (B[i] - v) * t))})`; }
+function shade(hex, k) { const A = hexRgb(hex); return `rgb(${A.map(v => clamp(Math.round(v * k), 0, 255))})`; }
+function hash(a, b, c = 0) { let h = (a * 374761393 + b * 668265263 + c * 982451653) | 0; h = (h ^ (h >>> 13)) * 1274126177; return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+function rng(seed) { let s = (seed * 4294967296) >>> 0 || 1; return () => { s = (s + 0x6d2b79f5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+// ---------------------------------------------------------------- pixel font (3x5)
+const FONT = {
+  A: '.X.X.XXXXX.XX.X', B: 'XX.X.XXX.X.XXX.', C: '.XXX..X..X...XX', D: 'XX.X.XX.XX.XXX.', E: 'XXXX..XX.X..XXX', F: 'XXXX..XX.X..X..',
+  G: '.XXX..X.XX.X.XX', H: 'X.XX.XXXXX.XX.X', I: 'XXX.X..X..X.XXX', J: '..X..X..XX.X.X.', K: 'X.XX.XXX.X.XX.X', L: 'X..X..X..X..XXX',
+  M: 'X.XXXXXXXX.XX.X', N: 'XX.X.XX.XX.XX.X', O: '.X.X.XX.XX.X.X.', P: 'XX.X.XXX.X..X..', Q: '.X.X.XX.XXX..XX', R: 'XX.X.XXX.X.XX.X',
+  S: '.XXX...X...XXX.', T: 'XXX.X..X..X..X.', U: 'X.XX.XX.XX.XXXX', V: 'X.XX.XX.XX.X.X.', W: 'X.XX.XXXXXXXX.X', X: 'X.XX.X.X.X.XX.X',
+  Y: 'X.XX.X.X..X..X.', Z: 'XXX..X.X.X..XXX', 0: 'XXXX.XX.XX.XXXX', 1: '.X.XX..X..X.XXX', 2: 'XX...X.X.X..XXX', 3: 'XX...X.X...XXX.',
+  4: 'X.XX.XXXX..X..X', 5: 'XXXX..XX...XXX.', 6: '.XXX..XXXX.XXXX', 7: 'XXX..X.X..X..X.', 8: 'XXXX.XXXXX.XXXX', 9: 'XXXX.XXXX..XXX.',
+  '!': '.X..X..X.....X.', '-': '......XXX......', ':': '....X.....X....', '.': '.............X.', "'": '.X..X..........', ' ': '...............',
+  '?': 'XX...X.X.....X.', '&': '.X.X.X.X.X.X.XX', '♥': '...X.XXXX.X....',
+};
+const textW = s => s.length * 4 - 1;
+function text(str, x, y, col = '#ffffff', shadow = '#1a1a22', g = ctx) {
+  str = String(str).toUpperCase();
+  const draw = (ox, oy, c) => { g.fillStyle = c; for (let i = 0; i < str.length; i++) { const gl = FONT[str[i]] || FONT['?']; for (let k = 0; k < 15; k++) if (gl[k] === 'X') g.fillRect(Math.round(x + ox + i * 4 + (k % 3)), Math.round(y + oy + Math.floor(k / 3)), 1, 1); } };
+  if (shadow) draw(1, 1, shadow);
+  draw(0, 0, col);
+}
+
+// ---------------------------------------------------------------- city layout
+const AW = 14, SW = 9, BW = 56, BH = 26, PX = BW + AW, PY = BH + SW;
+const NA = 16, NS = 80;                         // avenues 0..15, streets 0..79
+const LAND_W = (NA - 1) * PX + AW, LAND_H = (NS - 1) * PY + SW;
+const WATER = 110, WX0 = -WATER, WX1 = LAND_W + WATER;
+const PARK = { c0: 5, c1: 7, r0: 18, r1: 42 };
+const PLAZA = { c0: 6, c1: 7, r: 49 };
+const BRIDGE_ST = 66;
+const CONSTRUCTION = [[3, 52], [11, 62], [9, 12]];
+const AX = i => i * PX, SY = j => j * PY;
+const blockX = c => c * PX + AW, blockY = r => r * PY + SW;
+PARK.x0 = blockX(PARK.c0); PARK.x1 = blockX(PARK.c1) + BW; PARK.y0 = blockY(PARK.r0); PARK.y1 = blockY(PARK.r1) + BH;
+const inPark = (c, r) => c >= PARK.c0 && c <= PARK.c1 && r >= PARK.r0 && r <= PARK.r1;
+const inPlaza = (c, r) => r === PLAZA.r && c >= PLAZA.c0 && c <= PLAZA.c1;
+const isConstruction = (c, r) => CONSTRUCTION.some(([a, b]) => a === c && b === r);
+// avenue i exists at world y?  street j exists at world x?
+const avenueAt = (i, y) => !(i > PARK.c0 && i <= PARK.c1 && y > PARK.y0 - 1 && y < PARK.y1 + 1) && y >= -80 && y <= LAND_H + 80;   // avenues run off the top/bottom of the map (always off-screen)
+const streetAt = (j, x) => !(j > PARK.r0 && j <= PARK.r1 && x > PARK.x0 - 1 && x < PARK.x1 + 1) && (x >= 0 && x <= LAND_W || (j === BRIDGE_ST && x > LAND_W && x <= WX1 + 40));
+function district(r) { return r < 45 ? 'uptown' : r < 58 ? 'midtown' : r < 72 ? 'downtown' : 'financial'; }
+function districtName(x, y) {
+  if (x < 0) return 'WEST RIVER'; if (x > LAND_W) return y > SY(BRIDGE_ST) - 60 && y < SY(BRIDGE_ST) + 60 ? 'THE BRIDGE' : 'EAST RIVER';
+  if (x > PARK.x0 && x < PARK.x1 && y > PARK.y0 && y < PARK.y1) return 'THE PARK';
+  const r = Math.floor(y / PY), c = Math.floor(x / PX);
+  if (r === PLAZA.r && c >= PLAZA.c0 - 1 && c <= PLAZA.c1 + 1) return 'NEON SQUARE';
+  return { uptown: 'UPTOWN', midtown: 'MIDTOWN', downtown: 'DOWNTOWN', financial: 'FINANCIAL DISTRICT' }[district(r)];
+}
+
+// ---------------------------------------------------------------- buildings per block (deterministic)
+const ROOFS = {
+  uptown: ['#8a5a4a', '#a0664a', '#9a8070', '#7a6a64', '#8c7258', '#a88a6a'],
+  midtown: ['#8a94a4', '#6a7a8c', '#a8b0b8', '#5a6474', '#9aa4ac', '#788494'],
+  downtown: ['#9a5a44', '#7a6a60', '#8a8a88', '#a07a5a', '#6a6a70'],
+  financial: ['#7a8494', '#5a6a7a', '#c8ccd4', '#8a96a8', '#4e5a6a'],
+};
+const HEIGHTS = { uptown: [4, 9], midtown: [16, 60], downtown: [6, 34], financial: [26, 72] };
+const blockCache = new Map();
+function blockBuildings(c, r) {
+  const key = c + ',' + r;
+  if (blockCache.has(key)) return blockCache.get(key);
+  const R = rng(hash(c, r, 7)), d = district(r), [h0, h1] = HEIGHTS[d], out = { lots: [], trees: [], lights: [] };
+  const x0 = blockX(c) + 3, y0 = blockY(r) + 3, w = BW - 6, dep = BH - 6;
+  if (inPark(c, r) || inPlaza(c, r) || c < 0 || c >= NA - 1 || r < 0 || r >= NS - 1) { blockCache.set(key, out); return out; }
+  if (isConstruction(c, r)) { out.construction = { x: x0, y: y0, w, h: dep }; blockCache.set(key, out); return out; }
+  if (LANDMARKS[key]) { out.lots.push(LANDMARKS[key](x0, y0, w, dep)); blockCache.set(key, out); return out; }
+  let x = x0;
+  while (x < x0 + w - 3) {
+    let lw = d === 'uptown' ? Math.floor(5 + R() * 5) : Math.floor(10 + R() * 18);
+    if (x + lw > x0 + w - 4) lw = x0 + w - x;
+    const tall = Math.round(h0 + Math.pow(R(), d === 'uptown' ? 1 : 1.6) * (h1 - h0));
+    if (d !== 'uptown' && R() < 0.35 && lw > 12) {
+      const split = Math.floor(dep / 2);
+      out.lots.push({ x, y: y0, w: lw, h: split, ht: tall, col: pick2(R, ROOFS[d]), R: R() });
+      out.lots.push({ x, y: y0 + split, w: lw, h: dep - split, ht: Math.round(tall * (0.4 + R() * 0.6)), col: pick2(R, ROOFS[d]), R: R() });
+    } else out.lots.push({ x, y: y0, w: lw, h: dep, ht: tall, col: pick2(R, ROOFS[d]), R: R() });
+    x += lw;
+  }
+  for (const L of out.lots) makeTiers(L, d);
+  if (d === 'uptown' || d === 'downtown') {
+    for (let k = 0; k < (d === 'uptown' ? 5 : 2); k++) {
+      const side = Math.floor(R() * 2);
+      out.trees.push({ x: blockX(c) + 4 + R() * (BW - 8), y: side ? blockY(r) + 1.5 : blockY(r) + BH - 1.5, r: 2 + R() * 1.2 });
+    }
+  }
+  blockCache.set(key, out);
+  return out;
+}
+function pick2(R, arr) { return arr[Math.floor(R() * arr.length)]; }
+
+// park layout (paths, lake, lawns, trees) — deterministic per session
+const parkData = { paths: [], trees: [], lake: null, lawn: null, fields: [], fountain: null, lamps: [] };
+function buildParkData() {
+  const P = PARK, R = rng(0.4242), pw = P.x1 - P.x0, ph = P.y1 - P.y0;
+  // perimeter loop drive
+  const loop = [];
+  const inset = 9;
+  for (let k = 0; k <= 60; k++) {
+    const u = k / 60, a = u * Math.PI * 2;
+    loop.push({ x: P.x0 + pw / 2 + Math.cos(a) * (pw / 2 - inset) * (1 + 0.04 * Math.sin(a * 5)), y: P.y0 + ph / 2 + Math.sin(a) * (ph / 2 - inset) * (1 + 0.01 * Math.cos(a * 7)) });
+  }
+  // squash the loop into a rounded rectangle
+  for (const p of loop) { const nx = (p.x - (P.x0 + pw / 2)) / (pw / 2 - inset), ny = (p.y - (P.y0 + ph / 2)) / (ph / 2 - inset); const k = Math.pow(Math.abs(nx) ** 6 + Math.abs(ny) ** 6, -1 / 6); p.x = P.x0 + pw / 2 + nx * k * (pw / 2 - inset); p.y = P.y0 + ph / 2 + ny * k * (ph / 2 - inset); }
+  parkData.paths.push({ pts: loop, closed: true, w: 4, drive: true });
+  parkData.lake = { x: P.x0 + pw * 0.45, y: P.y0 + ph * 0.36, rx: pw * 0.28, ry: 46 };
+  parkData.lawn = { x: P.x0 + pw * 0.5, y: P.y0 + ph * 0.62, rx: pw * 0.3, ry: 60 };
+  parkData.fountain = { x: P.x0 + pw * 0.5, y: P.y0 + ph * 0.23 };
+  parkData.fields = [{ x: P.x0 + pw * 0.3, y: P.y0 + ph * 0.84 }, { x: P.x0 + pw * 0.7, y: P.y0 + ph * 0.84 }];
+  // winding footpaths
+  for (let n = 0; n < 5; n++) {
+    const y = P.y0 + ph * (0.12 + n * 0.19), pts = [];
+    for (let k = 0; k <= 12; k++) pts.push({ x: P.x0 + 4 + (k / 12) * (pw - 8), y: y + Math.sin(k * 0.9 + n) * 10 });
+    parkData.paths.push({ pts, closed: false, w: 2 });
+  }
+  { const L = parkData.lake, pts = []; for (let k = 0; k <= 40; k++) { const a = (k / 40) * Math.PI * 2; pts.push({ x: L.x + Math.cos(a) * (L.rx + 7), y: L.y + Math.sin(a) * (L.ry + 7) }); } parkData.paths.push({ pts, closed: true, w: 2 }); }
+  // trees in clusters, avoiding water/lawns/paths
+  const clear = (x, y, pad) => {
+    const L = parkData.lake, G = parkData.lawn;
+    if (((x - L.x) / (L.rx + pad)) ** 2 + ((y - L.y) / (L.ry + pad)) ** 2 < 1) return false;
+    if (((x - G.x) / (G.rx + pad)) ** 2 + ((y - G.y) / (G.ry + pad)) ** 2 < 1) return false;
+    if (parkData.fields.some(f => Math.abs(f.x - x) < 26 + pad && Math.abs(f.y - y) < 26 + pad)) return false;
+    if (Math.hypot(parkData.fountain.x - x, parkData.fountain.y - y) < 16 + pad) return false;
+    for (const p of parkData.paths) for (const q of p.pts) if (Math.hypot(q.x - x, q.y - y) < p.w + pad + 2) return false;
+    return x > P.x0 + 3 && x < P.x1 - 3 && y > P.y0 + 3 && y < P.y1 - 3;
+  };
+  for (let n = 0; n < 700; n++) {
+    const x = P.x0 + R() * pw, y = P.y0 + R() * ph, r = 2.5 + R() * 3;
+    if (clear(x, y, r) && (noiseish(x, y) > 0.35 || R() < 0.15)) parkData.trees.push({ x, y, r, c: R() });
+  }
+  for (const p of parkData.paths) for (let k = 0; k < p.pts.length; k += p.drive ? 4 : 3) parkData.lamps.push({ x: p.pts[k].x + 3, y: p.pts[k].y });
+}
+function noiseish(x, y) { return (Math.sin(x * 0.05) + Math.sin(y * 0.031 + 1.3) + Math.sin((x + y) * 0.021)) / 6 + 0.5; }
+const inLake = (x, y, pad = 0) => { const L = parkData.lake; return ((x - L.x) / (L.rx - pad)) ** 2 + ((y - L.y) / (L.ry - pad)) ** 2 < 1; };
+
+// ---------------------------------------------------------------- static chunk rendering
+const CH = 256, chunks = new Map(), chunkLights = new Map();
+const COL = {
+  road: '#4a4a52', road2: '#46464e', lane: '#8a8a82', cross: '#d8d8d0', walk: '#b4b0a8', walk2: '#aaa69e', curb: '#8a8680',
+  water: '#2a5a8a', water2: '#2f6494', grass: '#6aa84a', grass2: '#5e9c42', path: '#d8c8a0', sand: '#c8a878',
+};
+function getChunk(cx, cy) {
+  const key = cx + ',' + cy;
+  let c = chunks.get(key);
+  if (!c) { c = buildChunk(cx, cy); chunks.set(key, c); }
+  return c;
+}
+function buildChunk(cx, cy) {
+  const cv = mk(CH, CH), g = cv.getContext('2d'), ox = cx * CH + WX0, oy = cy * CH, lights = [];
+  g.translate(-ox, -oy);
+  const R = (x, y, w, h, col) => { g.fillStyle = col; g.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); };
+  // water everywhere, then land
+  R(ox, oy, CH, CH, COL.water);
+  for (let y = oy; y < oy + CH; y += 2) for (let x = ox; x < ox + CH; x += 3) if (hash(x, y, 3) < 0.06) R(x, y, 2, 1, COL.water2);
+  R(-12, 0, LAND_W + 24, LAND_H, COL.walk);                       // esplanades
+  for (let y = 0; y < LAND_H; y += 2) { R(-12, y, 1, 1, '#6a6a70'); R(LAND_W + 11, y, 1, 1, '#6a6a70'); }
+  R(0, 0, LAND_W, LAND_H, COL.road);
+  // piers
+  for (let j = 4; j < NS; j += 9) {
+    const y = SY(j) + 8;
+    if (oy > y + 30 || oy + CH < y - 10) continue;
+    for (const side of [-1, 1]) {
+      if (side > 0 && Math.abs(j - BRIDGE_ST) < 5) continue;
+      const px0 = side < 0 ? -84 : LAND_W + 12, pw = 72;
+      R(px0, y, pw, 14, '#8a7a6a'); R(px0, y, pw, 1, '#a89a88'); R(px0, y + 13, pw, 1, '#5a4a3a');
+      R(px0 + (side < 0 ? 8 : 40), y + 3, 22, 8, '#6a7a8a'); R(px0 + (side < 0 ? 8 : 40), y + 3, 22, 1, '#8a9aaa');
+      for (let k = 0; k < pw; k += 6) R(px0 + k, y + 14, 1, 2, '#4a3a2a');
+      lights.push({ x: px0 + (side < 0 ? 4 : pw - 4), y: y + 7, c: '#ffe8a0', r: 4 });
+    }
+  }
+  // bridge
+  { const by = SY(BRIDGE_ST) - 3;
+    R(LAND_W, by, WX1 - LAND_W + 60, SW + 6, '#6a6a70'); R(LAND_W, by, WX1 - LAND_W + 60, 1, '#9a9aa0'); R(LAND_W, by + SW + 5, WX1 - LAND_W + 60, 1, '#3a3a40');
+    for (let x = LAND_W; x < WX1 + 60; x += 4) { R(x, by + 1, 2, 1, '#c8c8d0'); R(x, by + SW + 4, 2, 1, '#c8c8d0'); }
+    for (let x = LAND_W; x < WX1 + 60; x += 6) R(x, by + 3 + Math.floor(SW / 2), 3, 1, '#c8b040');
+    for (const tx of [LAND_W + 40, LAND_W + 100]) { R(tx, by - 4, 6, SW + 14, '#8a8a92'); R(tx, by - 4, 6, 1, '#b0b0b8'); lights.push({ x: tx + 3, y: by - 3, c: '#ff4a4a', r: 3, blink: true }); }
+    for (let x = LAND_W + 4; x < WX1 + 60; x += 12) { lights.push({ x, y: by, c: '#ffe8a0', r: 3 }); lights.push({ x, y: by + SW + 5, c: '#ffe8a0', r: 3 }); } }
+  // blocks (sidewalks) + lane markings
+  const c0 = Math.floor((ox - 60) / PX), c1 = Math.ceil((ox + CH + 60) / PX), r0 = Math.floor((oy - 60) / PY), r1 = Math.ceil((oy + CH + 60) / PY);
+  for (let r = Math.max(0, r0); r <= Math.min(NS - 2, r1); r++) for (let c = Math.max(0, c0); c <= Math.min(NA - 2, c1); c++) {
+    if (inPark(c, r)) continue;
+    const x = blockX(c), y = blockY(r);
+    R(x, y, BW, BH, COL.walk);
+    R(x, y, BW, 1, COL.curb); R(x, y + BH - 1, BW, 1, COL.curb); R(x, y, 1, BH, COL.curb); R(x + BW - 1, y, 1, BH, COL.curb);
+    for (let k = 3; k < BW; k += 4) R(x + k, y + 2, 1, 1, COL.walk2), R(x + k, y + BH - 3, 1, 1, COL.walk2);
+    if (inPlaza(c, r)) { R(x + 2, y + 2, BW - 4, BH - 4, '#b88a82'); for (let yy = y + 2; yy < y + BH - 2; yy += 3) for (let xx = x + 2; xx < x + BW - 2; xx += 3) if ((xx + yy) % 2) R(xx, yy, 1, 1, '#a87a72'); }
+  }
+  // park block
+  if (ox < PARK.x1 + 20 && ox + CH > PARK.x0 - 20 && oy < PARK.y1 + 20 && oy + CH > PARK.y0 - 20) drawParkStatic(g, R, lights);
+  // lane markings + crosswalks + stop lines
+  for (let i = Math.max(0, c0); i <= Math.min(NA - 1, c1 + 1); i++) {
+    const x = AX(i);
+    for (let y = Math.max(0, oy - 4); y < Math.min(LAND_H, oy + CH + 4); y += 1) {
+      if (!avenueAt(i, y)) continue;
+      const j = Math.floor(y / PY), inX = (y - SY(j)) < SW;
+      if (inX) continue;
+      if (y % 7 < 3) { R(x + 5, y, 1, 1, COL.lane); R(x + 9, y, 1, 1, COL.lane); }
+    }
+  }
+  for (let j = Math.max(0, r0); j <= Math.min(NS - 1, r1 + 1); j++) {
+    const y = SY(j);
+    for (let x = Math.max(0, ox - 4); x < Math.min(j === BRIDGE_ST ? WX1 + 60 : LAND_W, ox + CH + 4); x++) {
+      if (!streetAt(j, x)) continue;
+      const i = Math.floor(x / PX);
+      if (x < LAND_W && (x - AX(i)) < AW) continue;
+      if (x % 7 < 3) R(x, y + 4, 1, 1, j === BRIDGE_ST ? '#c8b040' : COL.lane);
+    }
+    for (let i = Math.max(0, c0); i <= Math.min(NA - 1, c1 + 1); i++) {
+      const X = AX(i);
+      if (!avenueAt(i, y + 4) || !streetAt(j, X + 7)) continue;
+      // crosswalks across the avenue (north and south of the street)
+      for (let k = 1; k < AW; k += 2) { if (avenueAt(i, y - 2)) R(X + k, y - 3, 1, 3, COL.cross); if (avenueAt(i, y + SW + 2)) R(X + k, y + SW, 1, 3, COL.cross); }
+      // crosswalks across the street (west and east of the avenue)
+      for (let k = 1; k < SW; k += 2) { if (streetAt(j, X - 2)) R(X - 3, y + k, 3, 1, COL.cross); if (streetAt(j, X + AW + 2)) R(X + AW, y + k, 3, 1, COL.cross); }
+      lights.push({ x: X - 1, y: y - 1, c: '#fff0c0', r: 7, street: true }, { x: X + AW, y: y + SW, c: '#fff0c0', r: 7, street: true });
+    }
+  }
+  // buildings: shadows, then roofs (lowest first), with taller neighbours shading lower roofs
+  const lots = [], trees = [];
+  for (let r = Math.max(0, r0); r <= Math.min(NS - 2, r1); r++) for (let c = Math.max(0, c0); c <= Math.min(NA - 2, c1); c++) {
+    const B = blockBuildings(c, r);
+    lots.push(...B.lots); trees.push(...B.trees);
+    if (B.construction) drawConstructionStatic(g, R, B.construction);
+  }
+  const sweep = (path, x, y, w, h, ht) => { const sx = ht * 0.22, sy = ht * 0.3, n = Math.max(1, Math.ceil(Math.max(sx, sy))); for (let k = 0; k <= n; k++) path.rect(Math.round(x + (sx * k) / n), Math.round(y + (sy * k) / n), w, h); };
+  g.beginPath();
+  for (const L of lots) sweep(g, L.x, L.y, L.w, L.h, L.ht);
+  for (const t of trees) sweep(g, t.x - t.r, t.y - t.r, t.r * 2, t.r * 2, 6);
+  g.globalAlpha = 0.34; g.fillStyle = '#10101e'; g.fill(); g.globalAlpha = 1;
+  // (buildings themselves are drawn in 3D every frame — see drawBuildings)
+  for (const t of trees) drawTree(g, R, t.x, t.y, t.r, 0.5);
+  chunkLights.set(cx + ',' + cy, lights);
+  return cv;
+}
+function drawRoof(g, R, L, lights) {
+  const { x, y, w, h, ht, col } = L, Rr = rng(L.R);
+  R(x, y, w, h, col);
+  R(x, y, w, 1, shade(col, 1.25)); R(x, y, 1, h, shade(col, 1.18)); R(x, y + h - 1, w, 1, shade(col, 0.75)); R(x + w - 1, y, 1, h, shade(col, 0.8));
+  if (ht > 30 && w > 10 && h > 10) {                              // setback towers
+    R(x + 2, y + 2, w - 4, h - 4, shade(col, 1.12)); R(x + 2, y + 2, w - 4, 1, shade(col, 1.35));
+    if (ht > 45 && w > 16 && h > 14) {
+      R(x + 5, y + 5, w - 10, h - 10, shade(col, 1.22));
+      if (Rr() < 0.4 && w > 18) { const cx = x + w / 2, cy = y + h / 2; R(cx - 3, cy - 3, 7, 7, '#5a5a62'); for (const [a, b] of [[-1, -2], [-1, -1], [-1, 0], [-1, 1], [-1, 2], [1, -2], [1, -1], [1, 0], [1, 1], [1, 2], [0, 0]]) R(cx + a, cy + b, 1, 1, '#e8e8e0'); }
+      else R(x + w / 2, y + h / 2, 1, 1, '#e8e8f0');
+      lights.push({ x: x + w / 2, y: y + h / 2, c: '#ff3a3a', r: 3, blink: true });
+    }
+  }
+  const n = Math.floor((w * h) / 90) + 1;
+  for (let k = 0; k < n; k++) {
+    const t = Rr(), dx = x + 2 + Rr() * Math.max(1, w - 6), dy = y + 2 + Rr() * Math.max(1, h - 6);
+    if (t < 0.3) { R(dx, dy, 2, 1, '#c8c8c8'); R(dx, dy + 1, 2, 1, '#8a8a8a'); }                         // AC unit
+    else if (t < 0.45) { R(dx, dy, 3, 3, shade(col, 0.7)); R(dx, dy, 3, 1, shade(col, 0.9)); }          // stair bulkhead
+    else if (t < 0.55) { R(dx, dy, 3, 2, '#8ac8e0'); R(dx, dy, 1, 1, '#d8f4ff'); }                       // skylight
+    else if (t < 0.63 && ht < 30) { R(dx, dy, 4, 3, '#5a9a4a'); R(dx + 1, dy, 1, 1, '#8ad06a'); R(dx + 3, dy + 2, 1, 1, '#e86a8a'); } // rooftop garden
+    else if (t < 0.7) { for (let a = 0; a < 3; a++) R(dx + a * 2, dy, 1, 3, '#2a3a6a'); }                  // solar panels
+  }
+  if (ht >= 6 && ht <= 30 && Rr() < 0.45 && w >= 6 && h >= 6) {                                           // water tower
+    const tx = x + 2 + Math.floor(Rr() * (w - 5)), ty = y + 2 + Math.floor(Rr() * (h - 5));
+    R(tx - 1, ty - 1, 5, 5, '#3a2a20'); R(tx, ty - 2, 3, 1, '#7a5030'); R(tx - 2, ty, 1, 3, '#7a5030'); R(tx, ty, 3, 3, '#8a5a36'); R(tx + 1, ty + 1, 1, 1, '#b07a4a'); R(tx, ty, 1, 1, '#a06a40');
+  }
+  if (Rr() < 0.25) lights.push({ x: x + 1 + Rr() * (w - 2), y: y + 1 + Rr() * (h - 2), c: '#ffe08a', r: 2 });
+}
+function drawTree(g, R, x, y, r, dark) {
+  x = Math.round(x); y = Math.round(y); const rr = Math.ceil(r);
+  for (let dy = -rr; dy <= rr; dy++) for (let dx = -rr; dx <= rr; dx++) {
+    const q = (dx * dx + dy * dy) / (r * r); if (q > 1) continue;
+    const l = (dx + dy) / r + bayer(dx + 16, dy + 16) * 0.6;
+    R(x + dx, y + dy, 1, 1, l < -0.7 ? '#8ad06a' : l < 0.4 ? '#4e9a3e' : '#3a7a34');
+  }
+}
+function drawParkStatic(g, R, lights) {
+  const P = PARK;
+  R(P.x0 - 3, P.y0 - 3, P.x1 - P.x0 + 6, P.y1 - P.y0 + 6, COL.walk);
+  R(P.x0, P.y0, P.x1 - P.x0, P.y1 - P.y0, COL.grass);
+  for (let y = P.y0; y < P.y1; y += 2) for (let x = P.x0; x < P.x1; x += 2) if (hash(x, y, 9) < 0.18) R(x, y, 1, 1, COL.grass2);
+  for (let x = P.x0; x < P.x1; x += 2) { R(x, P.y0, 1, 1, '#5a5a50'); R(x, P.y1 - 1, 1, 1, '#5a5a50'); }
+  for (let y = P.y0; y < P.y1; y += 2) { R(P.x0, y, 1, 1, '#5a5a50'); R(P.x1 - 1, y, 1, 1, '#5a5a50'); }
+  const G = parkData.lawn;
+  for (let dy = -G.ry; dy <= G.ry; dy++) for (let dx = -G.rx; dx <= G.rx; dx++) if ((dx / G.rx) ** 2 + (dy / G.ry) ** 2 < 1) R(G.x + dx, G.y + dy, 1, 1, (Math.floor((dx + dy + 400) / 6) % 2) ? '#7ab85a' : '#72b052');
+  const L = parkData.lake;
+  for (let dy = -L.ry - 3; dy <= L.ry + 3; dy++) for (let dx = -L.rx - 3; dx <= L.rx + 3; dx++) {
+    const wob = 1 + Math.sin(Math.atan2(dy, dx) * 5) * 0.05, q = (dx / (L.rx * wob)) ** 2 + (dy / (L.ry * wob)) ** 2;
+    if (q < 1) R(L.x + dx, L.y + dy, 1, 1, q > 0.85 ? '#4a8ac8' : hash(dx, dy, 4) < 0.05 ? '#5a9ad8' : '#3a7ab8');
+    else if (q < 1.18) R(L.x + dx, L.y + dy, 1, 1, hash(dx, dy, 5) < 0.5 ? '#8a8a7a' : '#a09a88');
+  }
+  R(L.x + L.rx - 4, L.y - 3, 14, 6, '#8a6a4a'); R(L.x + L.rx - 4, L.y - 3, 14, 1, '#a88a6a');                  // boathouse dock
+  for (const f of parkData.fields) {
+    R(f.x - 22, f.y - 22, 44, 44, '#7ab85a');
+    for (let k = 0; k < 16; k++) { R(f.x - 14 + k, f.y + 6 - k, 2, 2, COL.sand); R(f.x + k - 2, f.y - 10 + k, 2, 2, COL.sand); }
+    R(f.x - 3, f.y - 2, 6, 6, COL.sand); R(f.x - 1, f.y, 2, 2, '#ffffff');
+    R(f.x - 16, f.y + 7, 32, 1, '#ffffff'); R(f.x - 16, f.y - 25, 1, 32, '#ffffff');
+    for (const [a, b] of [[-14, 6], [0, -8], [14, 6], [0, 20]]) R(f.x + a, f.y + b, 2, 2, '#ffffff');
+  }
+  for (const p of parkData.paths) {
+    const col = p.drive ? '#9a9a98' : COL.path;
+    for (let k = 0; k < p.pts.length - (p.closed ? 0 : 1); k++) {
+      const a = p.pts[k], b = p.pts[(k + 1) % p.pts.length], n = Math.ceil(dist(a, b));
+      for (let s = 0; s <= n; s++) { const x = lerp(a.x, b.x, s / n), y = lerp(a.y, b.y, s / n); R(x - p.w / 2, y - p.w / 2, p.w, p.w, col); }
+    }
+  }
+  const F = parkData.fountain;
+  for (let dy = -12; dy <= 12; dy++) for (let dx = -12; dx <= 12; dx++) { const d = Math.hypot(dx, dy); if (d < 12) R(F.x + dx, F.y + dy, 1, 1, d > 10 ? '#c8b89a' : d > 6 ? '#b8a88a' : d > 5 ? '#9a9a9a' : '#4a8ac8'); }
+  R(F.x - 1, F.y - 1, 3, 3, '#e8e8e0');
+  g.beginPath();
+  for (const t of parkData.trees) { const sx = 3, sy = 4; for (let k = 0; k <= 4; k++) g.rect(Math.round(t.x - t.r + (sx * k) / 4), Math.round(t.y - t.r + (sy * k) / 4), Math.round(t.r * 2), Math.round(t.r * 2)); }
+  g.globalAlpha = 0.3; g.fillStyle = '#10201a'; g.fill(); g.globalAlpha = 1;
+  for (const t of parkData.trees) drawTree(g, R, t.x, t.y, t.r, t.c);
+  for (const l of parkData.lamps) lights.push({ x: l.x, y: l.y, c: '#fff0c0', r: 6 });
+}
+function drawConstructionStatic(g, R, C) {
+  R(C.x, C.y, C.w, C.h, '#9a7a5a');
+  for (let k = 0; k < 40; k++) R(C.x + hash(k, C.x, 1) * C.w, C.y + hash(k, C.y, 2) * C.h, 2, 1, hash(k, 3, 3) < 0.5 ? '#8a6a4a' : '#aa8a6a');
+  for (let x = C.x; x < C.x + C.w; x += 2) { R(x, C.y, 1, 1, '#e8a030'); R(x, C.y + C.h - 1, 1, 1, '#e8a030'); }
+  R(C.x + 4, C.y + 4, 8, 6, '#7a6a5a'); R(C.x + 5, C.y + 5, 6, 1, '#9a8a7a');
+  for (let k = 0; k < 4; k++) R(C.x + C.w - 18 + k * 4, C.y + C.h - 8, 3, 5, '#8a8a8a');
+  R(C.x + C.w / 2 - 12, C.y + 2, 24, 3, '#6a6a70'); for (let k = 0; k < 24; k += 3) R(C.x + C.w / 2 - 12 + k, C.y + 2, 1, 3, '#9a9aa0');
+}
+
+// ---------------------------------------------------------------- 3D buildings
+// Each building is a stack of 1px floor slices. Every slice is drawn nudged away from the camera centre in proportion
+// to its height, so walls facing the middle of the screen come into view and the perspective shifts as the camera pans.
+// Only the edge pixels of each slice show, so the slice edges carry the windows, floor lines and shop awnings.
+const LANDMARKS = {
+  '8,51': (x, y, w, h) => ({ x, y, w, h, ht: 90, hp: 80, col: '#b8b0a0', wall: '#bdb3a0', R: 0.123, style: 'stone', tiers: [{ i: 0, h: 18 }, { i: 3, h: 50 }, { i: 6, h: 70 }, { i: 8, h: 80 }], top: 'spire', spire: 20, shop: true }),
+  '3,55': (x, y, w, h) => ({ x: x + 14, y, w: w - 28, h, ht: 80, hp: 72, col: '#c8ccd4', wall: '#a8aab4', R: 0.456, style: 'stone', tiers: [{ i: 0, h: 22 }, { i: 2, h: 52 }, { i: 4, h: 64 }, { i: 5, h: 70 }], top: 'crown', spire: 14, shop: true }),
+  '9,75': (x, y, w, h) => ({ x: x + 12, y, w: w - 24, h, ht: 100, hp: 100, col: '#8aa4b8', wall: '#4e7e9c', R: 0.789, style: 'glass', tiers: [{ i: 0, h: 20 }, { i: 1, h: 60 }, { i: 3, h: 88 }, { i: 5, h: 100 }], top: 'spire', spire: 22 }),
+  '12,48': (x, y, w, h) => ({ x: x + 8, y, w: w - 16, h, ht: 70, hp: 66, col: '#6a8aa0', wall: '#3e6e8c', R: 0.321, style: 'glass', tiers: [{ i: 0, h: 66 }], top: 'helipad', spire: 0 }),
+};
+function makeTiers(L, d) {
+  const R = rng(L.R + 0.77), hp = Math.max(6, Math.round(L.ht * (d === 'uptown' ? 2.4 : 1.15)));
+  L.style = d === 'uptown' ? (R() < 0.8 ? 'brick' : 'stone') : d === 'downtown' ? (R() < 0.5 ? 'brick' : R() < 0.6 ? 'stone' : 'glass') : (R() < 0.55 ? 'glass' : 'stone');
+  const minDim = Math.min(L.w, L.h);
+  if (hp > 30 && minDim >= 10) L.tiers = [{ i: 0, h: Math.round(hp * 0.45) }, { i: Math.min(2, Math.floor(minDim / 5)), h: Math.round(hp * 0.8) }, { i: Math.min(4, Math.floor(minDim / 3.2)), h: hp }];
+  else if (hp > 18 && minDim >= 8) L.tiers = [{ i: 0, h: Math.round(hp * 0.7) }, { i: 1, h: hp }];
+  else L.tiers = [{ i: 0, h: hp }];
+  L.top = hp > 50 && R() < 0.45 ? 'spire' : hp < 32 && R() < 0.45 ? 'water' : null;
+  L.spire = 8 + Math.floor(R() * 10);
+  L.shop = d !== 'financial' && R() < 0.6;
+  L.hp = hp;
+}
+const BUILD = {
+  brick: { walls: ['#9a4a3a', '#8a5446', '#a8603a', '#7e4838', '#946050', '#b06a4a'], win: ['#2a2a36', '#3a3a48'], lit: 0.2 },
+  stone: { walls: ['#c8b89a', '#b8a888', '#a89a88', '#d0c4a8', '#bab2a4', '#9a9a9e'], win: ['#3a4a5a', '#4a5a6a'], lit: 0.18 },
+  glass: { walls: ['#4e7e9c', '#3e6e8c', '#5e8ea8', '#35607e', '#6a96ac'], win: ['#a8d8ec', '#2e4e6a'], lit: 0.25 },
+};
+const AWNINGS = ['#c83a3a', '#2e7a4a', '#e8b030', '#3a5ab8', '#8a3a8a', '#e86a2a'];
+// TILT gives a three-quarter view (every building shows its south face); FOCAL adds perspective that shifts as the camera pans
+const FOCAL = 380, LEAN = 45, TILT = 0.42;
+function buildLotGfx(L) {
+  const R = rng(L.R + 0.31), P = BUILD[L.style] || BUILD.stone, wall = L.wall || P.walls[Math.floor(R() * P.walls.length)];
+  L.gfx = L.tiers.map((T, ti) => {
+    const w = Math.max(1, L.w - 2 * T.i), h = Math.max(1, L.h - 2 * T.i), top = ti === L.tiers.length - 1;
+    const face = (x, y) => (y === 0 || x === 0 ? 1.12 : 0.78);                       // light from the north-west
+    const edge = [];
+    for (let x = 0; x < w; x++) { edge.push([x, 0, x]); if (h > 1) edge.push([x, h - 1, x]); }
+    for (let y = 1; y < h - 1; y++) { edge.push([0, y, y]); if (w > 1) edge.push([w - 1, y, y]); }
+    const slice = kind => {
+      const c = mk(w, h), g = c.getContext('2d');
+      if (kind !== 'lit') { g.fillStyle = wall; g.fillRect(0, 0, w, h); }
+      for (const [x, y, k] of edge) {
+        const corner = (x === 0 || x === w - 1) && (y === 0 || y === h - 1);
+        let col = null;
+        if (kind === 'slab') col = shade(wall, face(x, y) * 0.84);
+        else if (kind === 'win') col = corner ? shade(wall, face(x, y)) : k % 2 ? (L.style === 'glass' ? shade(P.win[0], face(x, y) * 0.95) : P.win[0]) : L.style === 'glass' ? shade(P.win[1], face(x, y) * 1.25) : shade(wall, face(x, y));
+        else if (kind === 'shop') col = corner ? shade(wall, 0.8) : AWNINGS[Math.floor(hash(L.x + Math.floor(k / 4), L.y + y, 3) * AWNINGS.length)];
+        else if (kind === 'lit') col = !corner && k % 2 && R() < P.lit ? (R() < 0.8 ? '#ffd88a' : '#fff4d0') : null;
+        if (col) { g.fillStyle = col; g.fillRect(x, y, 1, 1); }
+      }
+      return c;
+    };
+    const roof = mk(w, h), rg = roof.getContext('2d');
+    const RR = (x, y, ww, hh, col) => { rg.fillStyle = col; rg.fillRect(Math.round(x), Math.round(y), Math.round(ww), Math.round(hh)); };
+    drawRoof(rg, RR, { x: 0, y: 0, w, h, ht: top && L.top !== 'water' ? Math.min(L.ht, 30) : 5, col: top ? L.col : shade(L.col, 0.9), R: L.R + ti * 0.1 }, []);
+    if (top && L.top === 'helipad' && w > 12 && h > 12) {
+      const cx = Math.floor(w / 2), cy = Math.floor(h / 2);
+      RR(cx - 5, cy - 5, 11, 11, '#4a4a52'); RR(cx - 4, cy - 4, 9, 9, '#5a5a62');
+      for (const [a, b] of [[-2, -2], [-2, -1], [-2, 0], [-2, 1], [-2, 2], [2, -2], [2, -1], [2, 0], [2, 1], [2, 2], [-1, 0], [0, 0], [1, 0]]) RR(cx + a, cy + b, 1, 1, '#f0f0e8');
+    }
+    return { win: slice('win'), slab: slice('slab'), shop: slice('shop'), lit: slice('lit'), roof };
+  });
+}
+const LIT = [];
+let PCTX = null, PLIT = null;
+// Draw a building from a cached image; the image is only repainted when its perspective shifts by about half a pixel.
+function drawLot(L, night) {
+  if (!L.gfx) buildLotGfx(L);
+  L.used = world.t;
+  const top = L.tiers[L.tiers.length - 1].h + (L.top === 'crown' ? 9 : 0) + (L.top === 'spire' || L.top === 'crown' ? L.spire : 0) + (L.top === 'water' ? 8 : 0) + 1;
+  const step = 0.5 / top;
+  const kx = Math.round((L.x + L.w / 2 - cam.x) / FOCAL / step) * step;
+  const ky = Math.round((-TILT + ((L.y + L.h / 2 - cam.y) / FOCAL) * 0.45) / step) * step;
+  const key = kx.toFixed(5) + ',' + ky.toFixed(5) + (night ? 'n' : 'd');
+  let C = L.cache;
+  if (!C || C.key !== key) {
+    const ex = clamp(Math.round(kx * top), -LEAN, LEAN), ey = clamp(Math.round(ky * top), -LEAN, LEAN);
+    const x0 = Math.floor(L.x + Math.min(0, ex)) - 3, y0 = Math.floor(L.y + Math.min(0, ey)) - 3;
+    const w = Math.ceil(L.w + Math.abs(ex)) + 6, h = Math.ceil(L.h + Math.abs(ey)) + 6;
+    const cv = C && C.cv.width >= w && C.cv.height >= h ? C.cv : mk(w + 8, h + 8), g = cv.getContext('2d');
+    g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, cv.width, cv.height); g.translate(-x0, -y0);
+    PCTX = g; PLIT = [];
+    paintLot(L, night, kx, ky);
+    C = L.cache = { key, cv, x0, y0, lit: PLIT };
+  }
+  ctx.drawImage(C.cv, C.x0, C.y0);
+  for (let k = 0; k < C.lit.length; k += 3) LIT.push(C.lit[k], C.lit[k + 1], C.lit[k + 2]);
+}
+function paintLot(L, night, kx, ky) {
+  const ctx = PCTX, LIT = PLIT;   // paint into the building's own cache canvas
+  const ox = z => clamp(Math.round(kx * z), -LEAN, LEAN), oy = z => clamp(Math.round(ky * z), -LEAN, LEAN);
+  let z0 = 0;
+  for (let ti = 0; ti < L.tiers.length; ti++) {
+    const T = L.tiers[ti], G = L.gfx[ti], bx = L.x + T.i, by = L.y + T.i;
+    for (let z = z0; z < T.h; z++) {
+      const x = ox(z), y = oy(z);
+      if (z < T.h - 1 && ox(z + 1) === x && oy(z + 1) === y) continue;   // this floor is completely hidden by the one above
+      const img = ti === 0 && z < 2 && L.shop ? G.shop : z % 3 === 0 ? G.slab : G.win;
+      ctx.drawImage(img, bx + x, by + y);
+      if (night && img === G.win && z % 3 === 1) LIT.push(G.lit, bx + x, by + y);   // light up one floor band in three
+    }
+    ctx.drawImage(G.roof, bx + ox(T.h), by + oy(T.h));
+    z0 = T.h;
+  }
+  const T = L.tiers[L.tiers.length - 1], cx = Math.round(L.x + L.w / 2), cy = Math.round(L.y + L.h / 2);
+  if (L.top === 'water') {
+    const R = rng(L.R + 0.9), tw = L.w - 2 * T.i, th = L.h - 2 * T.i;
+    if (tw >= 6 && th >= 6) {
+      const tx = L.x + T.i + 1 + Math.floor(R() * (tw - 5)), ty = L.y + T.i + 1 + Math.floor(R() * (th - 5));
+      for (let z = T.h; z < T.h + 6; z++) { const x = tx + ox(z), y = ty + oy(z); ctx.fillStyle = z < T.h + 2 ? '#3a2a20' : z % 2 ? '#8a5a36' : '#7a5030'; ctx.fillRect(x, y + 1, 4, 2); ctx.fillRect(x + 1, y, 2, 4); }
+      const x = tx + ox(T.h + 6), y = ty + oy(T.h + 6);
+      ctx.fillStyle = '#5a3a24'; ctx.fillRect(x + 1, y + 1, 2, 2); ctx.fillStyle = '#b07a4a'; ctx.fillRect(x + 1, y + 1, 1, 1);
+    }
+  }
+  if (L.top === 'crown') {
+    for (let k = 0; k < 5; k++) {
+      const ins = T.i + 1 + k, w = L.w - 2 * ins, h = L.h - 2 * ins; if (w < 1 || h < 1) break;
+      const z = T.h + k * 2, x = L.x + ins + ox(z), y = L.y + ins + oy(z);
+      ctx.fillStyle = k % 2 ? '#eef0f6' : '#a8acb8'; ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = '#3a3a48'; for (let q = 1; q < w - 1; q += 2) ctx.fillRect(x + q, y + h - 1, 1, 1);
+    }
+  }
+  if (L.top === 'spire' || L.top === 'crown') {
+    const base = T.h + (L.top === 'crown' ? 9 : 0);
+    for (let s = 0; s < L.spire; s++) { ctx.fillStyle = s > L.spire - 3 ? '#f4f4f8' : s % 3 ? '#b8bcc8' : '#d8dce4'; ctx.fillRect(cx + ox(base + s), cy + oy(base + s), 1, 1); }
+    if (night) LIT.push(null, cx + ox(base + L.spire), cy + oy(base + L.spire));
+  } else if (night && L.hp > 45) LIT.push(null, cx + ox(T.h), cy + oy(T.h));
+}
+let gfxPurgeT = 0;
+function collectLots(v) {
+  if (world.t - gfxPurgeT > 10) {      // free building images the camera left behind a while ago
+    gfxPurgeT = world.t;
+    for (const B of blockCache.values()) for (const L of B.lots) if (L.gfx && world.t - (L.used || 0) > 40) { L.gfx = null; L.cache = null; }
+  }
+  const m = 80, list = [];
+  for (let r = Math.max(0, Math.floor((v.y0 - m) / PY)); r <= Math.min(NS - 2, Math.floor((v.y1 + m) / PY)); r++)
+    for (let c = Math.max(0, Math.floor((v.x0 - m) / PX)); c <= Math.min(NA - 2, Math.floor((v.x1 + m) / PX)); c++)
+      for (const L of blockBuildings(c, r).lots) list.push(L);
+  return list;
+}
+// Buildings, cars and people are drawn together from north to south, so things tuck behind the buildings in front of them.
+function drawCity(v) {
+  drawSignals(0);
+  LIT.length = 0;
+  const items = [], night = world.dark > 0.35;
+  for (const L of collectLots(v)) items.push([L.y + L.h, 0, L]);
+  for (const c of cars) items.push([c.y + c.fy * c.turnT + (c.lane.axis === 'v' ? c.len / 2 : 1.5), 1, c]);
+  for (const p of peds) if (p.x > v.x0 - 4 && p.x < v.x1 + 4 && p.y > v.y0 - 4 && p.y < v.y1 + 80) items.push([p.y + 0.5, 2, p]);
+  items.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  for (const [, k, o] of items) { if (k === 0) drawLot(o, night); else if (k === 1) drawCar(o); else o.draw(); }
+}
+function drawBuildingLights(a) {
+  for (let k = 0; k < LIT.length; k += 3) {
+    const img = LIT[k];
+    if (img) { ctx.globalAlpha = a * 0.5; ctx.drawImage(img, LIT[k + 1], LIT[k + 2]); }
+    else if (Math.floor(world.t + LIT[k + 1] * 0.1) % 2) { ctx.globalAlpha = a; ctx.fillStyle = '#ff3a3a'; ctx.fillRect(LIT[k + 1], LIT[k + 2], 1, 1); ctx.globalAlpha = a * 0.3; ctx.beginPath(); ctx.arc(LIT[k + 1], LIT[k + 2], 3, 0, 6.283); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- camera route
+const ROUTE_PTS = () => [
+  [60, 120], [300, 260], [620, 420], [PARK.x0 + 98, 700], [PARK.x0 + 60, 1000], [PARK.x0 + 110, 1250], [PARK.x0 + 98, 1500],
+  [AX(7), SY(PLAZA.r) + 14], [300, 1860], [-30, 2000], [240, 2200], [650, 2250], [LAND_W + 40, SY(BRIDGE_ST)], [880, 2520], [520, 2720],
+];
+const cam = { x: 0, y: 0, s: 0, dir: 1, route: null, len: 0, total: 0, label: '', labelT: 0 };
+function buildRoute() {
+  const pts = ROUTE_PTS().map(([x, y]) => ({ x, y })), out = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    for (let k = 0; k < 30; k++) {
+      const t = k / 30, t2 = t * t, t3 = t2 * t;
+      out.push({ x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * (2 * p1.y + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3) });
+    }
+  }
+  out.push(pts[pts.length - 1]);
+  let L = 0; out[0].s = 0;
+  for (let i = 1; i < out.length; i++) { L += dist(out[i], out[i - 1]); out[i].s = L; }
+  cam.route = out; cam.total = L;
+}
+function routeAt(s) {
+  const r = cam.route; s = clamp(s, 0, cam.total);
+  let lo = 0, hi = r.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (r[m].s < s) lo = m; else hi = m; }
+  const a = r[lo], b = r[hi], t = (s - a.s) / (b.s - a.s || 1);
+  return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) };
+}
+function updateCamera(dt) {
+  const speed = (cam.total / 600) * PAN;                      // whole route in ~30 minutes
+  const ease = clamp(Math.min(cam.s, cam.total - cam.s) / 40, 0.15, 1);   // soft slow-down at each end
+  cam.s += cam.dir * speed * ease * dt;
+  if (cam.s >= cam.total) { cam.s = cam.total; cam.dir = -1; }
+  if (cam.s <= 0) { cam.s = 0; cam.dir = 1; }
+  const p = routeAt(cam.s);
+  cam.x = clamp(p.x, WX0 + VW / 2, WX1 - VW / 2); cam.y = clamp(p.y, VH / 2, LAND_H - VH / 2);
+  const name = districtName(cam.x, cam.y);
+  if (name !== cam.label) { cam.label = name; cam.labelT = 0; }
+  cam.labelT += dt;
+}
+const view = () => ({ x0: Math.floor(cam.x - VW / 2), y0: Math.floor(cam.y - VH / 2), x1: Math.floor(cam.x - VW / 2) + VW, y1: Math.floor(cam.y - VH / 2) + VH });
+const onView = (x, y, m = 0) => { const v = view(); return x > v.x0 - m && x < v.x1 + m && y > v.y0 - m && y < v.y1 + m; };
+const aheadPoint = secs => { const speed = (cam.total / 600) * PAN; const p = routeAt(cam.s + cam.dir * speed * secs); return { x: clamp(p.x, WX0 + VW / 2, WX1 - VW / 2), y: clamp(p.y, VH / 2, LAND_H - VH / 2) }; };
+
+// ---------------------------------------------------------------- world state
+const world = { t: 0, parts: [], fx: [], day: 0.25, dark: 0, snow: 0, snowCover: 0, rain: 0, lightsOut: false };
+function addPart(x, y, vx, vy, life, col, o = {}) {
+  if (world.parts.length > 1500) world.parts.splice(0, 200);
+  world.parts.push({ x, y, vx, vy, z: o.z ?? 0, vz: o.vz ?? 0, life, max: life, col, drag: o.drag ?? 1, grav: o.grav ?? 0, size: o.size || 1, fade: o.fade ?? true, glow: o.glow ?? false, air: o.air ?? false });
+}
+function addFx(f) { f.t = f.t ?? 0; f.layer = f.layer || 'ground'; world.fx.push(f); return f; }
+function later(fn, secs) { addFx({ dur: secs, layer: 'none', done: fn }); }
+function updateDaylight(dt) {
+  world.day = (world.day + dt / (24 * 60)) % 1;                // 24 minute day
+  let d;
+  if (TIME_LOCK === 'day') d = 0; else if (TIME_LOCK === 'dusk') d = 0.45; else if (TIME_LOCK === 'night') d = 0.85;
+  else { const a = world.day; d = a < 0.5 ? 0 : a < 0.6 ? (a - 0.5) * 8.5 : a < 0.9 ? 0.85 : 0.85 - (a - 0.9) * 8.5; }
+  world.dark = clamp(Math.max(d, world.dim || 0), 0, 0.85);
+}
+
+// ---------------------------------------------------------------- traffic signals
+const CYCLE = 19;
+function sigPhase(i, j) { return (world.t + i * 0.8 + j * 0.45) % CYCLE; }
+function signal(i, j, axis) {          // 'g' | 'y' | 'r' for traffic travelling along axis ('v' avenue, 'h' street)
+  const t = sigPhase(i, j);
+  if (world.closedAve === i) return axis === 'h' ? 'r' : 'g';
+  if (axis === 'v') return t < 7 ? 'g' : t < 8.5 ? 'y' : 'r';          // 1.5s all-red after each yellow so the box can clear
+  return t >= 10 && t < 16 ? 'g' : t >= 16 && t < 17.5 ? 'y' : 'r';
+}
+// walk signal for pedestrians crossing an avenue (moving along x) or a street (moving along y)
+const walkAcrossAvenue = (i, j) => { if (world.closedAve === i) return false; const t = sigPhase(i, j); return t > 10.3 && t < 15; };
+const walkAcrossStreet = (i, j) => { const t = sigPhase(i, j); return t > 0.3 && t < 5.5; };
+const SIG = { g: '#3aff6a', y: '#ffd83a', r: '#ff3a3a' };
+function drawSignals(glow) {
+  const v = view();
+  for (let i = Math.max(0, Math.floor(v.x0 / PX) - 1); i <= Math.min(NA - 1, Math.ceil(v.x1 / PX)); i++)
+    for (let j = Math.max(0, Math.floor(v.y0 / PY) - 1); j <= Math.min(NS - 1, Math.ceil(v.y1 / PY)); j++) {
+      const X = AX(i), Y = SY(j);
+      if (!avenueAt(i, Y + 4) || !streetAt(j, X + 7)) continue;
+      const a = SIG[signal(i, j, 'v')], s = SIG[signal(i, j, 'h')];
+      if (glow) { ctx.globalAlpha = glow * 0.35; ctx.fillStyle = a; ctx.fillRect(X - 2, Y - 2, 3, 3); ctx.fillRect(X + AW - 1, Y + SW - 1, 3, 3); ctx.fillStyle = s; ctx.fillRect(X + AW - 1, Y - 2, 3, 3); ctx.fillRect(X - 2, Y + SW - 1, 3, 3); }
+      ctx.globalAlpha = glow || 1;
+      ctx.fillStyle = a; ctx.fillRect(X - 1, Y - 1, 1, 1); ctx.fillRect(X + AW, Y + SW, 1, 1);
+      ctx.fillStyle = s; ctx.fillRect(X + AW, Y - 1, 1, 1); ctx.fillRect(X - 1, Y + SW, 1, 1);
+    }
+  ctx.globalAlpha = 1;
+}
+const drawTrafficLights = a => drawSignals(a);
+
+// ---------------------------------------------------------------- lanes
+const laneMap = new Map();
+function lane(axis, idx, k) {
+  const key = axis + idx + '_' + k;
+  let L = laneMap.get(key);
+  if (!L) {
+    if (axis === 'v') L = { key, axis, idx, k, c: AX(idx) + 3 + k * 4, dir: idx % 2 ? 1 : -1, n: 3 };
+    else L = { key, axis, idx, k, c: SY(idx) + 2 + k * 4, dir: idx === BRIDGE_ST ? (k ? 1 : -1) : idx % 2 ? 1 : -1, n: 2 };
+    L.exists = p => (axis === 'v' ? avenueAt(idx, p) : streetAt(idx, p));
+    L.cars = [];
+    laneMap.set(key, L);
+  }
+  return L;
+}
+// positions (along the lane) of each crossing road's centre line
+function crossings(L, from, to) {
+  const out = [];
+  if (L.axis === 'v') { for (let j = Math.max(0, Math.floor(from / PY)); j <= Math.min(NS - 1, Math.ceil(to / PY)); j++) if (streetAt(j, AX(L.idx) + 7)) out.push({ j, i: L.idx, p: SY(j) + SW / 2, a: SY(j), b: SY(j) + SW }); }
+  else { for (let i = Math.max(0, Math.floor(from / PX)); i <= Math.min(NA - 1, Math.ceil(to / PX)); i++) if (avenueAt(i, SY(L.idx) + 4)) out.push({ i, j: L.idx, p: AX(i) + AW / 2, a: AX(i), b: AX(i) + AW }); }
+  return out;
+}
+
+// cross-road lanes a car could turn into at crossing X (ignoring traffic)
+function turnOptions(L, X) {
+  const crossAxis = L.axis === 'v' ? 'h' : 'v', crossIdx = L.axis === 'v' ? X.j : X.i, n2 = crossAxis === 'v' ? 3 : 2;
+  return [...Array(n2).keys()].map(k => lane(crossAxis, crossIdx, k)).filter(L2 => L2.exists(L.c + L2.dir * 20));
+}
+// Turns come from the lane on the side you're turning toward. A forced turn (dead end) from another lane
+// waits until the lanes it has to cut across are clear through the intersection.
+function turnPathClear(c, L, X, L2, forced) {
+  const edgeK = L2.dir > 0 ? L.n - 1 : 0;
+  if (L.k === edgeK || L.n === 1) return true;
+  if (!forced) return false;
+  const lo = Math.min(L.k, edgeK), hi = Math.max(L.k, edgeK);
+  for (let k = lo; k <= hi; k++) {
+    if (k === L.k) continue;
+    for (const o of lane(L.axis, L.idx, k).cars) if (o.pos + o.len / 2 > X.a - 8 && o.pos - o.len / 2 < X.b + 8) return false;
+  }
+  return true;
+}
+// must a car turn here? (road ends after this crossing, or the next crossing is a dead end with no way out)
+function mustTurnAt(L, X) {
+  const step = L.axis === 'v' ? PY : PX, d = L.dir;
+  if (!L.exists(X.p + d * step)) return true;
+  if (!L.exists(X.p + 2 * d * step)) {
+    const nx = crossings(L, X.p + d * step - 3, X.p + d * step + 3)[0];
+    if (nx && !turnOptions(L, nx).length) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- vehicle sprites (top-down, facing +x)
+const CAR_COLORS = ['#e8e8ec', '#2a2a30', '#8a9098', '#b8342e', '#2e5ab8', '#3a7a4a', '#c8b89a', '#6a3a8a', '#1e3a5a'];
+function carCanvas(type, col) {
+  const spec = { car: [6, col], taxi: [6, '#ffcc1a'], suv: [7, col], van: [8, '#e8e8ec'], bus: [14, '#2e7ad0'], truck: [10, '#8a5a36'], police: [7, '#f0f0f4'], fire: [13, '#d02a2a'], ambulance: [9, '#f4f4f4'], limo: [10, '#1a1a1e'], ice: [8, '#f4e8f8'] }[type];
+  const [L, base] = spec, c = mk(L, 3), g = c.getContext('2d');
+  const P = (x, y, w, h, cc) => { g.fillStyle = cc; g.fillRect(x, y, w, h); };
+  P(0, 0, L, 3, base);
+  if (type === 'bus') { P(0, 1, L, 1, '#e8f0ff'); for (let x = 2; x < L - 2; x += 3) P(x, 1, 1, 1, '#9ac0e8'); P(L - 1, 0, 1, 3, '#1a3a5a'); }
+  else if (type === 'truck') { P(0, 0, L - 3, 3, '#e8d8b8'); P(0, 0, L - 3, 1, '#f8ecd0'); P(L - 3, 0, 1, 3, '#2a3a4a'); }
+  else if (type === 'van') { P(L - 3, 0, 1, 3, '#2a3a4a'); P(1, 0, L - 5, 1, '#f8f8f8'); }
+  else if (type === 'fire') { P(1, 1, L - 5, 1, '#e8e8e8'); for (let x = 2; x < L - 4; x += 2) P(x, 0, 1, 3, '#b8b8b8'); P(L - 3, 0, 1, 3, '#2a3a4a'); }
+  else if (type === 'ambulance') { P(L - 3, 0, 1, 3, '#2a3a4a'); P(3, 1, 3, 1, '#e02a2a'); P(4, 0, 1, 3, '#e02a2a'); }
+  else if (type === 'ice') { P(L - 3, 0, 1, 3, '#2a3a4a'); P(1, 0, 2, 3, '#ff8ac0'); P(4, 1, 1, 1, '#8ad8ff'); }
+  else {
+    P(L - 2 - (L > 6 ? 1 : 0), 0, 1, 3, '#2a3a4a'); P(1, 0, 1, 3, '#3a4a5a');
+    P(2, 1, L - 4 - (L > 6 ? 1 : 0), 1, shade(base, type === 'car' && base === '#2a2a30' ? 1.8 : 1.15));
+    if (type === 'taxi') P(Math.floor(L / 2) - 1, 1, 1, 1, '#1a1a1a');
+    if (type === 'police') { P(2, 1, L - 4, 1, '#2a4ab8'); P(Math.floor(L / 2), 0, 1, 3, '#3a3a40'); }
+  }
+  const out = {};
+  for (const [name, rot, w, h] of [['px', 0, L, 3], ['nx', Math.PI, L, 3], ['py', Math.PI / 2, 3, L], ['ny', -Math.PI / 2, 3, L]]) {
+    const o = mk(w, h), og = o.getContext('2d');
+    og.translate(w / 2, h / 2); og.rotate(rot); og.drawImage(c, -L / 2, -1.5);
+    out[name] = o;
+  }
+  out.L = L;
+  return out;
+}
+const spriteCache = new Map();
+function carSprite(type, col) { const k = type + col; if (!spriteCache.has(k)) spriteCache.set(k, carCanvas(type, col)); return spriteCache.get(k); }
+const TYPE_SPEED = { car: 34, taxi: 38, suv: 32, van: 28, bus: 22, truck: 24, police: 36, fire: 34, ambulance: 38, limo: 26, ice: 16 };
+
+// ---------------------------------------------------------------- cars
+let cars = [];
+class Car {
+  constructor(type, L, pos, o = {}) {
+    Object.assign(this, { type, lane: L, pos, v: 0, lat: 0, latT: 0, hold: false, siren: false, yieldT: 0, turnT: 0, fx: 0, fy: 0, stuckT: 0, dead: false, noTurn: false, honkT: rand(2, 6), passedCross: -1 }, o);
+    this.id = Car.n = (Car.n || 0) + 1;
+    this.col = o.col || pick(CAR_COLORS);
+    this.spr = carSprite(type, this.col); this.len = this.spr.L;
+    this.v0 = TYPE_SPEED[type] * rand(0.85, 1.1); this.v = o.v ?? this.v0 * 0.6;
+    cars.push(this); L.cars.push(this);
+  }
+  get x() { return this.lane.axis === 'v' ? this.lane.c + this.lat : this.pos; }
+  get y() { return this.lane.axis === 'v' ? this.pos : this.lane.c + this.lat; }
+  get front() { return this.pos + this.lane.dir * this.len / 2; }
+  switchLane(L2, pos2) {
+    const ox = this.x, oy = this.y;
+    this.lane.cars.splice(this.lane.cars.indexOf(this), 1);
+    this.lane = L2; this.pos = pos2; L2.cars.push(this);
+    this.fx = ox - this.x; this.fy = oy - this.y; this.turnT = 1;
+  }
+  remove() { this.dead = true; const a = this.lane.cars; const k = a.indexOf(this); if (k >= 0) a.splice(k, 1); }
+  honk(txt = 'HONK!') { const x = this.x, y = this.y; addFx({ layer: 'air', dur: 1.2, draw(f) { if (f.t > 0.9 && Math.floor(f.t * 12) % 2) return; text(txt, Math.round(x - textW(txt) / 2), Math.round(y - 9 - f.t * 4), '#ffe040'); } }); }
+}
+function spaceFree(L, pos, gap, len = 6) { return L.cars.every(c => Math.abs(c.pos - pos) > gap + c.len / 2 + len / 2); }
+
+// ---- collision awareness: every car checks the road just ahead of its bumper against every other car's footprint
+const OCC = new Map(), OC = 16;
+function carBox(c) { const h = c.len / 2; return c.lane.axis === 'v' ? { x0: c.x - 1.5, x1: c.x + 1.5, y0: c.pos - h, y1: c.pos + h } : { x0: c.pos - h, x1: c.pos + h, y0: c.y - 1.5, y1: c.y + 1.5 }; }
+function buildOcc() {
+  OCC.clear();
+  for (const c of cars) {
+    const b = (c._b = carBox(c));
+    for (let gx = Math.floor(b.x0 / OC); gx <= Math.floor(b.x1 / OC); gx++) for (let gy = Math.floor(b.y0 / OC); gy <= Math.floor(b.y1 / OC); gy++) {
+      const k = gx * 100000 + gy; let a = OCC.get(k); if (!a) OCC.set(k, (a = [])); a.push(c);
+    }
+  }
+}
+function firstHit(c, look) {
+  const L = c.lane, d = L.dir, f = c.pos + d * c.len / 2, far = f + d * look;
+  const p = L.axis === 'v' ? { x0: c.x - 1, x1: c.x + 1, y0: Math.min(f, far), y1: Math.max(f, far) } : { x0: Math.min(f, far), x1: Math.max(f, far), y0: c.y - 1, y1: c.y + 1 };
+  let best = null;
+  const seen = new Set();
+  for (let gx = Math.floor(p.x0 / OC); gx <= Math.floor(p.x1 / OC); gx++) for (let gy = Math.floor(p.y0 / OC); gy <= Math.floor(p.y1 / OC); gy++) {
+    const a = OCC.get(gx * 100000 + gy); if (!a) continue;
+    for (const o of a) {
+      if (o === c || o.dead || seen.has(o)) continue;
+      seen.add(o);
+      const b = o._b;
+      if (!b || b.x1 < p.x0 || b.x0 > p.x1 || b.y1 < p.y0 || b.y0 > p.y1) continue;
+      if (c.siren && o.yieldT > 0) continue;
+      if (c.inBox && o.lane.axis !== L.axis) continue;                             // already in the intersection: clear it
+      if (o.lane.axis !== L.axis && (c.hitT || 0) > 4 && o.id > c.id) continue;   // untangle a rare standoff
+      const near = L.axis === 'v' ? (d > 0 ? b.y0 : b.y1) : (d > 0 ? b.x0 : b.x1), dd = (near - f) * d;
+      if (dd < -c.len) continue;
+      const v = Math.max(0, dd);
+      if (best === null || v < best) best = v;
+    }
+  }
+  return best;
+}
+// is any cross traffic inside intersection X?
+function crossTrafficIn(X, axis) {
+  const x0 = AX(X.i) - 3, x1 = AX(X.i) + AW + 3, y0 = SY(X.j) - 3, y1 = SY(X.j) + SW + 3;   // includes cars just past the stop line
+  const crossAxis = axis === 'v' ? 'h' : 'v', idx = axis === 'v' ? X.j : X.i, n = crossAxis === 'v' ? 3 : 2;
+  for (let k = 0; k < n; k++) for (const o of lane(crossAxis, idx, k).cars) { const b = o._b || carBox(o); if (b.x1 > x0 && b.x0 < x1 && b.y1 > y0 && b.y0 < y1) return true; }
+  return false;
+}
+// is there room for car c on the far side of intersection X? (don't block the box)
+function exitRoom(L, X, c) {
+  const d = L.dir, edge = d > 0 ? X.b : X.a;
+  for (const o of L.cars) { if (o === c) continue; const rear = o.pos - d * o.len / 2, dd = (rear - edge) * d; if (dd > -AW && dd < c.len + 3) return false; }
+  return true;
+}
+function spawnCar(type, L, pos, o) { return new Car(type, L, pos, o); }
+function randomType(L) {
+  const d = district(Math.floor((L.axis === 'v' ? 1400 : L.c) / PY));
+  if (L.axis === 'v' && chance(0.05)) return 'bus';
+  return weighted({ car: 5, taxi: d === 'midtown' ? 5 : 2.5, suv: 2, van: 1, truck: 0.8, police: 0.15, limo: d === 'midtown' || d === 'financial' ? 0.3 : 0.05 });
+}
+const activeLanes = new Set();
+function simWindow() { const v = view(); return { x0: v.x0 - 80, x1: v.x1 + 80, y0: v.y0 - 80, y1: v.y1 + 80 }; }
+function updateTraffic(dt) {
+  const S = simWindow(), now = new Set();
+  for (let i = Math.max(0, Math.floor(S.x0 / PX)); i <= Math.min(NA - 1, Math.ceil(S.x1 / PX)); i++) for (let k = 0; k < 3; k++) now.add(lane('v', i, k));
+  for (let j = Math.max(0, Math.floor(S.y0 / PY)); j <= Math.min(NS - 1, Math.ceil(S.y1 / PY)); j++) for (let k = 0; k < 2; k++) { const L = lane('h', j, k); if (j === BRIDGE_ST || (S.x0 < LAND_W && S.x1 > 0)) now.add(L); }
+  for (const L of now) {
+    if (L.axis === 'v' && L.idx === world.closedAve) continue;   // closed for a parade: no new cars
+    const lo = L.axis === 'v' ? S.y0 : S.x0, hi = L.axis === 'v' ? S.y1 : S.x1;
+    const density = (L.axis === 'v' ? 0.85 : 0.45) * (world.snow > 0.5 ? 0.5 : 1) * (world.dark > 0.6 ? 0.7 : 1) / 100;
+    const want = (hi - lo) * density;
+    if (!activeLanes.has(L)) {
+      for (let p = lo + rand(0, 30); p < hi; p += rand(0.6, 1.4) / density) if (L.exists(p) && spaceFree(L, p, 8) && !crossings(L, p - 5, p + 5).some(x => p > x.a - 4 && p < x.b + 4)) spawnCar(randomType(L), L, p, { v: 20 });
+    } else if (L.cars.length < want && chance(dt * 1.5 * (L.exists((L.dir > 0 ? lo : hi) + L.dir * (L.axis === 'v' ? PY : PX) * 8) ? 1 : 0.2))) {   // fewer cars on roads that dead-end soon
+      // enter from just off-screen; where the road starts on-screen (river edge, park) cars arrive by turning instead
+      const v = view(), inView = p => (L.axis === 'v' ? p > v.y0 - 8 && p < v.y1 + 8 : p > v.x0 - 8 && p < v.x1 + 8);
+      for (let k = 0; k < 12; k++) {
+        const p = (L.dir > 0 ? lo + 2 : hi - 2) + L.dir * k * 10;
+        if (!L.exists(p)) continue;
+        if (!inView(p) && spaceFree(L, p, 10)) spawnCar(randomType(L), L, p);
+        break;
+      }
+    }
+  }
+  for (const L of activeLanes) if (!now.has(L)) for (const c of [...L.cars]) c.remove();
+  activeLanes.clear(); for (const L of now) activeLanes.add(L);
+  // sort lanes by travel direction and step every car
+  for (const L of now) L.cars.sort((a, b) => (a.pos - b.pos) * L.dir);
+  buildOcc();
+  for (const L of now) {
+    const arr = L.cars.slice();
+    for (let n = 0; n < arr.length; n++) stepCar(arr[n], arr, n, dt, S);
+  }
+  cars = cars.filter(c => !c.dead);
+  // emergency vehicles make traffic ahead pull over
+  for (const e of cars) if (e.siren) for (const c of e.lane.cars) if (c !== e && (c.pos - e.pos) * e.lane.dir > 0 && Math.abs(c.pos - e.pos) < 70) c.yieldT = 1.5;
+}
+function stepCar(c, arr, n, dt, S) {
+  const L = c.lane, d = L.dir;
+  c.turnT = Math.max(0, c.turnT - dt * 3);
+  c.yieldT = Math.max(0, c.yieldT - dt);
+  let limit = c.v0 * (world.snow > 0.3 ? 0.6 : 1);
+  c.leader = null;
+  // leader
+  for (let m = n + 1; m < arr.length; m++) {
+    const o = arr[m];
+    if (o.dead || (c.siren && o.yieldT > 0)) continue;
+    const gap = Math.abs(o.pos - c.pos) - (o.len + c.len) / 2 - 3;
+    limit = Math.min(limit, Math.max(0, gap * 2.2));
+    c.leader = gap < 12 ? o : null;
+    break;
+  }
+  // signals
+  const ahead = crossings(L, Math.min(c.pos, c.pos + d * 40), Math.max(c.pos, c.pos + d * 40)).sort((a, b) => (a.p - b.p) * d);   // nearest first
+  const blockLen = L.axis === 'v' ? PY : PX;
+  for (const X of ahead) {           // the road ends after this crossing: pull into the intersection and wait to turn
+    if (!mustTurnAt(L, X)) continue;
+    const dd = (X.p - c.pos) * d;
+    if (dd > -1) limit = Math.min(limit, Math.max(0, dd * 2.5));
+    break;
+  }
+  for (const X of ahead) {
+    const stopAt = d > 0 ? X.a - 4 : X.b + 4, dist = (stopAt - c.front) * d;
+    if (dist < -2) continue;
+    if (c.siren) break;
+    const s = signal(X.i, X.j, L.axis);
+    let go = s === 'g' || (s === 'y' && dist <= 6);
+    if (go && dist < 14) {           // only enter the box when it's clear and there's room on the other side
+      if (crossTrafficIn(X, L.axis)) go = false;
+      else if (mustTurnAt(L, X)) {    // dead end ahead: only the lane on the turning side may pull in
+        const opts = turnOptions(L, X);
+        go = opts.length > 0 && L.k === (opts[0].dir > 0 ? L.n - 1 : 0) && opts.some(L2 => spaceFree(L2, L.c, 3, c.len));
+      }
+      else go = exitRoom(L, X, c);
+    }
+    if (!go) limit = Math.min(limit, Math.max(0, dist * 2.5));
+    break;
+  }
+  // approaching a dead end: merge toward the lane on the side we'll have to turn
+  if (!c.inBox && L.n > 1 && c.turnT <= 0 && c.v > 6) {   // merge only while moving
+    const soon = crossings(L, Math.min(c.pos, c.pos + d * 90), Math.max(c.pos, c.pos + d * 90)).sort((a, b) => (a.p - b.p) * d).find(X => (X.p - c.pos) * d > 2 && mustTurnAt(L, X));
+    const opts = soon ? turnOptions(L, soon) : [];
+    if (opts.length) {
+      const want = opts[0].dir > 0 ? L.n - 1 : 0;
+      if (want !== L.k) { const L2 = lane(L.axis, L.idx, L.k + Math.sign(want - L.k)); if (spaceFree(L2, c.pos, 5, c.len)) c.switchLane(L2, c.pos); }
+    }
+  }
+  c.inBox = crossings(L, c.pos - c.len / 2, c.pos + c.len / 2).some(X => c.pos + c.len / 2 > X.a && c.pos - c.len / 2 < X.b);
+  const hit = firstHit(c, 3 + c.v * 0.3);
+  if (hit !== null) limit = Math.min(limit, Math.max(0, (hit - 1.5) * 3));
+  c.hitT = hit !== null && c.v < 1 ? (c.hitT || 0) + dt : 0;
+  if (c.yieldT > 0 && !c.siren) { limit = 0; c.lat = lerp(c.lat, L.k === 0 ? -1.5 : L.k === L.n - 1 ? 1.5 : 0, dt * 4); }
+  else if (!c.hold) c.lat = lerp(c.lat, 0, dt * 3);
+  if (c.hold) limit = 0;
+  const acc = limit > c.v ? 22 : 70;
+  c.v = c.v < limit ? Math.min(limit, c.v + acc * dt) : Math.max(limit, c.v - acc * dt);
+  c.pos += d * c.v * dt;
+  // stuck behind something stopped (not a light): change lane or honk
+  const atLight = ahead.length && Math.abs((d > 0 ? ahead[0].a : ahead[0].b) - c.front) < 12;
+  if (c.v < 1 && !c.hold && !atLight && c.yieldT <= 0) {
+    c.stuckT += dt;
+    if (c.stuckT > 1.5 && L.n > 1 && c.leader && c.leader.hold) {   // only pull around a parked/double-parked vehicle
+      for (const k2 of shuffleArr([...Array(L.n).keys()].filter(k => Math.abs(k - L.k) === 1))) {
+        const L2 = lane(L.axis, L.idx, k2);
+        if (spaceFree(L2, c.pos, 6, c.len)) { c.switchLane(L2, c.pos); c.stuckT = 0; break; }
+      }
+    }
+    if (c.stuckT > 5 && (c.honkT -= dt) < 0) { c.honkT = rand(10, 20); if (onView(c.x, c.y) && chance(0.4)) c.honk(); }
+  } else c.stuckT = 0;
+  // turning at intersections
+  for (const X of crossings(L, c.pos - 3, c.pos + 3)) {
+    const nextExists = !mustTurnAt(L, X);
+    if (Math.abs(c.pos - X.p) > 1.5) continue;
+    if (nextExists && (c.passedCross === X.p || c.noTurn)) continue;
+    c.passedCross = X.p;
+    if (!nextExists || chance(L.exists(X.p + d * (L.axis === 'v' ? PY : PX) * 3) ? 0.07 : 0.3)) {   // turn off early before a dead end
+      const crossAxis = L.axis === 'v' ? 'h' : 'v', crossIdx = L.axis === 'v' ? X.j : X.i, n2 = crossAxis === 'v' ? 3 : 2;
+      const options = [...Array(n2).keys()].map(k => lane(crossAxis, crossIdx, k)).filter(L2 => {
+        const p2 = L.axis === 'v' ? L.c : L.c;
+        return L2.exists(p2 + L2.dir * 20) && spaceFree(L2, p2, 4, c.len) && turnPathClear(c, L, X, L2, !nextExists) && (!nextExists || L2.exists(p2 + L2.dir * (L2.axis === 'v' ? PY : PX) * 3));   // don't choose a road that ends right away
+      });
+      if (options.length && (c.type !== 'bus' || !nextExists)) { const L2 = pick(options); c.switchLane(L2, L.c); c.v *= 0.6; c.endWait = 0; break; }
+      if (!nextExists) { c.endWait = (c.endWait || 0) + dt; if (c.endWait > 15 && !onView(c.x, c.y, 12)) c.remove(); }
+    }
+  }
+  const CL = c.lane;   // may have changed if the car just turned
+  if (!c.dead && (!CL.exists(c.pos) || c.pos < (CL.axis === 'v' ? S.y0 : S.x0) - 10 || c.pos > (CL.axis === 'v' ? S.y1 : S.x1) + 10)) c.remove();
+}
+function shuffleArr(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function drawCar(c) {
+  const v = view();
+  {
+    const x = c.x + c.fx * c.turnT, y = c.y + c.fy * c.turnT;
+    if (x < v.x0 - 16 || x > v.x1 + 16 || y < v.y0 - 16 || y > v.y1 + 16) return;
+    const L = c.lane, img = L.axis === 'v' ? (L.dir > 0 ? c.spr.py : c.spr.ny) : (L.dir > 0 ? c.spr.px : c.spr.nx);
+    const X = Math.round(x - img.width / 2), Y = Math.round(y - img.height / 2);
+    ctx.globalAlpha = 0.3; ctx.fillStyle = '#10101e'; ctx.fillRect(X + 1, Y + 1, img.width, img.height); ctx.globalAlpha = 1;
+    ctx.drawImage(img, X, Y);
+    if ((c.siren && !c.quiet) || c.chase) {
+      const on = Math.floor(world.t * 8) % 2, cxp = Math.round(x), cyp = Math.round(y);
+      ctx.fillStyle = on ? '#ff3a3a' : '#3a6aff'; ctx.fillRect(cxp - (L.axis === 'v' ? 1 : 0), cyp - (L.axis === 'v' ? 0 : 1), 1, 1);
+      ctx.fillStyle = on ? '#3a6aff' : '#ff3a3a'; ctx.fillRect(cxp + (L.axis === 'v' ? 1 : 0), cyp + (L.axis === 'v' ? 0 : 1), 1, 1);
+    }
+    if (world.snow > 0.4 && c.v < 1) { ctx.fillStyle = '#ffffff'; ctx.globalAlpha = 0.6; ctx.fillRect(X + 1, Y + 1, Math.max(1, img.width - 2), Math.max(1, img.height - 2)); ctx.globalAlpha = 1; }
+  }
+}
+function drawCarLights(a) {
+  const v = view();
+  for (const c of cars) {
+    const x = c.x + c.fx * c.turnT, y = c.y + c.fy * c.turnT;
+    if (x < v.x0 - 20 || x > v.x1 + 20 || y < v.y0 - 20 || y > v.y1 + 20) continue;
+    const L = c.lane, dx = L.axis === 'h' ? L.dir : 0, dy = L.axis === 'v' ? L.dir : 0, h = c.len / 2;
+    ctx.globalAlpha = a * 0.25; ctx.fillStyle = '#fff4c0';
+    for (let k = 2; k < 9; k++) { const w = 1 + Math.floor(k / 3); ctx.fillRect(Math.round(x + dx * (h + k) - (dy ? 0 : 0) - (dx ? 0 : w / 2)), Math.round(y + dy * (h + k) - (dy ? 0 : w / 2)), dx ? 1 : w, dy ? 1 : w); }
+    ctx.globalAlpha = a; ctx.fillStyle = '#fff8d0';
+    ctx.fillRect(Math.round(x + dx * h - (dy ? 1 : 0)), Math.round(y + dy * h - (dx ? 1 : 0)), 1, 1);
+    ctx.fillRect(Math.round(x + dx * h + (dy ? 1 : 0)), Math.round(y + dy * h + (dx ? 1 : 0)), 1, 1);
+    ctx.fillStyle = c.v < 2 ? '#ff2a2a' : '#a01a1a';
+    ctx.fillRect(Math.round(x - dx * (h + 1) - (dy ? 1 : 0)), Math.round(y - dy * (h + 1) - (dx ? 1 : 0)), 1, 1);
+    ctx.fillRect(Math.round(x - dx * (h + 1) + (dy ? 1 : 0)), Math.round(y - dy * (h + 1) + (dx ? 1 : 0)), 1, 1);
+    if ((c.siren && !c.quiet) || c.chase) { ctx.globalAlpha = a * 0.4; ctx.fillStyle = Math.floor(world.t * 8) % 2 ? '#ff3a3a' : '#3a6aff'; ctx.beginPath(); ctx.arc(x, y, 7, 0, 6.283); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+}
+function drawLights() {}   // daytime placeholder (street furniture is baked into chunks)
+
+// ---------------------------------------------------------------- emotes & popups
+const ICON_ROWS = {
+  heart: [['.X.X.', 'XXXXX', 'XXXXX', '.XXX.', '..X..'], '#ff5a8a'],
+  note: [['..XX', '..X.', '..X.', 'XXX.', 'XX..'], '#8a6aff'],
+  bang: [['X', 'X', 'X', '.', 'X'], '#ffe040'],
+  star: [['.X.', 'XXX', '.X.'], '#ffe040'],
+  q: [['XX.', '..X', '.X.', '...', '.X.'], '#8ae4ff'],
+  wave: [['X.X', 'X.X', 'XXX'], '#ffe040'],
+  snow: [['X.X', '.X.', 'X.X'], '#ffffff'],
+};
+function drawIcon(name, x, y) {
+  const [rows, col] = ICON_ROWS[name], w = rows[0].length, h = rows.length, X = Math.round(x - w / 2), Y = Math.round(y - h);
+  const on = (a, b) => rows[b]?.[a] === 'X';
+  for (let j = -1; j <= h; j++) for (let i = -1; i <= w; i++) {
+    if (on(i, j)) { ctx.fillStyle = col; ctx.fillRect(X + i, Y + j, 1, 1); }
+    else if (on(i - 1, j) || on(i + 1, j) || on(i, j - 1) || on(i, j + 1)) { ctx.fillStyle = '#1a1a22'; ctx.fillRect(X + i, Y + j, 1, 1); }
+  }
+}
+function emoteAt(x, y, name, dur = 1.6) { addFx({ layer: 'air', dur, draw(f) { if (f.t / dur > 0.75 && Math.floor(f.t * 12) % 2) return; drawIcon(name, x, y - 3 - Math.min(1, f.t * 4) * 3); } }); }
+function popText(x, y, s, col = '#ffffff', dur = 1.5) { addFx({ layer: 'air', dur, draw(f) { if (f.t > dur - 0.3 && Math.floor(f.t * 12) % 2) return; text(s, Math.round(x - textW(s) / 2), Math.round(y - 8 - f.t * 3), col); } }); }
+
+// ---------------------------------------------------------------- pedestrians on sidewalks
+const SHIRTS = ['#e84a4a', '#3a7ae8', '#f0c030', '#3ab86a', '#e8e8e8', '#2a2a30', '#b86ae0', '#ff8a3a', '#6ad0e0', '#c85a8a', '#8a6a4a'];
+const HAIRS = ['#2a1a10', '#5a3a1a', '#1a1a1a', '#c8a050', '#8a4a2a', '#d8d8d8'];
+let peds = [];
+const activeBlocks = new Set();
+const sideRect = (c, r) => ({ x: blockX(c) + 1, y: blockY(r) + 1, w: BW - 3, h: BH - 3 });
+function perim(c, r) { const S = sideRect(c, r); return 2 * (S.w + S.h); }
+function sidePos(c, r, s) {
+  const S = sideRect(c, r), P = 2 * (S.w + S.h); s = ((s % P) + P) % P;
+  if (s < S.w) return { x: S.x + s, y: S.y };
+  if (s < S.w + S.h) return { x: S.x + S.w, y: S.y + (s - S.w) };
+  if (s < 2 * S.w + S.h) return { x: S.x + S.w - (s - S.w - S.h), y: S.y + S.h };
+  return { x: S.x, y: S.y + S.h - (s - 2 * S.w - S.h) };
+}
+function cornerS(c, r, k) { const S = sideRect(c, r); return [0, S.w, S.w + S.h, 2 * S.w + S.h][k]; }   // 0 NW, 1 NE, 2 SE, 3 SW
+class Ped {
+  constructor(c, r, o = {}) {
+    Object.assign(this, { c, r, s: rand(0, perim(c, r)), dir: coin(), speed: rand(5, 9), state: 'walk', shirt: pick(SHIRTS), hair: pick(HAIRS), t: rand(0, 5), dead: false, brain: null, dog: chance(0.06), umbrella: pick(['#e84a4a', '#3a3a4a', '#3a7ae8', '#f0c030']), x: 0, y: 0, cross: null, lastCorner: -1 }, o);
+    const p = sidePos(c, r, this.s); this.x = p.x; this.y = p.y;
+    peds.push(this);
+  }
+  update(dt) {
+    this.t += dt;
+    if (this.brain) { const res = this.brain.next(dt); if (res.done) this.brain = null; return; }
+    if (this.state === 'walk') {
+      const P = perim(this.c, this.r), prev = this.s;
+      this.s = (this.s + this.dir * this.speed * dt + P) % P;
+      const p = sidePos(this.c, this.r, this.s); this.x = p.x; this.y = p.y;
+      for (let k = 0; k < 4; k++) {
+        const cs = cornerS(this.c, this.r, k);
+        const crossed = this.dir > 0 ? (prev < cs && this.s >= cs) || (cs === 0 && prev > this.s) : (prev > cs && this.s <= cs) || (cs === 0 && this.s > prev);
+        if (crossed && this.lastCorner !== k) { this.lastCorner = k; this.atCorner(k); break; }
+        if (!crossed && Math.abs(this.s - cs) > 4) { if (this.lastCorner === k) this.lastCorner = -1; }
+      }
+    } else if (this.state === 'wait') {
+      const C = this.cross;
+      if (C.ok()) this.state = 'cross';
+      else if ((this.waitT -= dt) < 0) { this.state = 'walk'; this.dir *= -1; }
+    } else if (this.state === 'cross') {
+      const C = this.cross, dx = C.tx - this.x, dy = C.ty - this.y, d = Math.hypot(dx, dy);
+      if (d < 0.8) { this.c = C.c; this.r = C.r; this.s = cornerS(C.c, C.r, C.k); this.lastCorner = C.k; this.state = 'walk'; this.dir = coin(); }
+      else { this.x += dx / d * this.speed * 1.2 * dt; this.y += dy / d * this.speed * 1.2 * dt; }
+    }
+  }
+  atCorner(k) {
+    if (!chance(0.45)) return;
+    const S = sideRect(this.c, this.r), horiz = chance(0.5);
+    const east = k === 1 || k === 2, south = k === 2 || k === 3;
+    let c2 = this.c, r2 = this.r, k2, ok;
+    if (horiz) {
+      c2 += east ? 1 : -1; k2 = { 0: 1, 1: 0, 2: 3, 3: 2 }[k];
+      const i = east ? this.c + 1 : this.c, j = south ? this.r + 1 : this.r;
+      ok = () => walkAcrossAvenue(i, j) || world.lightsOut;
+    } else {
+      r2 += south ? 1 : -1; k2 = { 0: 3, 1: 2, 2: 1, 3: 0 }[k];
+      const i = east ? this.c + 1 : this.c, j = south ? this.r + 1 : this.r;
+      ok = () => walkAcrossStreet(i, j) || world.lightsOut;
+    }
+    if (c2 < 0 || r2 < 0 || c2 > NA - 2 || r2 > NS - 2 || inPark(c2, r2) || !activeBlocks.has(c2 + ',' + r2)) return;
+    const t = sidePos(c2, r2, cornerS(c2, r2, k2));
+    this.cross = { c: c2, r: r2, k: k2, tx: t.x, ty: t.y, ok };
+    this.state = 'wait'; this.waitT = rand(6, 14);
+    const p = sidePos(this.c, this.r, cornerS(this.c, this.r, k)); this.x = p.x; this.y = p.y;
+  }
+  draw() {
+    const X = Math.round(this.x), Y = Math.round(this.y), step = this.state !== 'wait' && Math.floor(this.t * 6) % 2;
+    ctx.globalAlpha = 0.3; ctx.fillStyle = '#10101e'; ctx.fillRect(X + 1, Y + 1, 2, 1); ctx.globalAlpha = 1;
+    if ((world.rain > 0.3 || world.snow > 0.5) && !this.brain) {
+      ctx.fillStyle = this.umbrella; ctx.fillRect(X - 1, Y - 1, 3, 3); ctx.fillStyle = shade(this.umbrella, 1.4); ctx.fillRect(X - 1, Y - 1, 1, 1);
+    } else {
+      ctx.fillStyle = this.shirt; ctx.fillRect(X, Y, 2, 1);
+      ctx.fillStyle = this.hair; ctx.fillRect(X + (step ? 1 : 0), Y - 1, 1, 1);
+    }
+    if (this.dog) { const a = this.dir; ctx.fillStyle = '#a8703a'; ctx.fillRect(X - 3 * a, Y + 1, 2, 1); ctx.fillStyle = '#5a3a1a'; ctx.fillRect(X - 3 * a + (a > 0 ? 0 : 1), Y, 1, 1); }
+    if (this.extra) this.extra(this, X, Y);
+  }
+}
+function blockDensity(c, r) {
+  if (inPark(c, r)) return 0;
+  if (inPlaza(c, r)) return 12;
+  if (isConstruction(c, r)) return 1;
+  const d = district(r);
+  return (d === 'midtown' ? 4.5 : d === 'financial' ? 4 : d === 'downtown' ? 3.5 : 2.5) * (world.dark > 0.6 ? 0.5 : 1) * (world.snow > 0.5 ? 0.6 : 1);
+}
+function updatePeople(dt) {
+  const v0 = view(), S = { x0: v0.x0 - 50, x1: v0.x1 + 50, y0: v0.y0 - 50, y1: v0.y1 + 50 }, now = new Set();
+  for (let r = Math.max(0, Math.floor(S.y0 / PY)); r <= Math.min(NS - 2, Math.floor(S.y1 / PY)); r++)
+    for (let c = Math.max(0, Math.floor(S.x0 / PX)); c <= Math.min(NA - 2, Math.floor(S.x1 / PX)); c++) {
+      const key = c + ',' + r;
+      now.add(key);
+      if (!activeBlocks.has(key)) { for (let n = Math.round(blockDensity(c, r) * rand(0.7, 1.2)); n > 0; n--) new Ped(c, r); }
+      if (inPlaza(c, r)) { const P = peds.filter(p => p.c === c && p.r === r).length; if (P < 8 && chance(dt * 0.3)) new Ped(c, r); }
+    }
+  for (const key of activeBlocks) if (!now.has(key)) for (const p of peds) if (p.c + ',' + p.r === key && !p.keep) p.dead = true;
+  activeBlocks.clear(); for (const k of now) activeBlocks.add(k);
+  for (const p of peds) if (!p.dead) p.update(dt);
+  peds = peds.filter(p => !p.dead);
+}
+function drawPeople() {
+  const v = view();
+  for (const p of peds) if (p.x > v.x0 - 4 && p.x < v.x1 + 4 && p.y > v.y0 - 4 && p.y < v.y1 + 4) p.draw();
+}
+
+// ---------------------------------------------------------------- park life, boats, birds
+const life = { park: [], boats: [], rowboats: [], birds: [], picnics: [], parkOn: false, riverOn: { w: false, e: false }, birdT: 5 };
+function pathLen(p) { if (!p.len) { let L = 0; p.cum = [0]; const n = p.pts.length; for (let k = 1; k < n + (p.closed ? 1 : 0); k++) { L += dist(p.pts[k % n], p.pts[k - 1]); p.cum.push(L); } p.len = L; } return p.len; }
+function pathPos(p, s) {
+  const L = pathLen(p), n = p.pts.length;
+  s = p.closed ? ((s % L) + L) % L : clamp(s, 0, L);
+  let k = 1; while (k < p.cum.length - 1 && p.cum[k] < s) k++;
+  const a = p.pts[(k - 1) % n], b = p.pts[k % n], t = (s - p.cum[k - 1]) / ((p.cum[k] - p.cum[k - 1]) || 1);
+  return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) };
+}
+function initLife() {}
+function spawnParkLife() {
+  life.park = [];
+  const paths = parkData.paths;
+  for (let n = 0; n < 70; n++) {
+    const kind = weighted({ walker: 5, jogger: 3, cyclist: 1.5, stroller: 1, carriage: 0.4, dogwalker: 1 });
+    const path = kind === 'carriage' || kind === 'cyclist' ? paths[0] : pick(paths);
+    life.park.push({ kind, path, s: rand(0, pathLen(path)), dir: coin(), off: rand(-1, 1), speed: { walker: 5, jogger: 13, cyclist: 22, stroller: 4, carriage: 9, dogwalker: 5 }[kind] * rand(0.8, 1.2), shirt: pick(SHIRTS), hair: pick(HAIRS), t: rand(0, 5) });
+  }
+  const L = parkData.lake;
+  life.rowboats = Array.from({ length: 4 }, () => ({ x: L.x + rand(-L.rx * 0.5, L.rx * 0.5), y: L.y + rand(-L.ry * 0.5, L.ry * 0.5), a: rand(0, 6.28), t: rand(0, 5), col: pick(['#c8583a', '#3a8ac8', '#e8c83a', '#e8e8e8']) }));
+  const G = parkData.lawn;
+  life.picnics = Array.from({ length: 9 }, () => { const a = rand(0, 6.28), k = Math.sqrt(Math.random()) * 0.85; return { x: G.x + Math.cos(a) * G.rx * k, y: G.y + Math.sin(a) * G.ry * k, col: pick(['#e84a4a', '#3a7ae8', '#f0c030', '#ffffff']), n: randi(1, 3), shirts: [pick(SHIRTS), pick(SHIRTS), pick(SHIRTS)] }; });
+  life.ducks = Array.from({ length: 8 }, () => ({ x: L.x + rand(-L.rx * 0.6, L.rx * 0.6), y: L.y + rand(-L.ry * 0.6, L.ry * 0.6), a: rand(0, 6.28) }));
+}
+function spawnBoat(side, o = {}) {
+  const kind = o.kind || weighted({ ferry: 2, tug: 2, sail: 2, kayak: 1.5, yacht: 1 });
+  const v = view(), dir = o.dir ?? coin();
+  const x = side === 'w' ? rand(-100, -30) : rand(LAND_W + 30, LAND_W + 100);
+  const b = { side, kind, x, y: o.y ?? (dir > 0 ? v.y0 - 40 : v.y1 + 40), vy: dir * ({ ferry: 10, tug: 7, sail: 6, kayak: 5, yacht: 14 }[kind]) * rand(0.8, 1.2), t: 0, dead: false, ...o };
+  if (side === 'e' && Math.abs(b.x - LAND_W - 70) < 1) b.x += 10;
+  life.boats.push(b);
+  return b;
+}
+function updateLife(dt) {
+  const S = simWindow();
+  const parkVis = S.x1 > PARK.x0 && S.x0 < PARK.x1 && S.y1 > PARK.y0 && S.y0 < PARK.y1;
+  if (parkVis && !life.parkOn) spawnParkLife();
+  life.parkOn = parkVis;
+  if (parkVis) {
+    for (const a of life.park) {
+      a.t += dt;
+      if (!a.stop) a.s += a.dir * a.speed * dt;
+      if (!a.path.closed) { const L = pathLen(a.path); if (a.s < 0 || a.s > L) { a.dir *= -1; a.s = clamp(a.s, 0, L); } }
+    }
+    for (const b of life.rowboats) {
+      b.t += dt; b.a += Math.sin(b.t * 0.3) * 0.3 * dt;
+      const nx = b.x + Math.cos(b.a) * 3 * dt, ny = b.y + Math.sin(b.a) * 3 * dt;
+      if (inLake(nx, ny, 8)) { b.x = nx; b.y = ny; } else b.a += 2.5;
+    }
+    for (const d of life.ducks) { d.a += rand(-1, 1) * dt; const nx = d.x + Math.cos(d.a) * 2 * dt, ny = d.y + Math.sin(d.a) * 2 * dt; if (inLake(nx, ny, 4)) { d.x = nx; d.y = ny; } else d.a += 3; }
+  }
+  for (const side of ['w', 'e']) {
+    const vis = side === 'w' ? S.x0 < -12 : S.x1 > LAND_W + 12;
+    const count = life.boats.filter(b => b.side === side).length;
+    if (vis && count < 3 && chance(dt * 0.12)) spawnBoat(side);
+    if (vis && !life.riverOn[side]) for (let k = 0; k < 2; k++) spawnBoat(side, { y: rand(S.y0 + 20, S.y1 - 20) });
+    life.riverOn[side] = vis;
+  }
+  for (const b of life.boats) {
+    b.t += dt;
+    if (!b.docked) b.y += b.vy * dt;
+    if (chance(dt * 8) && !b.docked) addPart(b.x + rand(-1.5, 1.5), b.y - Math.sign(b.vy) * (b.kind === 'ferry' ? 10 : 5), rand(-4, 4), -b.vy * 0.1, rand(1, 2), ['#e8f4ff', '#a8c8e8', '#5a8ab8']);
+    if (b.y < S.y0 - 80 || b.y > S.y1 + 80) b.dead = true;
+  }
+  life.boats = life.boats.filter(b => !b.dead);
+  if ((life.birdT -= dt) <= 0) {
+    life.birdT = rand(15, 35);
+    const v = view(), dir = coin();
+    const n = randi(5, 9), y = rand(v.y0 + 20, v.y1 - 20);
+    for (let k = 0; k < n; k++) life.birds.push({ x: (dir > 0 ? v.x0 - 20 : v.x1 + 20) - dir * k * 5 + rand(-3, 3), y: y + rand(-8, 8), vx: dir * rand(28, 34), vy: rand(-3, 3), t: rand(0, 3), gull: v.x0 < -12 || v.x1 > LAND_W + 12 ? chance(0.6) : false });
+  }
+  for (const b of life.birds) { b.t += dt; b.x += b.vx * dt; b.y += (b.vy + Math.sin(b.t * 2) * 3) * dt; }
+  const v = view();
+  life.birds = life.birds.filter(b => b.x > v.x0 - 60 && b.x < v.x1 + 60 && b.y > v.y0 - 60 && b.y < v.y1 + 60 && b.t < 30);
+}
+function drawBoat(b) {
+  const X = Math.round(b.x), Y = Math.round(b.y), d = Math.sign(b.vy) || 1;
+  const R = (x, y, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(X + x, Y + y, w, h); };
+  ctx.globalAlpha = 0.25; R(1, -8, 7, 18, '#0a1a2a'); ctx.globalAlpha = 1;
+  if (b.kind === 'ferry') { R(-4, -10, 9, 20, '#f4f4f4'); R(-3, -8, 7, 16, '#f0a030'); R(-2, -6, 5, 12, '#e8e8e8'); for (let k = -5; k < 6; k += 2) R(-3, k, 1, 1, '#3a4a6a'), R(3, k, 1, 1, '#3a4a6a'); R(-4, d > 0 ? 9 : -10, 9, 1, '#c8c8c8'); }
+  else if (b.kind === 'tug') { R(-2, -5, 5, 10, '#c83a2a'); R(-1, -2 * d - 1, 3, 3, '#f4f4f4'); R(0, -1 * d - 1, 1, 1, '#2a2a30'); R(-3, -6, 7, 12, 'rgba(0,0,0,0)'); if (b.barge) { R(-4, -d * 22 - 7, 9, 14, '#6a5a4a'); R(-3, -d * 22 - 6, 7, 12, '#8a7a5a'); } }
+  else if (b.kind === 'sail') { R(-1, -4, 3, 8, '#f4f4f4'); R(0, -3, 1, 6, '#8a6a4a'); const s = Math.sin(world.t * 0.5) > 0 ? 1 : -1; R(s, -3, 2 * s > 0 ? 2 : 2, 5, '#ffffff'); R(s * 2, -2, 1, 3, '#e8e8f0'); }
+  else if (b.kind === 'kayak') { R(0, -3, 1, 6, '#ff7a1a'); R(0, 0, 1, 1, '#2a4ab8'); const o = Math.floor(b.t * 3) % 2 ? 1 : -1; R(-1 * o, -1, 1, 1, '#e8d8a0'); R(1 * o, 1, 1, 1, '#e8d8a0'); }
+  else if (b.kind === 'yacht') { R(-2, -7, 5, 14, '#f4f4f8'); R(-1, -4, 3, 6, '#3a4a6a'); R(-1, d > 0 ? 5 : -7, 3, 2, '#c8e8f8'); }
+}
+function drawLife(layer) {
+  const v = view();
+  if (layer === 'ground') {
+    if (life.parkOn) {
+      for (const p of life.picnics) {
+        if (!onView(p.x, p.y, 10)) continue;
+        ctx.fillStyle = p.col; ctx.fillRect(Math.round(p.x) - 2, Math.round(p.y) - 2, 5, 4);
+        ctx.fillStyle = p.col === '#ffffff' ? '#e84a4a' : '#ffffff'; ctx.fillRect(Math.round(p.x) - 2, Math.round(p.y), 5, 1);
+        for (let k = 0; k < p.n; k++) { ctx.fillStyle = p.shirts[k]; ctx.fillRect(Math.round(p.x) - 3 + k * 3, Math.round(p.y) - 3, 1, 1); }
+      }
+      for (const a of life.park) {
+        const p = pathPos(a.path, a.s), X = Math.round(p.x + a.off * (a.path.w / 2)), Y = Math.round(p.y + a.off * (a.path.w / 2));
+        if (X < v.x0 - 6 || X > v.x1 + 6 || Y < v.y0 - 6 || Y > v.y1 + 6) continue;
+        if (a.kind === 'carriage') { ctx.fillStyle = '#8a5a2a'; ctx.fillRect(X, Y, 2, 2); ctx.fillStyle = '#1a1a1a'; ctx.fillRect(X - 3, Y, 3, 3); ctx.fillStyle = '#c83a3a'; ctx.fillRect(X - 2, Y + 1, 1, 1); continue; }
+        if (a.kind === 'cyclist') { ctx.fillStyle = '#2a2a2a'; ctx.fillRect(X - 1, Y, 3, 1); ctx.fillStyle = a.shirt; ctx.fillRect(X, Y - 1, 1, 1); continue; }
+        ctx.fillStyle = a.shirt; ctx.fillRect(X, Y, 2, 1);
+        ctx.fillStyle = a.hair; ctx.fillRect(X + (Math.floor(a.t * (a.kind === 'jogger' ? 10 : 6)) % 2), Y - 1, 1, 1);
+        if (a.kind === 'stroller') { ctx.fillStyle = '#5a6a8a'; ctx.fillRect(X + 2, Y, 2, 2); }
+        if (a.kind === 'dogwalker') { ctx.fillStyle = '#e8e8e8'; ctx.fillRect(X - 2, Y + 1, 2, 1); }
+      }
+      for (const b of life.rowboats) {
+        if (!onView(b.x, b.y, 8)) continue;
+        const X = Math.round(b.x), Y = Math.round(b.y), ox = Math.round(Math.cos(b.a)), oy = Math.round(Math.sin(b.a)), row = Math.floor(b.t * 2) % 2;
+        ctx.fillStyle = b.col; ctx.fillRect(X - 1, Y - 1, 3, 3); ctx.fillRect(X + ox * 2, Y + oy * 2, 1, 1); ctx.fillRect(X - ox * 2, Y - oy * 2, 1, 1);
+        ctx.fillStyle = '#ffd2a8'; ctx.fillRect(X, Y, 1, 1);
+        ctx.fillStyle = '#c8a070'; ctx.fillRect(X - oy * (2 + row), Y + ox * (2 + row), 1, 1); ctx.fillRect(X + oy * (2 + row), Y - ox * (2 + row), 1, 1);
+      }
+      for (const d of life.ducks) if (onView(d.x, d.y, 4)) { ctx.fillStyle = '#e8e8d8'; ctx.fillRect(Math.round(d.x), Math.round(d.y), 2, 1); ctx.fillStyle = '#3a7a3a'; ctx.fillRect(Math.round(d.x + Math.cos(d.a)), Math.round(d.y) - 1, 1, 1); }
+    }
+    for (const b of life.boats) if (onView(b.x, b.y, 30)) drawBoat(b);
+  } else {
+    for (const b of life.birds) {
+      const X = Math.round(b.x), Y = Math.round(b.y), up = Math.floor(b.t * 8) % 2;
+      ctx.globalAlpha = 0.25; ctx.fillStyle = '#10101e'; ctx.fillRect(X + 8, Y + 11, 3, 1); ctx.globalAlpha = 1;
+      ctx.fillStyle = b.gull ? '#f4f4f4' : '#6a6a78';
+      ctx.fillRect(X, Y, 1, 1); ctx.fillRect(X - 1, Y - up, 1, 1); ctx.fillRect(X + 1, Y - up, 1, 1);
+      if (b.gull) { ctx.fillRect(X - 2, Y - up * 2 + 1, 1, 1); ctx.fillRect(X + 2, Y - up * 2 + 1, 1, 1); }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- event helpers
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+function* pwalk(p, x, y, sp = 8, max = 30) {
+  for (let t = 0; t < max; ) { const dx = x - p.x, dy = y - p.y, d = Math.hypot(dx, dy); if (d < 0.8) break; const dt = yield; t += dt; p.x += dx / d * Math.min(d, sp * dt); p.y += dy / d * Math.min(d, sp * dt); p.t += dt; }
+}
+const pedsNear = (x, y, r) => peds.filter(p => !p.brain && !p.dead && p.state === 'walk' && Math.hypot(p.x - x, p.y - y) < r);
+function focus(secs = 15) { return aheadPoint(secs); }   // where the camera will be looking soon
+function blocksNear(pt, r = 1) {
+  const c0 = Math.floor(pt.x / PX), r0 = Math.floor(pt.y / PY), out = [];
+  for (let r2 = r0 - r; r2 <= r0 + r; r2++) for (let c = c0 - r; c <= c0 + r; c++) if (c >= 0 && r2 >= 0 && c < NA - 1 && r2 < NS - 1 && !inPark(c, r2)) out.push({ c, r: r2 });
+  return out;
+}
+function closeAvenueNear(pt) {
+  let best = null;
+  for (let i = 0; i < NA; i++) { if (!avenueAt(i, pt.y)) continue; const d = Math.abs(AX(i) + 7 - pt.x); if (!best || d < best.d) best = { i, d }; }
+  return best ? best.i : null;
+}
+// an avenue near pt where a vehicle can enter from just off-screen (upstream of its one-way direction)
+function avenueEntry(pt, margin = 60) {
+  const v = view(), order = [...Array(NA).keys()].sort((a, b) => Math.abs(AX(a) + 7 - pt.x) - Math.abs(AX(b) + 7 - pt.x));
+  for (const i of order.slice(0, 4)) {
+    if (!onView(AX(i) + 7, cam.y, -20) || world.closedAve === i) continue;
+    const dir = i % 2 ? 1 : -1, start = dir > 0 ? v.y0 - margin : v.y1 + margin;
+    if (avenueAt(i, start) && avenueAt(i, pt.y)) return { i, start };
+  }
+  return null;
+}
+const riverVisible = side => { const v = view(); return side === 'w' ? v.x0 < -30 : v.x1 > LAND_W + 30; };
+const parkVisible = () => { const v = view(); return v.x1 > PARK.x0 + 20 && v.x0 < PARK.x1 - 20 && v.y1 > PARK.y0 + 20 && v.y0 < PARK.y1 - 20; };
+const plazaVisible = () => onView((blockX(PLAZA.c0) + blockX(PLAZA.c1) + BW) / 2, blockY(PLAZA.r) + BH / 2, -20);
+const landVisible = () => { const v = view(); return v.x1 > 30 && v.x0 < LAND_W - 30; };
+
+// ---------------------------------------------------------------- COMMON EVENTS
+// Hailing a taxi: someone waves, a cab swerves to the curb, they hop in
+function* taxi() {
+  const pt = focus(8), cand = peds.filter(p => !p.brain && p.state === 'walk' && onView(p.x, p.y, -30) && Math.hypot(p.x - pt.x, p.y - pt.y) < 90);
+  for (const p of shuffleArr(cand)) {
+    const S = sideRect(p.c, p.r), top = Math.abs(p.y - S.y) < 0.5, bot = Math.abs(p.y - S.y - S.h) < 0.5, left = Math.abs(p.x - S.x) < 0.5, right = Math.abs(p.x - S.x - S.w) < 0.5;
+    let L = null, along;
+    if (top && p.r > 0) { L = lane('h', p.r, 1); along = p.x; }
+    else if (bot) { L = lane('h', p.r + 1, 0); along = p.x; }
+    else if (left) { L = lane('v', p.c, 2); along = p.y; }
+    else if (right) { L = lane('v', p.c + 1, 0); along = p.y; }
+    if (!L || !L.exists(along) || !activeLanes.has(L)) continue;
+    const startPos = along - L.dir * 100;
+    if (!L.exists(startPos) || !spaceFree(L, startPos, 10)) continue;
+    // stop the pedestrian and wave
+    p.keep = true;
+    p.brain = (function* () { for (;;) { p.t += yield; } })();
+    emoteAt(p.x, p.y - 2, 'wave', 2); popText(p.x, p.y - 4, 'TAXI!', '#ffe040', 1.8);
+    const cab = spawnCar('taxi', L, startPos, { noTurn: true, v: 30 });
+    let t = 0;
+    while (t < 25 && !cab.dead && (along - cab.pos) * L.dir > 8) { t += yield; if ((along - cab.pos) * L.dir < 30) cab.v0 = 14; }
+    if (cab.dead) { p.brain = null; p.keep = false; return; }
+    cab.hold = true;
+    const curb = L.axis === 'h' ? (L.k === 0 ? -1.5 : 1.5) : (L.k === 0 ? -1.5 : 1.5);
+    for (let k = 0; k < 20; k++) { cab.lat = lerp(cab.lat, curb, 0.15); yield; }
+    p.brain = pwalk(p, cab.x, cab.y, 8, 4);
+    yield* until(() => !p.brain, 5);
+    p.dead = true; emoteAt(cab.x, cab.y - 3, 'heart', 1.4);
+    yield* wait(1.2);
+    cab.hold = false; cab.v0 = TYPE_SPEED.taxi; cab.noTurn = false;
+    yield* wait(3);
+    return;
+  }
+}
+
+// Fire truck: sirens, traffic pulls over, it stops at a smoking roof and hoses it down
+function* fire() {
+  const pt = focus(10), E = avenueEntry(pt, 90);
+  if (!E) return;
+  const i = E.i, L = lane('v', i, 1), v = view(), dir = L.dir, start = E.start;
+  const c = Math.min(NA - 2, Math.max(0, dir > 0 ? i : i - 1)), r = clamp(Math.floor(pt.y / PY), 0, NS - 2);
+  const lots = blockBuildings(c, r).lots.filter(l => l.ht < 40);
+  const lot = lots.length ? pick(lots) : null;
+  const stopY = blockY(r) + BH / 2;
+  let smoking = !!lot, smokeK = 1;
+  const smoke = addFx({ layer: 'none', dur: 1e9, draw() {} });
+  const truck = spawnCar('fire', L, start, { siren: true, noTurn: true, v: 40 });
+  truck.v0 = 44;
+  let t = 0;
+  while (t < 40 && !truck.dead) {
+    const dt = yield; t += dt;
+    if (smoking && chance(dt * 12 * smokeK)) addPart(lot.x + lot.w / 2 + rand(-3, 3), lot.y + lot.h / 2 + rand(-2, 2), rand(4, 10), rand(-6, 2), rand(2, 4), ['#4a4a52', '#6a6a72', '#9a9aa0', '#c8c8cc'], { air: true, drag: 0.6, size: 2 });
+    if (smoking && chance(dt * 4 * smokeK)) addPart(lot.x + lot.w / 2 + rand(-2, 2), lot.y + lot.h / 2, rand(-2, 2), rand(-3, 0), 0.5, ['#ffe040', '#ff8a2a', '#e0302a'], { air: true });
+    if (lot && Math.abs(truck.pos - stopY) < 4 && !truck.hold) {
+      truck.hold = true; popText(truck.x, truck.y - 4, 'WOOO!', '#ff5a5a');
+      const from = { x: truck.x, y: truck.y }, to = { x: lot.x + lot.w / 2, y: lot.y + lot.h / 2 };
+      for (let k = 0; k < 6; k++) { const f = new Ped(c, r, { keep: true, shirt: '#e8c030', hair: '#3a3a3a' }); f.x = from.x + (dir > 0 ? -3 : 3); f.y = from.y + rand(-4, 4); f.brain = (function* () { yield* pwalk(f, from.x + (i === c ? -9 : 9), from.y + rand(-5, 5), 10, 3); for (;;) { f.t += yield; if (!truck.hold) break; } yield* pwalk(f, from.x, from.y, 10, 3); f.dead = true; })(); }
+      let hoseT = 0;
+      while (hoseT < 8) {
+        const dt2 = yield; hoseT += dt2; smokeK = Math.max(0, 1 - hoseT / 6);
+        if (smoking) for (let k = 0; k < 3; k++) { const s = rand(0, 1); addPart(lerp(from.x, to.x, s), lerp(from.y, to.y, s) - Math.sin(s * Math.PI) * 10, rand(-3, 3), rand(-3, 3), 0.25, ['#c8e8ff', '#8ac8f0'], { air: true }); }
+        if (smoking && chance(dt2 * 20)) addPart(to.x + rand(-3, 3), to.y + rand(-3, 3), rand(-10, 10), rand(-10, 10), 0.6, '#e8f4ff', { air: true });
+      }
+      smoking = false;
+      emoteAt(to.x, to.y - 4, 'star', 2);
+      yield* wait(2);
+      truck.hold = false; truck.siren = false; truck.v0 = 30;
+      yield* wait(3);
+      break;
+    }
+  }
+  smoke.dur = 0;
+}
+
+// Street performer: a crowd gathers in a circle, music, applause, then everyone moves on
+function* performer() {
+  let spot;
+  if (plazaVisible()) spot = { x: blockX(PLAZA.c0) + BW / 2 + rand(-10, 10), y: blockY(PLAZA.r) + BH / 2 };
+  else if (parkVisible() && onView(parkData.fountain.x, parkData.fountain.y, -20)) spot = { x: parkData.fountain.x, y: parkData.fountain.y + 18 };
+  else { const b = pick(blocksNear(focus(10), 1).filter(b => !isConstruction(b.c, b.r))); if (!b) return; const S = sideRect(b.c, b.r); spot = { x: S.x + S.w / 2, y: S.y + S.h }; }
+  const band = pick([['#ff5aa0', 'note'], ['#5aa0ff', 'note'], ['#ffe040', 'star']]);
+  const perf = new Ped(0, 0, { keep: true, shirt: band[0], hair: '#1a1a1a' });
+  perf.x = spot.x; perf.y = spot.y;
+  let t = 0, playing = true;
+  perf.brain = (function* () { for (;;) { const dt = yield; perf.t += dt * 2; perf.x = spot.x + Math.round(Math.sin(t * 3)); } })();
+  perf.extra = (p, X, Y) => { if (Math.floor(world.t * 4) % 2) { ctx.fillStyle = '#c8a050'; ctx.fillRect(X + 2, Y - 1, 1, 2); } };
+  const crowd = [];
+  const tryJoin = () => {
+    const p = pedsNear(spot.x, spot.y, 70)[0];
+    if (!p || crowd.length > 11) return;
+    p.keep = true;
+    const a = crowd.length * 0.55 + rand(-0.1, 0.1), rr = spot.y > blockY(PLAZA.r) && spot.y < blockY(PLAZA.r) + BH && plazaVisible() ? 9 : 6;
+    const tx = spot.x + Math.cos(a) * rr * 1.4, ty = spot.y + Math.sin(a) * rr * 0.7 - (plazaVisible() || parkVisible() ? 0 : 2);
+    p.brain = (function* () { yield* pwalk(p, tx, ty, 9, 12); while (playing) { yield; } yield* wait(rand(0, 1.5)); p.keep = false; p.state = 'walk'; const q = sidePos(p.c, p.r, p.s); yield* pwalk(p, q.x, q.y, 9, 10); })();
+    crowd.push(p);
+  };
+  while (t < 22) {
+    const dt = yield; t += dt;
+    if (chance(dt * 1.2)) tryJoin();
+    if (chance(dt * 1.5)) emoteAt(spot.x + rand(-4, 4), spot.y - 2, band[1], 1.2);
+    if (t > 8 && chance(dt * 0.8) && crowd.length) { const p = pick(crowd); emoteAt(p.x, p.y, chance(0.5) ? 'heart' : 'star', 1.2); }
+  }
+  popText(spot.x, spot.y - 4, 'BRAVO!', '#ffffff', 1.8);
+  for (let k = 0; k < 20; k++) addPart(spot.x + rand(-8, 8), spot.y - 4, rand(-10, 10), rand(-14, -4), 1.2, ['#ff5a8a', '#ffe040', '#5ac8ff', '#ffffff'], { air: true, drag: 0.6 });
+  yield* wait(2);
+  playing = false;
+  perf.brain = pwalk(perf, spot.x + 40, spot.y, 8, 8);
+  yield* wait(6);
+  perf.dead = true;
+  crowd.forEach(p => { if (p.brain) p.keep = false; });
+}
+
+// Pigeons land on the sidewalk, a kid runs through and they burst into the air
+function* pigeons() {
+  const b = pick(blocksNear(focus(8), 1)); if (!b) return;
+  const S = sideRect(b.c, b.r), spot = plazaVisible() ? { x: blockX(PLAZA.c0) + 20, y: blockY(PLAZA.r) + 12 } : { x: S.x + rand(10, S.w - 10), y: S.y + S.h };
+  const birds = Array.from({ length: randi(8, 12) }, () => ({ x: spot.x + rand(-60, -30), y: spot.y - rand(40, 60), tx: spot.x + rand(-7, 7), ty: spot.y + rand(-2, 1), z: 20, state: 'in', t: rand(0, 3), vx: 0, vy: 0 }));
+  const fx = addFx({ layer: 'air', dur: 1e9, draw() {
+    for (const p of birds) {
+      const X = Math.round(p.x), Y = Math.round(p.y - p.z), up = p.state !== 'peck' && Math.floor(p.t * 10) % 2;
+      if (p.z > 1) { ctx.globalAlpha = 0.25; ctx.fillStyle = '#10101e'; ctx.fillRect(Math.round(p.x), Math.round(p.y), 2, 1); ctx.globalAlpha = 1; }
+      ctx.fillStyle = '#7a7a88'; ctx.fillRect(X, Y, 2, 1);
+      ctx.fillStyle = '#4a6a6a'; ctx.fillRect(X + (p.vx < 0 ? 0 : 1), Y - (p.state === 'peck' && Math.floor(p.t * 4) % 2 ? 0 : 1), 1, 1);
+      if (up) { ctx.fillStyle = '#9a9aa8'; ctx.fillRect(X - 1, Y - 1, 1, 1); ctx.fillRect(X + 2, Y - 1, 1, 1); }
+    }
+  } });
+  let t = 0;
+  while (t < 5) { const dt = yield; t += dt; for (const p of birds) { p.t += dt; p.x = lerp(p.x, p.tx, dt * 1.2); p.y = lerp(p.y, p.ty, dt * 1.2); p.z = Math.max(0, p.z - dt * 6); p.vx = p.tx - p.x; if (p.z < 0.5) p.state = 'peck'; } }
+  for (let k = 0; k < 40; k++) { yield; for (const p of birds) { p.t += 1 / 30; if (chance(0.02)) p.tx += rand(-2, 2); p.x = lerp(p.x, p.tx, 0.05); } }
+  const kid = new Ped(b.c, b.r, { keep: true, shirt: '#ff5a5a', hair: '#8a4a2a', speed: 18 });
+  kid.x = spot.x - 40; kid.y = spot.y;
+  kid.brain = pwalk(kid, spot.x + 50, spot.y, 22, 8);
+  while (kid.brain && kid.x < spot.x - 8) { const dt = yield; for (const p of birds) p.t += dt; }
+  emoteAt(kid.x, kid.y, 'heart', 1.5);
+  birds.forEach(p => { p.state = 'fly'; p.vx = rand(-30, 30); p.vy = rand(-40, -15); });
+  t = 0;
+  while (t < 4) { const dt = yield; t += dt; for (const p of birds) { p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.z += 25 * dt; } }
+  fx.dur = 0;
+  yield* until(() => !kid.brain, 8);
+  kid.dead = true;
+}
+
+// Double-parked delivery: truck stops, hazards blink, a worker wheels boxes in, traffic honks and squeezes past
+function* delivery() {
+  const pt = focus(10), E = avenueEntry(pt); if (!E) return;
+  const i = E.i, L = lane('v', i, 0), v = view(), start = E.start;
+  if (!L.exists(start) || !spaceFree(L, start, 12)) return;
+  const tr = spawnCar('truck', L, start, { noTurn: true, v: 25 });
+  const stopY = clamp(pt.y + rand(-20, 20), v.y0 + 30, v.y1 - 30);
+  yield* until(() => tr.dead || Math.abs(tr.pos - stopY) < 3, 25);
+  if (tr.dead) return;
+  tr.hold = true;
+  const blink = addFx({ layer: 'air', dur: 1e9, draw() { if (Math.floor(world.t * 3) % 2 && !tr.dead) { ctx.fillStyle = '#ffa020'; ctx.fillRect(Math.round(tr.x) - 2, Math.round(tr.y) - 5, 1, 1); ctx.fillRect(Math.round(tr.x) + 2, Math.round(tr.y) - 5, 1, 1); ctx.fillRect(Math.round(tr.x) - 2, Math.round(tr.y) + 4, 1, 1); ctx.fillRect(Math.round(tr.x) + 2, Math.round(tr.y) + 4, 1, 1); } } });
+  const c = Math.max(0, i - 1), r = clamp(Math.floor(stopY / PY), 0, NS - 2);
+  const w = new Ped(c, r, { keep: true, shirt: '#8a5a2a', hair: '#1a1a1a' });
+  w.x = tr.x - 3; w.y = tr.y;
+  const door = { x: blockX(c) + BW - 3, y: tr.y };
+  let carrying = false;
+  w.extra = (p, X, Y) => { if (carrying) { ctx.fillStyle = '#c89a5a'; ctx.fillRect(X - 1, Y - 3, 3, 2); ctx.fillStyle = '#a87a3a'; ctx.fillRect(X - 1, Y - 2, 3, 1); } };
+  for (let k = 0; k < 3; k++) {
+    carrying = true; w.brain = pwalk(w, door.x, door.y, 7, 5); yield* until(() => !w.brain, 6);
+    carrying = false; yield* wait(0.8);
+    w.brain = pwalk(w, tr.x - 3, tr.y, 9, 5); yield* until(() => !w.brain, 6);
+    if (k === 1) { const behind = L.cars.filter(o => o !== tr && (tr.pos - o.pos) * L.dir > 0 && Math.abs(tr.pos - o.pos) < 40)[0]; if (behind) behind.honk(); }
+  }
+  w.dead = true; emoteAt(tr.x, tr.y - 3, 'star', 1.2);
+  blink.dur = 0; tr.hold = false; tr.noTurn = false;
+  yield* wait(3);
+}
+
+// Dog walker with a pack of pups that gets hilariously tangled
+function* dogs() {
+  const b = pick(blocksNear(focus(10), 1)); if (!b) return;
+  const walker = new Ped(b.c, b.r, { keep: true, shirt: '#3ab86a', hair: '#c8a050' });
+  const S = sideRect(b.c, b.r), y = S.y + S.h, x0 = S.x, x1 = S.x + S.w;
+  walker.x = x0; walker.y = y;
+  const pups = Array.from({ length: 6 }, (_, k) => ({ a: (k / 6) * 6.283, r: rand(3, 5), col: pick(['#a8703a', '#f4f4f4', '#2a2a2a', '#d8b070', '#8a5a3a']), x: x0, y }));
+  let tangle = 0, t = 0;
+  walker.extra = (p, X, Y) => {
+    for (const d of pups) {
+      ctx.fillStyle = 'rgba(40,40,40,0.5)';
+      const n = Math.ceil(Math.hypot(d.x - X, d.y - Y));
+      for (let s = 1; s < n; s += 2) ctx.fillRect(Math.round(lerp(X, d.x, s / n)), Math.round(lerp(Y, d.y, s / n)), 1, 1);
+      ctx.fillStyle = d.col; ctx.fillRect(Math.round(d.x), Math.round(d.y), 2, 1);
+      ctx.fillStyle = shade(d.col.length === 7 ? d.col : '#888888', 0.6); ctx.fillRect(Math.round(d.x) + (Math.floor(world.t * 8 + d.a) % 2), Math.round(d.y) - 1, 1, 1);
+    }
+  };
+  walker.brain = (function* () {
+    for (;;) {
+      const dt = yield; t += dt; walker.t += dt;
+      if (tangle <= 0) walker.x += 5 * dt;
+      for (const d of pups) {
+        d.a += dt * (tangle > 0 ? 6 : 0.6 + Math.sin(t + d.r) * 0.5);
+        const tx = walker.x + 3 + Math.cos(d.a) * d.r * (tangle > 0 ? 0.6 : 1.3), ty = walker.y + Math.sin(d.a) * (tangle > 0 ? 2 : 2.5);
+        d.x = lerp(d.x, tx, dt * 5); d.y = lerp(d.y, ty, dt * 5);
+      }
+      if (tangle > 0) tangle -= dt;
+      if (walker.x > x1) return;
+    }
+  })();
+  yield* wait(rand(5, 8));
+  tangle = 4; emoteAt(walker.x, walker.y, 'bang', 1.2); popText(walker.x, walker.y - 4, 'WHOA!', '#ffffff', 1.4);
+  for (let k = 0; k < 3; k++) later(() => emoteAt(pups[k].x, pups[k].y, 'heart', 1.2), 1 + k * 0.6);
+  yield* until(() => !walker.brain, 30);
+  walker.dead = true;
+}
+
+// Ice cream truck parks, a line forms, everyone leaves happy
+function* foodtruck() {
+  const pt = focus(10), E = avenueEntry(pt); if (!E) return;
+  const i = E.i, L = lane('v', i, 2), v = view(), start = E.start;
+  if (!L.exists(start) || !spaceFree(L, start, 12)) return;
+  const tr = spawnCar('ice', L, start, { noTurn: true, v: 18 });
+  const stopY = clamp(pt.y + rand(-15, 15), v.y0 + 40, v.y1 - 40);
+  popText(tr.x, tr.y, '♪ DING DING', '#ff8ac0', 2);
+  yield* until(() => tr.dead || Math.abs(tr.pos - stopY) < 3, 25);
+  if (tr.dead) return;
+  tr.hold = true;
+  for (let k = 0; k < 20; k++) { tr.lat = lerp(tr.lat, 1.5, 0.15); yield; }
+  const curbX = AX(i) + AW + 2, line = [];
+  let t = 0;
+  while (t < 20) {
+    const dt = yield; t += dt;
+    if (chance(dt * 0.8) && line.length < 6) {
+      const p = pedsNear(curbX, tr.y, 70)[0];
+      if (p) {
+        p.keep = true; const slot = line.length; line.push(p);
+        p.brain = (function* () {
+          yield* pwalk(p, curbX, tr.y - 3 - slot * 3, 8, 12);
+          while (line[0] !== p) { const idx = line.indexOf(p); yield* pwalk(p, curbX, tr.y - 3 - idx * 3, 6, 2); yield; }
+          yield* wait(1.5);
+          emoteAt(p.x, p.y, 'heart', 1.4);
+          p.extra = (q, X, Y) => { ctx.fillStyle = pick(['#ff8ac0', '#fff4d0']); ctx.fillRect(X + 2, Y - 1, 1, 1); ctx.fillStyle = '#c89a5a'; ctx.fillRect(X + 2, Y, 1, 1); };
+          line.shift();
+          const q = sidePos(p.c, p.r, p.s); yield* pwalk(p, q.x, q.y, 8, 10);
+          p.keep = false; p.state = 'walk';
+        })();
+      }
+    }
+  }
+  yield* until(() => line.length === 0, 12);
+  tr.hold = false; tr.noTurn = false;
+  popText(tr.x, tr.y, '♪', '#ff8ac0', 1);
+  yield* wait(2);
+}
+
+// Frisbee on the Great Lawn with a very good dog
+function* picnic() {
+  if (!parkVisible()) return;
+  const G = parkData.lawn, a = { x: G.x - 20 + rand(-8, 8), y: G.y + rand(-15, 15) }, b = { x: G.x + 20 + rand(-8, 8), y: G.y + rand(-15, 15) };
+  if (!onView(G.x, G.y, -10)) return;
+  const fr = { x: a.x, y: a.y, z: 0 }, dog = { x: a.x + 3, y: a.y + 2 };
+  let from = a, to = b, s = 0, catches = 0;
+  const fx = addFx({ layer: 'ground', dur: 1e9, draw() {
+    for (const [p, col] of [[a, '#e84a4a'], [b, '#3a7ae8']]) { ctx.fillStyle = col; ctx.fillRect(Math.round(p.x), Math.round(p.y), 2, 1); ctx.fillStyle = '#5a3a1a'; ctx.fillRect(Math.round(p.x), Math.round(p.y) - 1, 1, 1); }
+    ctx.fillStyle = '#e8c070'; ctx.fillRect(Math.round(dog.x), Math.round(dog.y), 2, 1); ctx.fillStyle = '#a8703a'; ctx.fillRect(Math.round(dog.x) + 1, Math.round(dog.y) - 1, 1, 1);
+    ctx.globalAlpha = 0.3; ctx.fillStyle = '#10101e'; ctx.fillRect(Math.round(fr.x), Math.round(fr.y), 2, 1); ctx.globalAlpha = 1;
+    ctx.fillStyle = '#ff5ad0'; ctx.fillRect(Math.round(fr.x), Math.round(fr.y - fr.z), 2, 1);
+  } });
+  while (catches < 6) {
+    const dt = yield; s += dt / 1.4;
+    fr.x = lerp(from.x, to.x, s); fr.y = lerp(from.y, to.y, s); fr.z = Math.sin(Math.PI * clamp(s, 0, 1)) * 8;
+    dog.x = lerp(dog.x, fr.x, dt * 2.2); dog.y = lerp(dog.y, fr.y, dt * 2.2);
+    if (s >= 1) {
+      catches++; s = 0;
+      if (catches === 4) { popText(dog.x, dog.y - 2, 'GOOD DOG!', '#ffe040', 1.8); emoteAt(dog.x, dog.y, 'heart', 1.6); fr.x = dog.x; yield* wait(1.5); }
+      [from, to] = [to, from];
+    }
+  }
+  fx.dur = 0;
+}
+
+// Ferry docks at a pier: passengers stream off and on, TOOT TOOT
+function* ferry() {
+  const side = riverVisible('w') ? 'w' : riverVisible('e') ? 'e' : null; if (!side) return;
+  const pt = focus(12);
+  let j = Math.round((pt.y - 12) / PY / 9) * 9 + 4;
+  if (side === 'e' && Math.abs(j - BRIDGE_ST) < 5) j += 9;
+  const pierY = SY(j) + 8, px0 = side === 'w' ? -84 : LAND_W + 12;
+  if (!onView(side === 'w' ? -40 : LAND_W + 40, pierY, 40)) return;
+  const dockX = side === 'w' ? px0 - 6 : px0 + 78, v = view();
+  const dir = pierY > cam.y ? -1 : 1;
+  const boat = spawnBoat(side, { kind: 'ferry', dir, y: dir > 0 ? v.y0 - 30 : v.y1 + 30 });
+  boat.x = dockX;
+  boat.vy = dir * 12;
+  yield* until(() => Math.abs(boat.y - pierY - 7) < 3, 30);
+  boat.docked = true; boat.y = pierY + 7;
+  popText(boat.x, boat.y - 10, 'TOOT TOOT!', '#ffffff', 2);
+  const walkers = [];
+  for (let k = 0; k < 10; k++) later(() => {
+    const p = new Ped(0, 0, { keep: true }); p.x = dockX + (side === 'w' ? 5 : -5); p.y = pierY + 7 + rand(-1, 1);
+    const endX = side === 'w' ? -10 : LAND_W + 10;
+    p.brain = (function* () { yield* pwalk(p, endX, p.y, 9, 20); yield* pwalk(p, endX, p.y + rand(-40, 40), 9, 10); p.dead = true; })();
+    walkers.push(p);
+  }, k * 0.5);
+  yield* wait(9);
+  boat.docked = false; boat.vy = dir * 10;
+  popText(boat.x, boat.y - 10, 'TOOT!', '#ffffff', 1.4);
+  yield* wait(4);
+}
+
+// Helicopter flyover (with a searchlight at night)
+function* helicopter(o = {}) {
+  const v = view(), dir = o.dir ?? coin(), y = o.y ?? rand(v.y0 + 30, v.y1 - 30);
+  const h = { x: dir > 0 ? v.x0 - 40 : v.x1 + 40, y, vx: dir * (o.speed || 30), t: 0, follow: o.follow };
+  const fx = addFx({ layer: 'air', dur: 1e9, draw() {
+    const X = Math.round(h.x), Y = Math.round(h.y), d = Math.sign(h.vx) || 1;
+    ctx.globalAlpha = 0.25; ctx.fillStyle = '#10101e'; ctx.fillRect(X + 18, Y + 24, 8, 3); ctx.globalAlpha = 1;
+    ctx.fillStyle = o.police ? '#2a3a8a' : '#e8e8ec'; ctx.fillRect(X - 3, Y - 2, 7, 4); ctx.fillStyle = '#6ac8f0'; ctx.fillRect(X + d * 3, Y - 1, 1, 2);
+    ctx.fillStyle = o.police ? '#2a3a8a' : '#c83a3a'; ctx.fillRect(X - d * 10, Y, 7 * 1, 1); if (d < 0) ctx.fillRect(X + 3, Y, 7, 1);
+    ctx.fillStyle = '#2a2a30'; const a = h.t * 30;
+    for (let k = -8; k <= 8; k++) { ctx.fillRect(Math.round(X + Math.cos(a) * k), Math.round(Y + Math.sin(a) * k * 0.5), 1, 1); }
+    if (Math.floor(h.t * 4) % 2) { ctx.fillStyle = '#ff3a3a'; ctx.fillRect(X - d * 10, Y - 1, 1, 1); }
+  } });
+  const beam = addFx({ layer: 'nightglow', dur: 1e9, draw() {
+    if (world.dark < 0.4) return;
+    const tx = h.follow ? h.follow.x : h.x + 10, ty = h.follow ? h.follow.y : h.y + 20;
+    ctx.globalAlpha = 0.35; ctx.fillStyle = '#fff8d0'; ctx.beginPath(); ctx.arc(tx, ty, 9, 0, 6.283); ctx.fill();
+    ctx.globalAlpha = 0.12; ctx.beginPath(); ctx.moveTo(h.x, h.y); ctx.lineTo(tx - 8, ty); ctx.lineTo(tx + 8, ty); ctx.fill(); ctx.globalAlpha = 1;
+  } });
+  while (h.t < 40) {
+    const dt = yield; h.t += dt;
+    if (h.follow && !h.follow.dead) { h.x = lerp(h.x, h.follow.x - 10, dt * 0.8); h.y = lerp(h.y, h.follow.y - 20, dt * 0.8); h.vx = (h.follow.x - h.x) || h.vx; }
+    else h.x += h.vx * dt;
+    if (!onView(h.x, h.y, 80) && h.t > 3) break;
+  }
+  fx.dur = 0; beam.dur = 0;
+}
+
+// ---------------------------------------------------------------- RARE EVENTS
+function spectators(i, v, n) {
+  const out = [];
+  for (let k = 0; k < n; k++) {
+    const side = k % 2, p = new Ped(0, 0, { keep: true });
+    p.x = side ? AX(i) + AW + 1 + randi(0, 1) : AX(i) - 2 - randi(0, 1);
+    p.y = rand(v.y0 - 40, v.y1 + 40);
+    if (!avenueAt(i, p.y) || Math.floor(p.y / PY) * PY + SW > p.y) { p.dead = true; continue; }
+    p.brain = (function* () { for (;;) { const dt = yield; p.t += dt * 0.2; if (chance(dt * 0.08)) emoteAt(p.x, p.y, pick(['star', 'heart', 'wave']), 1.2); } })();
+    p.extra = (q, X, Y) => { if (q.sign) { ctx.fillStyle = q.sign; ctx.fillRect(X - 1, Y - 3, 3, 2); } };
+    if (chance(0.15)) p.sign = pick(['#ffe040', '#ff5a8a', '#5ac8ff', '#ffffff']);
+    out.push(p);
+  }
+  return out;
+}
+function closeAvenue(i) {
+  world.closedAve = i;
+  for (let k = 0; k < 3; k++) for (const c of [...lane('v', i, k).cars]) if (!onView(c.x, c.y, 20)) c.remove();   // visible cars just drive away
+}
+const BALLOONS = {
+  dog(g, x, y) { g('#a8703a', x - 8, y - 4, 14, 9); g('#a8703a', x + 4, y - 8, 8, 8); g('#6a4a2a', x + 4, y - 9, 3, 5); g('#6a4a2a', x + 10, y - 9, 3, 5); g('#1a1a1a', x + 9, y - 5, 1, 1); g('#1a1a1a', x + 11, y - 3, 2, 1); g('#e84a4a', x + 7, y, 4, 1); g('#a8703a', x - 12, y - 3, 4, 2); },
+  star(g, x, y) { for (let k = 0; k < 5; k++) { const a = k * 1.2566 - 1.57; for (let s = 0; s < 10; s++) g('#ffd83a', x + Math.cos(a) * s - 1, y + Math.sin(a) * s - 1, 3, 3); } g('#ffe880', x - 3, y - 3, 6, 6); g('#1a1a1a', x - 2, y - 1, 1, 1); g('#1a1a1a', x + 2, y - 1, 1, 1); g('#e84a4a', x - 1, y + 2, 3, 1); },
+  duck(g, x, y) { g('#ffd83a', x - 8, y - 3, 14, 9); g('#ffd83a', x + 3, y - 9, 8, 8); g('#ff8a1a', x + 11, y - 6, 4, 3); g('#1a1a1a', x + 7, y - 7, 1, 1); g('#f0c02a', x - 6, y - 1, 8, 3); },
+  cat(g, x, y) { g('#8a8aa0', x - 8, y - 4, 14, 9); g('#8a8aa0', x + 3, y - 8, 9, 8); g('#8a8aa0', x + 3, y - 11, 2, 3); g('#8a8aa0', x + 10, y - 11, 2, 3); g('#ffe040', x + 5, y - 6, 1, 1); g('#ffe040', x + 9, y - 6, 1, 1); g('#ff8ab0', x + 7, y - 4, 1, 1); g('#8a8aa0', x - 12, y - 8, 2, 8); },
+};
+// Parade: the avenue closes, crowds line up, giant balloons and a marching band go by
+function* parade() {
+  if (!landVisible()) return;
+  const i = closeAvenueNear(focus(25)); if (i === null) return;
+  closeAvenue(i);
+  const v = view(), dir = i % 2 ? 1 : -1, cx = AX(i) + AW / 2;
+  const crowd = spectators(i, v, 70);
+  let head = dir > 0 ? v.y0 - 40 : v.y1 + 40;
+  const units = [
+    { kind: 'balloon', off: 0, shape: pick(Object.keys(BALLOONS)) },
+    { kind: 'band', off: 40 }, { kind: 'float', off: 80, col: pick(['#ff5a8a', '#5ac8ff', '#8aff6a']) },
+    { kind: 'balloon', off: 125, shape: pick(Object.keys(BALLOONS)) }, { kind: 'clowns', off: 160 }, { kind: 'float', off: 195, col: pick(['#ffd83a', '#c86aff']) },
+  ];
+  const G = (col, x, y, w, h) => { ctx.fillStyle = col; ctx.fillRect(Math.round(x), Math.round(y), w, h); };
+  const fx = addFx({ layer: 'ground', dur: 1e9, draw() {
+    for (const u of units) {
+      const y = head - dir * u.off;
+      if (u.kind === 'band') for (let r = 0; r < 4; r++) for (let c = 0; c < 3; c++) { const X = cx - 4 + c * 4, Y = y - dir * r * 4, st = Math.floor(world.t * 4 + r) % 2; G(r === 0 ? '#ffffff' : '#c83a3a', X, Y, 2, 1); G('#1a1a1a', X + st, Y - 1, 1, 1); if (r === 1) G('#ffd83a', X + 2, Y, 1, 1); }
+      if (u.kind === 'float') { G('#2a2a30', cx - 6, y - 8, 12, 16); G(u.col, cx - 5, y - 7, 10, 14); for (let k = 0; k < 6; k++) G(RAIN[(k + Math.floor(world.t * 3)) % 6], cx - 5 + (k % 2) * 9, y - 7 + k * 2.5, 1, 1); G('#ffffff', cx - 1, y - 2, 2, 2); }
+      if (u.kind === 'clowns') for (let k = 0; k < 5; k++) { const X = cx - 5 + ((k * 7) % 11), Y = y - dir * k * 3 + Math.sin(world.t * 6 + k) * 1.5; G(RAIN[k], X, Y, 2, 1); G('#ff3a3a', X + 1, Y - 1, 1, 1); }
+    }
+  } });
+  const RAIN = ['#ff5a5a', '#ffa23a', '#ffe14a', '#6ad66a', '#4ab0ff', '#b86aff'];
+  const air = addFx({ layer: 'air', dur: 1e9, draw() {
+    for (const u of units) {
+      if (u.kind !== 'balloon') continue;
+      const y = head - dir * u.off, bob = Math.sin(world.t * 1.2 + u.off) * 2, X = cx + Math.sin(world.t * 0.7 + u.off) * 2, Y = y - 16 + bob;
+      ctx.globalAlpha = 0.25; BALLOONS[u.shape]((c, x, yy, w, h) => G('#10101e', x + 8, yy + 20, w, h), X, Y); ctx.globalAlpha = 1;
+      for (const hx of [-5, 0, 5]) { const n = 16; for (let s = 0; s < n; s += 2) G('#5a5a5a', lerp(cx + hx, X, s / n), lerp(y + 2, Y, s / n), 1, 1); G('#e84a4a', cx + hx, y + 2, 2, 1); }
+      BALLOONS[u.shape]((c, x, yy, w, h) => G('#1a1a22', x - 1, yy - 1, w + 2, h + 2), X, Y);
+      BALLOONS[u.shape](G, X, Y);
+    }
+  } });
+  let t = 0;
+  popText(cx, (dir > 0 ? v.y0 : v.y1 - 20) + 30, 'PARADE!', '#ffe040', 2.5);
+  while (t < 150) {
+    const dt = yield; t += dt;
+    head += dir * 7 * dt;
+    if (chance(dt * 6)) { const u = pick(units), y = head - dir * u.off; for (let k = 0; k < 3; k++) addPart(cx + rand(-14, 14), y + rand(-6, 6), rand(-8, 8), rand(-8, 8), rand(2, 4), RAIN, { air: true, drag: 0.5 }); }
+    if (chance(dt * 2)) emoteAt(cx + rand(-4, 4), head - dir * 40, 'note', 1.2);
+    const tail = head - dir * 210, V = view();
+    if ((dir > 0 && tail > V.y1 + 30) || (dir < 0 && tail < V.y0 - 30)) break;
+  }
+  fx.dur = 0; air.dur = 0;
+  world.closedAve = null;
+  crowd.forEach(p => { p.brain = pwalk(p, p.x + (p.x < cx ? -30 : 30), p.y, 8, 6); later(() => (p.dead = true), 5); });
+}
+
+// Marathon: thousands (well, dozens) of runners stream down the avenue while crowds cheer
+function* marathon() {
+  if (!landVisible()) return;
+  const i = closeAvenueNear(focus(25)); if (i === null) return;
+  closeAvenue(i);
+  const v = view(), dir = i % 2 ? 1 : -1, crowd = spectators(i, v, 50), runners = [];
+  const fx = addFx({ layer: 'ground', dur: 1e9, draw() {
+    for (const r of runners) { const X = Math.round(r.x), Y = Math.round(r.y); ctx.fillStyle = r.shirt; ctx.fillRect(X, Y, 2, 1); ctx.fillStyle = '#ffffff'; ctx.fillRect(X, Y, 1, 1); ctx.fillStyle = r.hair; ctx.fillRect(X + (Math.floor(r.t * 10) % 2), Y - 1, 1, 1); }
+  } });
+  popText(AX(i) + 7, (dir > 0 ? v.y0 : v.y1 - 20) + 30, 'MARATHON!', '#5affa0', 2.5);
+  let t = 0;
+  while (t < 70) {
+    const dt = yield; t += dt;
+    const V = view();
+    if (t < 50 && chance(dt * (t < 10 ? 2 : 6))) runners.push({ x: AX(i) + rand(2, 12), y: dir > 0 ? V.y0 - 30 : V.y1 + 30, sp: rand(14, 26), shirt: pick(SHIRTS), hair: pick(HAIRS), t: 0, wob: rand(0, 6) });
+    for (const r of runners) { r.t += dt; r.y += dir * r.sp * dt; r.x += Math.sin(r.t + r.wob) * 2 * dt; }
+    if (chance(dt * 0.6) && runners.length) { const r = pick(runners); emoteAt(r.x, r.y, pick(['star', 'heart']), 1); }
+    for (let k = runners.length - 1; k >= 0; k--) if (runners[k].y < V.y0 - 60 || runners[k].y > V.y1 + 60) runners.splice(k, 1);
+    if (t > 50 && !runners.length) break;
+  }
+  fx.dur = 0;
+  world.closedAve = null;
+  crowd.forEach(p => { p.brain = pwalk(p, p.x + (p.x < AX(i) ? -30 : 30), p.y, 8, 6); later(() => (p.dead = true), 5); });
+}
+
+// Snow day: flakes fall, the city turns white, a plow goes by, someone builds a snowman
+function* snow() {
+  let t = 0;
+  let man = null;
+  while (t < 90) {
+    const dt = yield; t += dt;
+    world.snow = t < 12 ? t / 12 : t > 75 ? Math.max(0, (90 - t) / 15) : 1;
+    world.snowCover = Math.min(1, Math.max(world.snowCover, t / 35));
+    const v = view();
+    for (let k = 0; k < world.snow * VW * 0.12 * dt * 30 / 30; k++) addPart(rand(v.x0 - 20, v.x1 + 20), rand(v.y0 - 10, v.y1), rand(-4, 4), rand(6, 12), rand(3, 7), '#ffffff', { air: true, fade: true });
+    if (t > 20 && !man && landVisible()) {
+      const b = pick(blocksNear(focus(10), 1));
+      if (b) {
+        const S = sideRect(b.c, b.r); man = { x: S.x + rand(8, S.w - 8), y: S.y + S.h - 1, k: 0 };
+        const kid = new Ped(b.c, b.r, { keep: true, shirt: '#ff5a5a', hair: '#e8e8ff' }); kid.x = man.x + 3; kid.y = man.y;
+        kid.brain = (function* () { for (let s = 0; s < 12; s += 1 / 30) { const dt2 = yield; kid.t += dt2; man.k = Math.min(3, s / 3); } emoteAt(kid.x, kid.y, 'heart', 2); yield* wait(3); yield* pwalk(kid, kid.x + 30, kid.y, 8, 6); kid.dead = true; })();
+        addFx({ layer: 'ground', dur: 80, draw(f) {
+          const X = Math.round(man.x), Y = Math.round(man.y), melt = f.t > 60 ? (f.t - 60) / 20 : 0;
+          if (melt >= 1) return;
+          ctx.fillStyle = '#ffffff';
+          if (man.k > 0) ctx.fillRect(X - 1, Y - 1, 3, 3);
+          if (man.k > 1 && melt < 0.7) ctx.fillRect(X - 1, Y - 3, 2, 2);
+          if (man.k > 2 && melt < 0.4) { ctx.fillStyle = '#ff8a1a'; ctx.fillRect(X + 1, Y - 3, 1, 1); ctx.fillStyle = '#c83a3a'; ctx.fillRect(X - 1, Y - 2, 2, 1); }
+        } });
+      }
+    }
+    if (Math.floor(t) === 30 && Math.floor(t - dt) !== 30 && landVisible()) {
+      const i = closeAvenueNear(focus(10));
+      if (i !== null) { const L = lane('v', i, 1), V = view(), s0 = L.dir > 0 ? V.y0 - 60 : V.y1 + 60; if (L.exists(s0) && spaceFree(L, s0, 10)) { const p = spawnCar('suv', L, s0, { col: '#ff8a1a', noTurn: true }); p.v0 = 18; p.plow = true; popText(L.c, (L.dir > 0 ? V.y0 : V.y1 - 20) + 25, 'SNOW PLOW', '#ff8a1a', 2); } }
+    }
+    for (const c of cars) if (c.plow && chance(dt * 20)) addPart(c.x + rand(-3, 3), c.y + c.lane.dir * 4, rand(-12, 12), rand(-6, 6), 0.8, '#ffffff');
+  }
+  world.snow = 0;
+  while (world.snowCover > 0) { world.snowCover = Math.max(0, world.snowCover - (yield) / 25); }
+}
+
+// Police chase: a getaway car tears down the avenue, sirens, and a helicopter follows
+function* chase() {
+  if (!landVisible()) return;
+  const E = avenueEntry(focus(4), 70); if (!E) return;
+  const i = E.i, L = lane('v', i, 1), v = view(), start = E.start;
+  for (const c of [...L.cars]) if ((c.pos - start) * L.dir < 60 && (c.pos - start) * L.dir > -20) c.remove();
+  const bad = spawnCar('car', L, start, { col: '#e8302a', noTurn: true, v: 60, siren: true, quiet: true });
+  bad.v0 = 70;
+  const cops = [];
+  const heli = helicopter({ follow: bad, police: true, speed: 60 });
+  let t = 0;
+  while (t < 40) {
+    const dt = yield; t += dt;
+    heli.next(dt);
+    if (cops.length < 2 && t > 0.8 + cops.length * 0.6) { const p = start - L.dir * 10; if (spaceFree(L, p, 8)) { const c = spawnCar('police', L, p, { siren: true, chase: true, noTurn: true, v: 60 }); c.v0 = 66; cops.push(c); } }
+    if (chance(dt * 0.5) && !bad.dead && onView(bad.x, bad.y)) popText(bad.x, bad.y, pick(['WEE-OOO', 'STOP!']), '#8ab8ff', 1);
+    if (bad.dead && cops.every(c => c.dead) && t > 5) break;
+  }
+  while (!heli.next(1 / 30).done && t < 60) { t += yield; }
+}
+
+// Fireworks over the river or the park (dims the sky if it's still daytime)
+function* fireworks() {
+  const v = view();
+  let site;
+  if (riverVisible('w')) site = { x: clamp(-60, v.x0 + 20, v.x1 - 20), y: cam.y };
+  else if (riverVisible('e')) site = { x: clamp(LAND_W + 60, v.x0 + 20, v.x1 - 20), y: cam.y };
+  else if (parkVisible()) site = { x: parkData.lawn.x, y: clamp(parkData.lawn.y, v.y0 + 30, v.y1 - 30) };
+  else site = { x: cam.x, y: cam.y };
+  let t = 0;
+  while (t < 4) { t += yield; world.dim = Math.min(0.72, t / 4 * 0.72); }
+  const COLS = [['#ff5a8a', '#ffc0d8'], ['#5ac8ff', '#c8f0ff'], ['#ffe040', '#fff4b0'], ['#8aff6a', '#d8ffc8'], ['#c86aff', '#ecd0ff']];
+  t = 0;
+  let next = 0.5, shots = 0;
+  while (t < 30 || shots < 14) {
+    const dt = yield; t += dt; next -= dt;
+    const S = { x: site.x + (cam.x - site.x) * 0.3, y: cam.y };
+    if (next <= 0 && shots < 22) {
+      next = rand(0.5, 1.8); shots++;
+      const bx = S.x + rand(-VW * 0.35, VW * 0.35), by = S.y + rand(-VH * 0.35, VH * 0.1), col = pick(COLS), from = { x: bx + rand(-10, 10), y: by + 50 };
+      const rocket = addFx({ layer: 'glow', dur: 0.9, draw(f) { const k = f.t / 0.9; ctx.fillStyle = '#fff8d0'; ctx.fillRect(Math.round(lerp(from.x, bx, k)), Math.round(lerp(from.y, by, k)), 1, 2); }, done() {
+        const n = randi(28, 44), sp = rand(18, 30);
+        for (let k = 0; k < n; k++) { const a = (k / n) * 6.283; addPart(bx, by, Math.cos(a) * sp * rand(0.8, 1.1), Math.sin(a) * sp * rand(0.8, 1.1), rand(1.2, 2), [col[1], col[0], col[0], '#8a6a4a'], { glow: true, drag: 0.35 }); }
+        addFx({ layer: 'glow', dur: 0.3, draw(f) { ctx.globalAlpha = 0.25 * (1 - f.t / 0.3); ctx.fillStyle = col[0]; ctx.beginPath(); ctx.arc(bx, by, 18, 0, 6.283); ctx.fill(); ctx.globalAlpha = 1; } });
+        if (chance(0.25)) popText(cam.x + rand(-VW * 0.3, VW * 0.3), cam.y + VH * 0.35, pick(['OOOH!', 'AAAH!', 'WOW!']), '#ffffff', 1.4);
+      } });
+      void rocket;
+    }
+  }
+  yield* wait(2.5);
+  t = 0;
+  while (t < 5) { t += yield; world.dim = 0.72 * (1 - t / 5); }
+  world.dim = 0;
+}
+
+// ---------------------------------------------------------------- director
+const COMMON = { taxi: 3, fire: 1.2, performer: 2, pigeons: 2, delivery: 1.8, dogs: 1.6, foodtruck: 1.4, picnic: 1.5, ferry: 1.5, helicopter: 1.2 };
+const RARE = { parade: 1, marathon: 1, snow: 1, chase: 1, fireworks: 1 };
+const EVENTS = { taxi, fire, performer, pigeons, delivery, dogs, foodtruck, picnic, ferry, helicopter, parade, marathon, snow, chase, fireworks };
+const ALL_EVENTS = Object.keys(EVENTS);
+const FEASIBLE = {
+  taxi: landVisible, fire: landVisible, performer: () => landVisible() || parkVisible(), pigeons: landVisible, delivery: landVisible, dogs: landVisible, foodtruck: landVisible,
+  picnic: parkVisible, ferry: () => riverVisible('w') || riverVisible('e'), helicopter: () => true,
+  parade: landVisible, marathon: landVisible, snow: () => true, chase: landVisible, fireworks: () => true,
+};
+const director = { cur: null, name: '', cool: 6, last: '', idx: 0, runT: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    director.runT += dt;
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done || director.runT > 200) {
+      const quick = director.runT < 0.5;
+      director.cur = null; director.name = '';
+      world.closedAve = null; world.dim = 0;
+      director.cool = quick ? 2 : FORCE ? 4 : rand(12, 28);
+    }
+  } else if ((director.cool -= dt) <= 0) {
+    let name = null;
+    if (FORCE) name = FORCE === 'all' ? ALL_EVENTS[director.idx++ % ALL_EVENTS.length] : FORCE;
+    else {
+      for (let k = 0; k < 10 && !name; k++) {
+        const n = chance(0.14) ? weighted(RARE) : weighted(COMMON);
+        if (n !== director.last && FEASIBLE[n]()) name = n;
+      }
+    }
+    if (!name || !EVENTS[name]) { director.cool = 3; return; }
+    director.last = director.name = name; director.runT = 0;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; }
+  }
+}
+
+// ---------------------------------------------------------------- dynamic scenery
+function drawWater(v) {
+  if (v.x0 > -12 && v.x1 < LAND_W + 12) return;
+  for (let k = 0; k < 90; k++) {
+    const x = Math.floor(hash(k, 1, 1) * (WX1 - WX0)) + WX0, y = Math.floor(((hash(k, 2, 2) * LAND_H) + world.t * (4 + hash(k, 3) * 4)) % LAND_H);
+    if ((x > -14 && x < LAND_W + 14) || x < v.x0 || x > v.x1 || y < v.y0 || y > v.y1) continue;
+    if (Math.sin(world.t * 1.5 + k) > 0.3) { ctx.fillStyle = '#6aa0c8'; ctx.fillRect(x, y, 3, 1); }
+  }
+  for (let y = Math.max(0, v.y0 - (v.y0 % 6)); y < v.y1; y += 6) for (let x = v.x0 - (v.x0 % 9); x < v.x1; x += 9) {
+    if (x > -14 && x < LAND_W + 14) continue;
+    if (Math.sin(world.t * 0.8 + x * 0.13 + y * 0.29) > 0.85) { ctx.fillStyle = '#4a7aa8'; ctx.fillRect(x + ((y / 6) % 2) * 4, y, 2, 1); }
+  }
+}
+function drawPlazaBoards() {
+  const x0 = blockX(PLAZA.c0), x1 = blockX(PLAZA.c1) + BW, y = blockY(PLAZA.r);
+  if (!onView((x0 + x1) / 2, y, 140)) return;
+  const cols = ['#ff3a8a', '#3ad8ff', '#ffe03a', '#8a4aff', '#3aff8a', '#ff8a3a'];
+  for (const [bx, by, bw, bh, k] of [[x0 - 1, y - 12, 18, 6, 0], [x0 + 26, y - 12, 22, 6, 1], [x1 - 40, y - 12, 26, 6, 2], [x0 - 1, y + BH + 6, 20, 6, 3], [x1 - 30, y + BH + 6, 24, 6, 4], [x0 + 60, y + BH + 6, 16, 6, 5]]) {
+    const ph = Math.floor(world.t * 0.7 + k * 1.7), c = cols[(ph + k) % cols.length];
+    ctx.fillStyle = '#1a1a22'; ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+    ctx.fillStyle = c; ctx.fillRect(bx, by, bw, bh);
+    const m = Math.floor(world.t * 8 + k * 3) % (bw + 8);
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(bx + (m % bw), by + 2, 3, 2);
+    if (ph % 3 === 0) { ctx.fillStyle = shade(c, 0.6); ctx.fillRect(bx + 2, by + 1, bw - 4, 1); }
+    world.plazaLights = world.plazaLights || [];
+  }
+}
+function drawCranes() {
+  for (const [c, r] of CONSTRUCTION) {
+    const C = blockBuildings(c, r).construction;
+    if (!C || !onView(C.x + C.w / 2, C.y, 100)) continue;
+    const bx = C.x + C.w - 10, by = C.y + 10, a = world.t * 0.12 + c, len = 34, ex = bx + Math.cos(a) * len, ey = by + Math.sin(a) * len * 0.8;
+    ctx.globalAlpha = 0.3; ctx.fillStyle = '#10101e';
+    for (let k = 0; k <= len; k += 1) ctx.fillRect(Math.round(lerp(bx, ex, k / len) + 14), Math.round(lerp(by, ey, k / len) + 19), 2, 1);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#6a5a3a'; ctx.fillRect(bx - 2, by - 2, 5, 5);
+    for (let k = -8; k <= len; k += 1) { const X = Math.round(lerp(bx, ex, k / len)), Y = Math.round(lerp(by, ey, k / len)); ctx.fillStyle = k % 4 === 0 ? '#c8901a' : '#ffc02a'; ctx.fillRect(X, Y, 2, 2); }
+    ctx.fillStyle = '#3a3a40'; ctx.fillRect(Math.round(lerp(bx, ex, 0.7)), Math.round(lerp(by, ey, 0.7)) + 2, 1, 3);
+    ctx.fillStyle = '#8a6a4a'; ctx.fillRect(Math.round(lerp(bx, ex, 0.7)) - 2, Math.round(lerp(by, ey, 0.7)) + 5, 5, 2);
+  }
+}
+function drawFountain() {
+  const F = parkData.fountain;
+  if (!onView(F.x, F.y, 30)) return;
+  for (let k = 0; k < 10; k++) { const a = (k / 10) * 6.283 + world.t, r = 2 + ((world.t * 6 + k) % 4); ctx.fillStyle = k % 2 ? '#d8f0ff' : '#a8d8f8'; ctx.fillRect(Math.round(F.x + Math.cos(a) * r), Math.round(F.y + Math.sin(a) * r), 1, 1); }
+}
+
+// ---------------------------------------------------------------- main loop
+function update(dt) {
+  world.t += dt;
+  updateDaylight(dt);
+  updateTraffic(dt);
+  updatePeople(dt);
+  updateLife(dt);
+  runDirector(dt);
+  for (const p of world.parts) {
+    p.life -= dt;
+    if (p.drag !== 1) { const k = Math.pow(p.drag, dt); p.vx *= k; p.vy *= k; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.grav) { p.vz -= p.grav * dt; p.z += p.vz * dt; if (p.z < 0) { p.z = 0; p.vz = 0; p.vx *= 0.5; p.vy *= 0.5; } }
+  }
+  for (const f of world.fx) f.t += dt;
+  const done = world.fx.filter(f => f.t > f.dur && f.done);
+  world.parts = world.parts.filter(p => p.life > 0);
+  world.fx = world.fx.filter(f => f.t <= f.dur);
+  for (const f of done) f.done();
+}
+function drawParts(pred) {
+  for (const p of world.parts) {
+    if (!pred(p)) continue;
+    const k = p.life / p.max, X = Math.round(p.x), Y = Math.round(p.y - p.z);
+    if (p.fade && k < 0.4 && bayer(X, Y) > k * 2.5) continue;
+    ctx.fillStyle = Array.isArray(p.col) ? p.col[Math.min(p.col.length - 1, Math.floor((1 - k) * p.col.length))] : p.col;
+    ctx.fillRect(X, Y, p.size, p.size);
+  }
+}
+function drawFx(layer) { for (const f of world.fx) if (f.layer === layer && f.t >= 0 && f.draw) f.draw(f); }
+function render() {
+  const v0 = view(), v = { x0: v0.x0 - M, y0: v0.y0 - M, x1: v0.x1 + M, y1: v0.y1 + M };
+  renderOrigin.x = v0.x0; renderOrigin.y = v0.y0;
+  ctx.setTransform(1, 0, 0, 1, -v.x0, -v.y0);
+  ctx.fillStyle = COL.water; ctx.fillRect(v.x0, v.y0, VW + 2 * M, VH + 2 * M);
+  const cx0 = Math.floor((v.x0 - WX0) / CH), cx1 = Math.floor((v.x1 - WX0) / CH), cy0 = Math.floor(v.y0 / CH), cy1 = Math.floor(v.y1 / CH);
+  for (let cy = Math.max(0, cy0); cy <= cy1; cy++) for (let cx = Math.max(0, cx0); cx <= cx1; cx++) ctx.drawImage(getChunk(cx, cy), cx * CH + WX0, cy * CH);
+  drawWater(v);
+  drawFountain();
+  drawFx('ground');
+  drawLights();
+  drawLife('ground');
+  drawParts(p => !p.air && !p.glow);
+  drawCity(v);
+  drawPlazaBoards();
+  drawCranes();
+  drawFx('front');
+  drawLife('air');
+  drawParts(p => p.air && !p.glow);
+  drawFx('air');
+  if (world.snowCover > 0.01) {
+    ctx.globalAlpha = world.snowCover * 0.55; ctx.fillStyle = '#f4f8ff'; ctx.fillRect(v.x0, v.y0, VW + 2 * M, VH + 2 * M); ctx.globalAlpha = 1;
+  }
+  if (world.dark > 0.01) {
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = world.dark < 0.45 ? mixHex('#ffffff', '#ffb08a', world.dark / 0.45) : mixHex('#ffb08a', '#2a3070', (world.dark - 0.45) / 0.4);
+    ctx.fillRect(v.x0, v.y0, VW + 2 * M, VH + 2 * M);
+    ctx.globalCompositeOperation = 'source-over';
+    drawNightLights(v);
+  }
+  drawParts(p => p.glow);
+  drawFx('glow');
+  ctx.setTransform(1, 0, 0, 1, M, M);
+  drawHUD();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+function drawNightLights(v) {
+  const a = clamp((world.dark - 0.35) / 0.5, 0, 1);
+  if (a <= 0) return;
+  ctx.globalCompositeOperation = 'lighter';
+  const cx0 = Math.floor((v.x0 - 20 - WX0) / CH), cx1 = Math.floor((v.x1 + 20 - WX0) / CH), cy0 = Math.floor((v.y0 - 20) / CH), cy1 = Math.floor((v.y1 + 20) / CH);
+  for (let cy = Math.max(0, cy0); cy <= cy1; cy++) for (let cx = Math.max(0, cx0); cx <= cx1; cx++) {
+    const L = chunkLights.get(cx + ',' + cy); if (!L) continue;
+    for (const l of L) {
+      if (l.x < v.x0 - 10 || l.x > v.x1 + 10 || l.y < v.y0 - 10 || l.y > v.y1 + 10) continue;
+      if (world.lightsOut && !l.blink) continue;
+      if (l.blink && Math.floor(world.t + l.x) % 2) continue;
+      ctx.fillStyle = l.c;
+      if (l.r > 3) {
+        ctx.globalAlpha = a * (l.street ? 0.045 : 0.07); ctx.beginPath(); ctx.arc(l.x, l.y, l.r * 0.6, 0, 6.283); ctx.fill();
+      }
+      ctx.globalAlpha = a * 0.9; ctx.fillRect(Math.round(l.x), Math.round(l.y), 1, 1);
+    }
+  }
+  drawTrafficLights(a);
+  drawCarLights(a);
+  drawBuildingLights(a);
+  drawFx('nightglow');
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+function drawHUD() {
+  const k = cam.labelT;
+  if (k < 6) {
+    const s = cam.label, x = 5, y = VH - 10;
+    if (k < 5 || Math.floor(k * 10) % 2) text(s, x, y, '#ffffff', '#1a1a22');
+  }
+  if (DEBUG) text(`${director.name || '-'} cars:${cars.length} peds:${peds.length} s:${Math.round(cam.s)}/${Math.round(cam.total)}`, 4, 3, '#7aff7a');
+}
+// The canvas is drawn a couple of pixels larger than the screen and nudged with a sub-pixel CSS
+// transform every display frame, so the pan glides smoothly instead of stepping one pixel at a time.
+const M = 2, renderOrigin = { x: 0, y: 0 };
+let SCX = 1, SCY = 1;
+function resize() {
+  VH = ROWS;
+  VW = Math.round((ROWS * innerWidth) / innerHeight);
+  canvas.width = VW + 2 * M; canvas.height = VH + 2 * M;
+  SCX = innerWidth / VW; SCY = innerHeight / VH;
+  canvas.style.width = ((VW + 2 * M) * SCX) + 'px';
+  canvas.style.height = ((VH + 2 * M) * SCY) + 'px';
+  ctx.imageSmoothingEnabled = false;
+}
+function init() {
+  buildParkData();
+  buildRoute();
+  cam.s = clamp(START_AT, 0, 1) * cam.total;
+  resize();
+  updateCamera(0);
+  initLife();
+}
+addEventListener('resize', resize);
+init();
+
+let last = performance.now(), lastCam = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  // camera moves every display frame (60fps+); the city simulates and redraws at 30fps
+  const cdt = Math.min(0.1, (now - lastCam) / 1000) * TIME_SCALE;
+  lastCam = now;
+  updateCamera(cdt);
+  if (now - last >= 1000 / FPS - 1) {
+    const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+    last = now;
+    try { update(dt); render(); } catch (e) { console.error(e); }
+  }
+  const fx = clamp(cam.x - VW / 2 - renderOrigin.x, -M + 0.05, M - 0.05), fy = clamp(cam.y - VH / 2 - renderOrigin.y, -M + 0.05, M - 0.05);
+  canvas.style.transform = `translate(${(-(M + fx) * SCX).toFixed(2)}px, ${(-(M + fy) * SCY).toFixed(2)}px)`;
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
