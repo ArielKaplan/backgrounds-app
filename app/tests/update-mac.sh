@@ -44,11 +44,19 @@ echo '{"updateAutoInstall": true}' > "$SUPPORT/config.json"
 
 echo "== 1. update signed with the wrong key"
 feed "$W/wrong.pem"
-open "$APP"; sleep 30
+T0=$(date +%s)
+open "$APP"
+# Wait for the check + download (the first launch of a newly copied app can be slow while macOS scans it).
+for i in $(seq 1 60); do grep -q "GET /Backgrounds-mac.zip" "$W/http.log" && break; sleep 2; done
+sleep 5
+echo "  (feed fetched after $(( $(date +%s) - T0 ))s)"
 check '[ "$(ver)" = 0.9.0 ]' "badly signed update refused (still $(ver))"
 check 'pgrep -x Backgrounds >/dev/null' 'app still running'
 check 'grep -q lastUpdateCheck "$SUPPORT/config.json"' 'it did check the feed'
 check 'grep -q "GET /Backgrounds-mac.zip" "$W/http.log"' 'it downloaded the update before refusing it'
+
+echo "--- http.log"; cat "$W/http.log"
+log show --start "$(date -r $T0 '+%Y-%m-%d %H:%M:%S')" --predicate 'process == "Backgrounds" AND eventMessage CONTAINS "Backgrounds:"' --style compact 2>/dev/null | tail -10
 
 # The user edits one built-in wallpaper and deletes another.
 echo "<!-- my edit -->" >> "$PICS/Aquarium/index.html"
@@ -77,7 +85,8 @@ check '[ -f "$PICS/Zz New/index.html" ]' 'new built-in wallpaper added'
 check '[ ! -e "$PICS/Meadow" ]' 'deleted wallpaper not brought back'
 check 'grep -q "\"syncedVersion\" *: *\"99.0.0\"" "$SUPPORT/config.json"' 'sync recorded'
 screencapture -x "$SHOTS/mac-update-done.png" || true
-log show --last 3m --predicate 'process == "Backgrounds"' --style compact 2>/dev/null | grep -iE "update|synced|keeping" | tail -20
+echo "--- http.log"; cat "$W/http.log"
+log show --last 3m --predicate 'process == "Backgrounds" AND eventMessage CONTAINS "Backgrounds:"' --style compact 2>/dev/null | tail -20
 pkill -x Backgrounds
 if [ $fail -gt 0 ]; then echo "$fail FAILED"; exit 1; fi
 echo "all passed"
