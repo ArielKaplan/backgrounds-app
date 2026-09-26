@@ -62,7 +62,7 @@ namespace Backgrounds
         public static bool StillValid()
         {
             if (!IsWindow(Progman) || FindWindow("Progman", null) != Progman) return false;
-            if (Raised) return IsWindow(DefView) && GetParent(DefView) == Progman;
+            if (Raised) return IsWindow(DefView) && ParentOf(DefView) == Progman;
             return IsWindow(WorkerW);
         }
 
@@ -109,7 +109,7 @@ namespace Backgrounds
         /// Our window is still where it should be (right parent; on raised desktops, under the icons).
         public static bool IsAttached(IntPtr hwnd)
         {
-            if (!IsWindow(hwnd) || GetParent(hwnd) != Parent) return false;
+            if (!IsWindow(hwnd) || ParentOf(hwnd) != Parent) return false;
             if (!Raised) return true;
             // Walk the z-order from DefView downwards: we must come before Explorer's WorkerW.
             for (IntPtr w = GetWindow(DefView, GW_HWNDNEXT); w != IntPtr.Zero; w = GetWindow(w, GW_HWNDNEXT))

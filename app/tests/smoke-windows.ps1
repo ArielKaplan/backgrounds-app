@@ -15,10 +15,11 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, P p, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint f);
+  public static IntPtr GetParent(IntPtr h) { return GetAncestor(h, 1); }  // real parent (GetParent gives the owner of popups)
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-  [DllImport("user32.dll")] public static extern IntPtr FindWindow(string c, string t);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, IntPtr t);
   [DllImport("user32.dll", EntryPoint="GetWindowLongPtr")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   public static string Text(IntPtr h) { var s = new StringBuilder(256); GetWindowText(h, s, 256); return s.ToString(); }
@@ -57,7 +58,7 @@ function Describe-Hosts {
 }
 
 $os = [Environment]::OSVersion.Version
-$progman = [W]::FindWindow("Progman", $null)
+$progman = [W]::FindWindow("Progman", [IntPtr]::Zero)
 $raised = (([W]::GetWindowLongPtr($progman, -20).ToInt64()) -band 0x00200000) -ne 0
 Write-Host "Windows $os, explorer running: $([bool](Get-Process explorer -ErrorAction SilentlyContinue)), progman=$progman raised=$raised"
 Write-Host "WebView2: $((Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue).pv)"

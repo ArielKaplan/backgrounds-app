@@ -42,8 +42,9 @@ namespace Backgrounds
     /// (app/shared/settings.html); native code only reads a few fields.
     class Store
     {
-        public static readonly Store Shared = new Store();
+        // Order matters: static fields initialise top to bottom, and the Store constructor uses Json.
         public static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 256 };
+        public static readonly Store Shared = new Store();
 
         public readonly string SupportDir, DataDir;
         readonly string configPath;

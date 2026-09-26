@@ -42,6 +42,10 @@ namespace Backgrounds
         public static extern IntPtr GetParent(IntPtr hWnd);
         [DllImport("user32.dll")]
         public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+        public const uint GA_PARENT = 1;
+        /// The real parent window. (GetParent returns the *owner* for WS_POPUP windows, which is what our
+        /// window stays on the classic desktop after SetParent.)
+        public static IntPtr ParentOf(IntPtr hWnd) => GetAncestor(hWnd, GA_PARENT);
         [DllImport("user32.dll")]
         public static extern bool IsWindow(IntPtr hWnd);
         [DllImport("user32.dll")]

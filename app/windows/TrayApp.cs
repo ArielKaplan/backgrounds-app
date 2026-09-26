@@ -18,7 +18,6 @@ namespace Backgrounds
         readonly Timer tick = new Timer { Interval = 1000 };
         bool locked, desktopReady;
         public bool OnBattery { get; private set; }
-        int reattachFailures;
 
         public TrayApp()
         {
@@ -32,7 +31,7 @@ namespace Backgrounds
             SystemEvents.DisplaySettingsChanged += (s, e) => Later(500, () => Apply());
             SystemEvents.PowerModeChanged += (s, e) =>
             {
-                if (e.Mode == PowerModes.Resume) Later(2000, () => { CheckDesktop(); Apply(); });
+                if (e.Mode == PowerModes.Resume) Later(2000, () => { if (desktopReady) CheckDesktop(); Apply(); });
                 if (e.Mode == PowerModes.StatusChange) Tick();
             };
             SystemEvents.SessionSwitch += (s, e) =>
@@ -43,8 +42,7 @@ namespace Backgrounds
             tick.Tick += (s, e) => Tick();
 
             OnBattery = SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Offline;
-            desktopReady = Desktop.Setup();
-            if (!desktopReady) Later(1000, () => { desktopReady = Desktop.Setup(); Apply(); });
+            desktopReady = Desktop.Setup();     // if Explorer isn't ready yet, Tick keeps retrying
             Apply();
             tick.Start();
 
@@ -95,7 +93,6 @@ namespace Backgrounds
         public void Apply(bool force = false, string only = null)
         {
             var store = Store.Shared;
-            if (!desktopReady) desktopReady = Desktop.Setup();
             var wallpapers = store.Scan().GroupBy(w => w.Id).ToDictionary(g => g.Key, g => g.First());
             var seen = new HashSet<string>();
             bool freeze = store.Paused || PausedByBattery;
@@ -118,7 +115,7 @@ namespace Backgrounds
                 host.SetFrozen(freeze);
             }
             foreach (var key in hosts.Keys.Where(k => !seen.Contains(k)).ToList()) { hosts[key].Dispose(); hosts.Remove(key); }
-            Tick();
+            UpdatePause();
         }
 
         public int ReloadOnce(string wallpaperId, string extra)
@@ -137,27 +134,37 @@ namespace Backgrounds
         /// Explorer restarted / the desktop layout changed: re-create everything.
         void CheckDesktop()
         {
-            bool ok = desktopReady && Desktop.StillValid() && hosts.Values.All(h => h.IsAttached);
-            if (ok) { Desktop.EnsureWorkerWAtBottom(); reattachFailures = 0; return; }
+            if (hosts.Count == 0) return;
+            if (Desktop.StillValid() && hosts.Values.All(h => h.IsAttached)) { Desktop.EnsureWorkerWAtBottom(); return; }
             // Only z-order drift? Fix it in place.
-            if (desktopReady && Desktop.StillValid() && hosts.Values.All(h => IsWindow(h.Handle) && GetParent(h.Handle) == Desktop.Parent))
+            if (Desktop.StillValid() && hosts.Values.All(h => IsWindow(h.Handle) && ParentOf(h.Handle) == Desktop.Parent))
             {
                 foreach (var h in hosts.Values) Desktop.Restack(h.Handle);
                 return;
             }
-            if (++reattachFailures > 30 && reattachFailures % 30 != 0) return;   // back off if Explorer is gone
-            Log.Write("Desktop changed (Explorer restart?) — re-attaching wallpapers");
+            Log.Write("Desktop changed (Explorer restart?) - re-attaching wallpapers");
             foreach (var h in hosts.Values) h.Dispose();
             hosts.Clear();
-            desktopReady = Desktop.Setup();
-            if (desktopReady) Apply();
+            desktopReady = false;       // Tick retries until Explorer is back
+            nextSetupTry = DateTime.MinValue;
         }
+        DateTime nextSetupTry = DateTime.MinValue;
 
         void Tick()
         {
-            var store = Store.Shared;
-            if (hosts.Count > 0) CheckDesktop();
+            if (desktopReady) CheckDesktop();
+            if (!desktopReady && DateTime.Now >= nextSetupTry)
+            {
+                // Explorer may still be starting: retry every 2 s.
+                nextSetupTry = DateTime.Now.AddSeconds(2);
+                if (Desktop.Setup()) { desktopReady = true; Apply(); return; }
+            }
+            UpdatePause();
+        }
 
+        void UpdatePause()
+        {
+            var store = Store.Shared;
             bool battery = SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Offline;
             if (battery != OnBattery)
             {
