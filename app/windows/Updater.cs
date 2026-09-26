@@ -179,7 +179,8 @@ namespace Backgrounds
         {
             try
             {
-                foreach (var f in Directory.GetFiles(Store.AppDir, "*.bgold-*", SearchOption.AllDirectories))
+                // Not Store.AppDir: touching Store would initialise it (and sync wallpapers) before this cleanup.
+                foreach (var f in Directory.GetFiles(AppDomain.CurrentDomain.BaseDirectory, "*.bgold-*", SearchOption.AllDirectories))
                     try { File.Delete(f); } catch { }
             }
             catch { }

@@ -44,6 +44,8 @@ namespace Backgrounds
                     return;
                 }
 
+                // Leftovers of the previous version from an update; must go before anything reads the app folder.
+                Updater.CleanupOldFiles();
                 Log.Write("Backgrounds " + Application.ProductVersion + " starting, Windows " + Environment.OSVersion.Version);
                 LoginItem.Refresh();
                 var app = new TrayApp();

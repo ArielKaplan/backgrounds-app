@@ -48,7 +48,6 @@ namespace Backgrounds
             tick.Start();
 
             // Updates: check shortly after start, then hourly (it only goes to the network once a day).
-            Updater.CleanupOldFiles();
             Updater.Shared.Changed += () => SettingsForm.PushState();
             tray.BalloonTipClicked += (s, e) => SettingsForm.ShowSingle("update");
             Later(10000, () => MaybeCheckForUpdate());

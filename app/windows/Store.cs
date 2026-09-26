@@ -165,6 +165,7 @@ namespace Backgrounds
                         bool any = false;
                         foreach (var f in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
                         {
+                            if (IsUpdateLeftover(f)) continue;
                             string target = Path.Combine(dest, f.Substring(src.Length + 1));
                             if (System.IO.File.Exists(target) && Fingerprint(target) == Fingerprint(f)) continue;
                             Directory.CreateDirectory(Path.GetDirectoryName(target));
@@ -189,6 +190,7 @@ namespace Backgrounds
         {
             foreach (var f in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
             {
+                if (IsUpdateLeftover(f)) continue;
                 string rel = f.Substring(src.Length + 1).Replace('\\', '/');
                 string mine = Path.Combine(dest, rel);
                 if (!System.IO.File.Exists(mine)) continue;                // a file new in this version
@@ -199,6 +201,9 @@ namespace Backgrounds
             }
             return true;
         }
+
+        /// Old files an update renamed aside (*.bgold-xxxx) until they could be deleted.
+        static bool IsUpdateLeftover(string path) => Path.GetFileName(path).Contains(".bgold-");
 
         static Dictionary<string, HashSet<string>> LoadHistory()
         {
@@ -230,7 +235,8 @@ namespace Backgrounds
         static void CopyDir(string src, string dest)
         {
             Directory.CreateDirectory(dest);
-            foreach (var f in Directory.GetFiles(src)) System.IO.File.Copy(f, Path.Combine(dest, Path.GetFileName(f)));
+            foreach (var f in Directory.GetFiles(src))
+                if (!IsUpdateLeftover(f)) System.IO.File.Copy(f, Path.Combine(dest, Path.GetFileName(f)));
             foreach (var d in Directory.GetDirectories(src)) CopyDir(d, Path.Combine(dest, Path.GetFileName(d)));
         }
 

@@ -91,6 +91,8 @@ Check ((Get-Content "$pics\Sheep\index.html" -Raw) -match 'v99') 'unedited built
 $aq = Get-Content "$pics\Aquarium\index.html" -Raw
 Check ($aq -match 'my edit' -and $aq -notmatch 'v99') 'edited wallpaper kept as the user left it'
 Check (Test-Path "$pics\Zz New\index.html") 'new built-in wallpaper added'
+Check (@(Get-ChildItem $pics -Recurse -Filter '*.bgold-*').Count -eq 0) 'no update leftovers copied into the wallpapers folder'
+Check ((Get-Content "$env:LOCALAPPDATA\Backgrounds\log.txt" -Raw) -notmatch 'Ant Farm \(updated\)') 'unchanged wallpapers are not touched'
 Check (-not (Test-Path "$pics\Meadow")) 'deleted wallpaper not brought back'
 Check ((Get-Content "$support\config.json" -Raw) -match '"syncedVersion":"99.0.0"') 'sync recorded'
 
