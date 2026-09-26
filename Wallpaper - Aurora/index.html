@@ -1,0 +1,1141 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Aurora Wallpaper</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #02040a; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="ov"></canvas>
+<script>
+/* =====================================================================
+   AURORA — northern lights over a mountain lake
+   Live: the aurora follows the real planetary Kp index (NOAA SWPC, refreshed every 10 min).
+         Quiet nights are a faint green glow low over the mountains; storms climb the sky,
+         add red tops, pink lower fringes and extra arcs. The stars are the real sky over
+         Tromsø right now (Big Dipper, Cassiopeia and Polaris turn with sidereal time) and
+         the moon is where it really is, with its real phase.
+   Options (add to the end of the address, combine with &):
+     #kp=5              pretend Kp (0-9) instead of the live value
+     #lat=69.6&lon=19   observer for stars + moon (default Tromsø)
+     #seed=42           same mountains every time (otherwise a new valley each load)
+     #quality=medium    low | medium | high (GL resolution for the sky)
+     #hud=bl            HUD corner: bl | br | tl | tr | off
+     #offline           never touch the network
+     #event=moose       test mode: repeat one event (or "all")
+     #speed=3           run time faster (testing)
+     #fps=30            frame cap
+     #debug             event name + timings
+   Events: meteor substorm moose wolf owl fox cabin canoe satellite snow hare
+   Rare:   shower fireball red steve reindeer
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const num = (k, d) => { const v = parseFloat(params.get(k)); return Number.isFinite(v) ? v : d; };
+const KP_FORCE = params.has('kp') ? num('kp', 3) : null;
+const OBS_LAT = num('lat', 69.65), OBS_LON = num('lon', 18.96);
+const QUALITY = params.get('quality') || 'medium';
+const HUD = params.get('hud') || 'bl';
+const OFFLINE = params.has('offline');
+const FORCE = params.get('event');
+const TIME_SCALE = num('speed', 1);
+const FPS = num('fps', 30);
+const DEBUG = params.has('debug');
+
+// ---------------------------------------------------------------- utils
+let seed = params.has('seed') ? num('seed', 1) >>> 0 : (Math.random() * 2 ** 32) >>> 0;
+function srand() { seed = (seed + 0x6D2B79F5) >>> 0; let t = seed; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
+const rand = (a, b) => a + Math.random() * (b - a);
+const srandr = (a, b) => a + srand() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const chance = p => Math.random() < p;
+const coin = () => (Math.random() < 0.5 ? 1 : -1);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const rad = Math.PI / 180, TAU = Math.PI * 2;
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+function mk(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, w); c.height = Math.max(1, h); return c; }
+const PERM = new Float32Array(1024);
+function reseedNoise() { for (let i = 0; i < 1024; i++) PERM[i] = srand(); }
+const hsh = i => PERM[i & 1023];
+function vn(x) { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return hsh(i) + (hsh(i + 1) - hsh(i)) * u; }
+function vn2(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi, u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const h = (a, b) => PERM[(a * 73 + b * 151) & 1023];
+  const a = h(xi, yi), b = h(xi + 1, yi), c = h(xi, yi + 1), d = h(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function ridged(x, oct = 5) { let s = 0, a = 1, f = 1, n = 0; for (let i = 0; i < oct; i++) { const r = 1 - Math.abs(2 * vn(x * f + i * 17.3) - 1); s += a * r * r; n += a; a *= 0.5; f *= 2.03; } return s / n; }
+function fbm(x, oct = 4) { let s = 0, a = 1, f = 1, n = 0; for (let i = 0; i < oct; i++) { s += a * vn(x * f + i * 31.7); n += a; a *= 0.5; f *= 2.1; } return s / n; }
+
+// ---------------------------------------------------------------- astronomy
+function astro(ms) {
+  const n = ms / 86400000 + 2440587.5 - 2451545.0;
+  const L = 280.460 + 0.9856474 * n, g = (357.528 + 0.9856003 * n) * rad;
+  const lam = (L + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * rad, eps = (23.439 - 4e-7 * n) * rad;
+  const sun = { ra: Math.atan2(Math.cos(eps) * Math.sin(lam), Math.cos(lam)), dec: Math.asin(Math.sin(eps) * Math.sin(lam)) };
+  const gmst = ((280.46061837 + 360.98564736629 * n) % 360 + 360) % 360 * rad;
+  const Lm = (218.316 + 13.176396 * n) * rad, Mm = (134.963 + 13.064993 * n) * rad, Fm = (93.272 + 13.229350 * n) * rad;
+  const lm = Lm + 6.289 * rad * Math.sin(Mm), bm = 5.128 * rad * Math.sin(Fm);
+  const x = Math.cos(bm) * Math.cos(lm), y = Math.cos(eps) * Math.cos(bm) * Math.sin(lm) - Math.sin(eps) * Math.sin(bm), z = Math.sin(eps) * Math.cos(bm) * Math.sin(lm) + Math.cos(eps) * Math.sin(bm);
+  const moon = { ra: Math.atan2(y, x), dec: Math.asin(z) };
+  return { sun, moon, lst: gmst + OBS_LON * rad };
+}
+// local frame: x = east, y = up, z = north (we look north)
+const PHI = OBS_LAT * rad;
+const POLE = [0, Math.sin(PHI), Math.cos(PHI)], MERID = [0, Math.cos(PHI), -Math.sin(PHI)];
+function localDir(ra, dec, lst) {
+  const H = lst - ra, cd = Math.cos(dec), sd = Math.sin(dec), ch = Math.cos(H), sh = Math.sin(H);
+  return [-cd * sh, sd * POLE[1] + cd * ch * MERID[1], sd * POLE[2] + cd * ch * MERID[2]];
+}
+// bright stars: [RA hours, Dec deg, magnitude]
+const STARS = [
+  [2.530, 89.26, 2.0], [11.062, 61.75, 1.8], [11.031, 56.38, 2.4], [11.897, 53.69, 2.4], [12.257, 57.03, 3.3], [12.900, 55.96, 1.8], [13.399, 54.93, 2.2], [13.792, 49.31, 1.9],
+  [0.675, 56.54, 2.2], [0.153, 59.15, 2.3], [0.945, 60.72, 2.2], [1.430, 60.24, 2.7], [1.907, 63.67, 3.4],
+  [14.845, 74.16, 2.1], [15.345, 71.83, 3.0], [17.537, 86.59, 4.4], [16.766, 82.04, 4.2], [15.734, 77.79, 4.3], [16.292, 75.76, 4.9],
+  [5.278, 46.00, 0.1], [18.616, 38.78, 0.0], [20.690, 45.28, 1.3], [19.846, 8.87, 0.8], [14.261, 19.18, -0.05], [4.599, 16.51, 0.9],
+  [5.919, 7.41, 0.5], [5.242, -8.20, 0.1], [6.752, -16.72, -1.46], [7.655, 5.22, 0.4], [7.755, 28.03, 1.1], [7.577, 31.89, 1.6], [10.139, 11.97, 1.4],
+  [3.405, 49.86, 1.8], [3.136, 40.96, 2.1], [20.370, 40.26, 2.2], [20.770, 33.97, 2.5], [19.750, 45.13, 2.9], [19.512, 27.96, 3.1],
+  [17.943, 51.49, 2.2], [17.507, 52.30, 2.8], [14.073, 64.38, 3.7], [16.400, 61.51, 2.7], [21.310, 62.59, 2.5], [23.656, 77.63, 3.2], [21.478, 70.56, 3.2],
+  [5.992, 44.95, 1.9], [0.140, 29.09, 2.1], [1.162, 35.62, 2.1], [2.065, 42.33, 2.1], [23.079, 15.21, 2.5], [23.063, 28.08, 2.4], [0.220, 15.18, 2.8],
+  [3.791, 24.11, 2.9], [3.763, 24.37, 3.7], [3.747, 23.95, 3.9], [3.819, 24.05, 3.6], [9.460, -8.66, 2.0], [12.692, -1.45, 2.7],
+  [13.420, -11.16, 1.0], [16.490, -26.43, 1.0], [11.818, 14.57, 2.1], [10.333, 19.84, 2.0], [1.622, 20.81, 2.6], [2.120, 23.46, 2.0],
+];
+
+// ---------------------------------------------------------------- live Kp
+const live = { state: OFFLINE ? 'off' : 'wait', time: 0 };
+let KP_LIVE = null;
+async function fetchT(url, ms = 20000) {
+  const ac = new AbortController(), to = setTimeout(() => ac.abort(), ms);
+  try { const r = await fetch(url, { signal: ac.signal, mode: 'cors' }); if (!r.ok) throw new Error(r.status); return await r.json(); } finally { clearTimeout(to); }
+}
+async function fetchKp() {
+  let kp = null;
+  try {
+    const j = await fetchT('https://services.swpc.noaa.gov/json/planetary_k_index_1m.json');
+    const last = [].concat(j).reverse().find(r => r && (r.estimated_kp ?? r.kp_index) != null);
+    if (last) kp = parseFloat(last.estimated_kp ?? last.kp_index);
+  } catch (e) { /* try the 3-hourly product */ }
+  if (!Number.isFinite(kp)) {
+    const j = await fetchT('https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json');
+    const rows = [].concat(j).filter(r => r && (Array.isArray(r) ? r[1] !== 'Kp' : r.Kp != null));
+    const last = rows[rows.length - 1];
+    kp = parseFloat(Array.isArray(last) ? last[1] : last.Kp);
+  }
+  if (!Number.isFinite(kp)) throw new Error('bad Kp');
+  KP_LIVE = clamp(kp, 0, 9);
+  live.state = 'live'; live.time = Date.now();
+  try { localStorage.setItem('aurora:kp', JSON.stringify({ kp: KP_LIVE, time: live.time })); } catch (e) { /* ignore */ }
+}
+if (!OFFLINE && KP_FORCE === null) {
+  try { const c = JSON.parse(localStorage.getItem('aurora:kp') || 'null'); if (c && Date.now() - c.time < 3 * 3600e3) { KP_LIVE = c.kp; live.state = 'cache'; live.time = c.time; } } catch (e) { /* ignore */ }
+  let fails = 0;
+  const run = async () => {
+    let next = 10 * 60e3;
+    try { await fetchKp(); fails = 0; } catch (e) { fails++; console.warn('[aurora] Kp fetch failed', e.message || e); if (live.state === 'wait') live.state = 'off'; next = Math.min(10 * 60e3, 30e3 * 2 ** (fails - 1)); }
+    setTimeout(run, next);
+  };
+  run();
+}
+// without data: a plausible, slowly wandering "typical night"
+const kpNow = t => KP_FORCE !== null ? KP_FORCE : KP_LIVE !== null ? KP_LIVE : 2.6 + 1.1 * Math.sin(t / 900) + 0.5 * Math.sin(t / 257);
+const kpWord = k => k >= 7 ? 'strong storm' : k >= 5 ? `storm · G${Math.min(5, Math.floor(k) - 4)}` : k >= 4 ? 'active' : k >= 3 ? 'unsettled' : 'quiet';
+
+// ---------------------------------------------------------------- WebGL sky + lake
+const cv = document.getElementById('gl'), ov = document.getElementById('ov');
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'low-power' });
+const ctx = ov.getContext('2d');
+if (!gl) { document.body.style.color = '#8aa'; document.body.append('This wallpaper needs WebGL2.'); throw new Error('no webgl2'); }
+cv.addEventListener('webglcontextlost', e => e.preventDefault());
+cv.addEventListener('webglcontextrestored', () => location.reload());
+
+const FRAG = `#version 300 es
+precision highp float;
+uniform vec2 uRes;
+uniform float uScale, uHY, uF, uW, uPhase, uTime, uRed, uBoost, uMoonLight, uFlash, uSteve, uSteveX;
+uniform vec3 uArcZ, uArcI, uMoonDir;
+out vec4 o;
+
+float h11(float p) { p = fract(p * 0.1031); p *= p + 33.33; p *= p + p; return fract(p); }
+float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float n1(float x) { float i = floor(x), f = fract(x); return mix(h11(i), h11(i + 1.0), f * f * (3.0 - 2.0 * f)); }
+float n2(vec2 x) { vec2 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h12(i), h12(i + vec2(1, 0)), f.x), mix(h12(i + vec2(0, 1)), h12(i + vec2(1, 1)), f.x), f.y); }
+float fb(float x) { return n1(x) * 0.55 + n1(x * 2.17 + 7.3) * 0.3 + n1(x * 4.63 + 1.7) * 0.15; }
+
+float curveZ(float x, float k, float Z) {
+  float u = x / Z;
+  return Z * (1.0 + (fb(u * 0.9 + uPhase * 0.011 + k * 11.0) - 0.5) * 0.75 + 0.2 * sin(u * 0.33 + k * 2.1 + uPhase * 0.006)
+             + 0.16 * (n1(u * 3.6 + uPhase * 0.02 + k * 4.0) - 0.5));   // folds
+}
+
+vec3 aurora(vec3 rd) {
+  vec3 acc = vec3(0.0);
+  if (rd.y <= 0.001 || rd.z <= 0.02) return acc;
+  vec2 hd = normalize(rd.xz);
+  for (int k = 0; k < 3; k++) {
+    float Z = uArcZ[k], I = uArcI[k];
+    if (I < 0.01) continue;
+    for (int sh = 0; sh < 2; sh++) {
+      float ks = float(k) + float(sh) * 0.37, off = float(sh) * 0.08 * Z;
+      float t = Z / rd.z;
+      for (int it = 0; it < 4; it++) t = (curveZ(rd.x * t, ks, Z) + off) / rd.z;
+      if (t <= 0.0) continue;
+      float a = rd.y * t, x = rd.x * t, u = x / Z;
+      float a0 = 1.0 + 0.12 * (n1(u * 2.0 + ks * 3.1 + uPhase * 0.03) - 0.5) + 0.05 * (n1(u * 11.0 - uPhase * 0.2 + ks) - 0.5);
+      float h = a - a0;
+      if (h < -0.06 || h > 4.5) continue;
+      float green = smoothstep(-0.012, 0.012, h) * (exp(-max(h, 0.0) * 1.7) + 1.3 * exp(-max(h, 0.0) * 12.0));
+      float red = smoothstep(0.35, 1.3, h) * exp(-max(h - 1.3, 0.0) * 0.8);
+      float pink = exp(-h * h / 0.0025) * uBoost;
+      float rays = 0.18 + 0.95 * pow(n1(u * 9.0 + uPhase * 0.22 + ks * 17.0), 2.5) + 0.3 * pow(n1(u * 38.0 - uPhase * 0.6), 2.0);
+      float patchv = smoothstep(0.30, 0.78, fb(u * 2.2 + uPhase * 0.017 + ks * 5.0)) * (k == 0 ? 1.0 : smoothstep(0.45, 0.8, n1(u * 1.3 + ks * 9.0 + uPhase * 0.01)));
+      float pulse = 0.78 + 0.22 * sin(u * 9.0 - uPhase * 1.5 + 6.0 * n1(u * 2.0));
+      float dz = curveZ(x + 0.3 * Z, ks, Z) - curveZ(x - 0.3 * Z, ks, Z);
+      vec2 nrm = normalize(vec2(-dz / (0.6 * Z), 1.0));
+      float obl = min(1.0 / max(abs(dot(nrm, hd)), 0.22), 3.5);
+      float fade = exp(-t * 0.012);
+      float e = rays * patchv * pulse * obl * I * fade * (sh == 0 ? 1.0 : 0.5);
+      acc += (vec3(0.08, 1.0, 0.40) * green * 1.5 + vec3(1.0, 0.14, 0.30) * red * (0.10 + uRed) + vec3(1.0, 0.28, 0.72) * pink) * e;
+    }
+  }
+  return acc;
+}
+
+vec3 sky(vec3 rd) {
+  float el = max(rd.y, 0.0);
+  vec3 col = mix(vec3(0.011, 0.019, 0.030), vec3(0.0015, 0.003, 0.008), pow(el, 0.4));
+  col += vec3(0.03, 0.022, 0.012) * exp(-el * 30.0) * 0.4;               // faint town glow on the horizon
+  float gl = uArcI.x + uArcI.y * 0.6 + uArcI.z * 0.3;
+  col += vec3(0.02, 0.11, 0.06) * gl * exp(-el * 3.5) * 0.35;           // aurora lighting the whole sky
+  float mm = max(dot(rd, uMoonDir), 0.0);
+  col += vec3(0.10, 0.13, 0.19) * uMoonLight * (pow(mm, 30.0) * 0.5 + pow(mm, 4.0) * 0.12) + vec3(0.006, 0.009, 0.016) * uMoonLight;
+  col += aurora(rd);
+  if (uSteve > 0.001) {                                                  // STEVE: a thin mauve ribbon + green picket fence
+    float elev = asin(clamp(rd.y, -1.0, 1.0)), az = atan(rd.x, rd.z) - uSteveX;
+    float arc = radians(46.0) - 0.55 * az * az;
+    float d = elev - arc;
+    float rib = exp(-d * d / 0.00012) * (0.6 + 0.4 * n1(az * 40.0 + uTime * 0.3));
+    float fence = exp(-pow((d + 0.075) / 0.028, 2.0)) * pow(n1(az * 160.0 + uTime * 0.2), 3.0) * 2.0;
+    col += (vec3(0.75, 0.30, 0.85) * rib * 0.9 + vec3(0.2, 1.0, 0.45) * fence * 0.35) * uSteve * smoothstep(1.3, 0.6, abs(az));
+  }
+  return col;
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y) / uScale;    // CSS px, y down
+  float xs = (p.x - uW * 0.5) / uF;
+  float dy = p.y - uHY;
+  vec3 col;
+  if (dy <= 0.0) {
+    col = sky(normalize(vec3(xs, -dy / uF, 1.0)));
+  } else {
+    float D = uF / dy;                                                   // distance across the water
+    vec2 wp = vec2(xs * D, D);
+    float r1 = n2(wp * vec2(0.7, 2.2) + vec2(0.0, -uTime * 0.22)) + 0.5 * n2(wp * vec2(2.2, 6.0) + vec2(uTime * 0.05, uTime * 0.35));
+    float r2 = n2(wp * vec2(1.3, 3.0) + vec2(4.0, uTime * 0.18));
+    float slope = dy / uF;
+    vec3 rr = normalize(vec3(xs + (r2 - 0.5) * 0.035 * min(slope * 4.0, 1.0), slope * (1.0 + (r1 - 0.75) * 0.55), 1.0));
+    float fres = 0.30 + 0.62 * pow(1.0 - min(slope, 1.0), 4.0);
+    col = sky(rr) * fres + vec3(0.004, 0.010, 0.016);
+  }
+  col += vec3(0.25, 0.8, 0.45) * uFlash * 0.25;
+  col = 1.0 - exp(-col * 1.35);
+  col = pow(col, vec3(1.0 / 2.2));
+  col += (h12(gl_FragCoord.xy + fract(uTime * 7.0)) - 0.5) / 255.0;
+  o = vec4(col, 1.0);
+}`;
+function compile(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, `#version 300 es
+in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.bindAttribLocation(prog, 0, 'p');
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const U = {};
+for (let i = 0, n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS); i < n; i++) { const nm = gl.getActiveUniform(prog, i).name; U[nm] = gl.getUniformLocation(prog, nm); }
+
+// ---------------------------------------------------------------- world
+let W, H, DPR, HY, F, SHORE, UNIT, RS;
+const world = { t: 0, phase: 0, boost: 0, red: 0, steve: 0, steveX: 0, flash: 0, speedMul: 1, snow: 0, arcs: { Z: [8, 14, 24], I: [0.4, 0.2, 0.1] }, glow: 0 };
+const scene = {};
+const ents = [], parts = [], fx = [];
+const SIL = '#03060b';
+
+// bank (foreground snow) top line, in CSS px
+function bankTop(x) {
+  const u = x / W;
+  return SHORE + H * (0.012 * Math.sin(u * 9 + scene.bankSeed) + 0.008 * Math.sin(u * 23 + scene.bankSeed * 2)) - H * 0.085 * (smooth(0.22, 0, u) + smooth(0.8, 1.02, u));
+}
+
+// ---------------------------------------------------------------- landscape bake
+function buildLandscape() {
+  seed = scene.seed0; reseedNoise();
+  scene.bankSeed = srand() * 10;
+  const dw = Math.round(W * DPR), dh = Math.round(H * DPR), hy = Math.round(HY * DPR);
+  const top = mk(dw, hy + 2), tc = top.getContext('2d');
+  const img = tc.createImageData(dw, hy + 2), d = img.data;
+  const glowMask = mk(dw, hy + 2), gc = glowMask.getContext('2d'), gimg = gc.createImageData(dw, hy + 2), gd = gimg.data;
+  const moonSide = scene.moonSide || -1;   // light from the left (-1) or right (+1)
+  const mk01 = scene.moonK;
+  const s1 = srandr(0, 100), s2 = srandr(0, 100), p1 = srandr(0.18, 0.4), p2 = srandr(0.62, 0.85);
+  const far = new Float32Array(dw), mid = new Float32Array(dw);
+  for (let x = 0; x < dw; x++) {
+    const u = x / dw;
+    far[x] = hy - dh * (0.075 + 0.085 * ridged(u * 5.5 + s1) + 0.035 * Math.exp(-(((u - p2) / 0.12) ** 2)));
+    mid[x] = hy - dh * (0.01 + 0.035 * ridged(u * 7 + s2, 6) + 0.17 * Math.exp(-(((u - p1) / 0.11) ** 2)) * (0.75 + 0.25 * ridged(u * 13 + s2)) + 0.07 * Math.exp(-(((u - 0.95) / 0.1) ** 2)));
+  }
+  const layers = [
+    { h: far, snow: [58, 72, 98], shade: [26, 34, 52], rock: [19, 25, 38], forest: [14, 20, 30], haze: 0.45, line: 0.55 },
+    { h: mid, snow: [52, 64, 88], shade: [17, 23, 36], rock: [8, 11, 18], forest: [5, 8, 12], haze: 0.0, line: 0.42 },
+  ];
+  const sky = [9, 14, 20];
+  // Facet shading: every peak sends a spine down the face; the side of a spine facing the moon is lit,
+  // the other side is in shadow, and neighbouring peaks meet in a gully. Reads as real mountain faces.
+  for (const L of layers) {
+    const R = Math.round(16 * DPR), peaks = [];
+    for (let x = 0; x < dw; x++) {
+      let ok = true;
+      for (let k = 1; k <= R && ok; k++) if (L.h[Math.max(0, x - k)] < L.h[x] || L.h[Math.min(dw - 1, x + k)] < L.h[x]) ok = false;
+      if (ok && (!peaks.length || x - peaks[peaks.length - 1].x > R)) peaks.push({ x, y: L.h[x], sl: srandr(-0.35, 0.35), ph: srandr(0, 100) });
+    }
+    L.peaks = peaks;
+  }
+  const spineX = (p, y) => p.x + (y - p.y) * p.sl + (vn((y / DPR) * 0.04 + p.ph) - 0.5) * 10 * DPR;
+  for (const L of layers) {
+    const sl0 = srandr(0, 50), P = L.peaks;
+    let pi = 0;
+    for (let x = 0; x < dw; x++) {
+      while (pi < P.length && P[pi].x <= x) pi++;
+      const pl = P[pi - 1], pr = P[pi];
+      const t0 = Math.max(0, Math.floor(L.h[x]));
+      const span = hy - L.h[x];
+      const xs = x / DPR;
+      const snowline = L.line + (vn2(xs * 0.015, sl0) - 0.5) * 0.35;
+      for (let y = t0; y <= hy + 1; y++) {
+        const ys = y / DPR, depth = (y - L.h[x]) / DPR, rel = (y - L.h[x]) / Math.max(1, span);
+        const dl = pl ? x - spineX(pl, y) : 1e9, dr = pr ? spineX(pr, y) - x : 1e9;
+        const westFace = dr < dl;                        // closer to the right-hand peak: its west face
+        const litFace = moonSide < 0 ? westFace : !westFace;
+        const edge = clamp(Math.abs(dl - dr) / (4 * DPR), 0, 1);   // soft gully line
+        const spineEdge = Math.min(Math.abs(dl), Math.abs(dr)) < 1.2 * DPR;
+        const broad = vn2(xs * 0.03 + sl0, ys * 0.03);
+        let lit = litFace ? 0.82 : 0.26;
+        lit = lerp(0.54, lit, edge) + (broad - 0.5) * 0.25 - rel * 0.2;
+        let snow = rel < snowline + (broad - 0.5) * 0.12;
+        const rib = spineEdge && rel > 0.08 && vn2(xs * 0.2, ys * 0.08) > 0.45;   // dark rock ribs along the spines
+        let c;
+        if (snow && !rib) c = L.shade.map((v, i) => v + (L.snow[i] - v) * clamp(lit, 0, 1));
+        else if (snow) c = L.rock.map(v => v * 1.3);
+        else {
+          const speck = vn2(xs * 0.7, ys * 0.9) > 0.58 ? 0.75 : 1;
+          c = (rel < snowline + 0.15 ? L.rock : L.forest).map(v => v * speck * (0.8 + clamp(lit, 0, 1) * 0.35));
+        }
+        const k = 0.55 + 0.6 * mk01;
+        c = c.map((v, i) => lerp(v * k, sky[i] * 1.6, L.haze * (0.5 + 0.5 * (1 - rel))));
+        if (depth < 1.3 && snow) c = c.map(v => v * 1.15 + 5);
+        const o = (y * dw + x) * 4;
+        d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255;
+        gd[o] = 40; gd[o + 1] = 255; gd[o + 2] = 150; gd[o + 3] = snow && !rib ? Math.round(255 * clamp(0.2 + lit * 0.8, 0, 1) * (1 - L.haze * 0.5) * (1 - rel * 0.5)) : 0;
+      }
+    }
+  }
+  tc.putImageData(img, 0, 0);
+  gc.putImageData(gimg, 0, 0);
+  tc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  gc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // far-shore treeline + cabin (cabin sits on the far shore)
+  scene.cabin = { x: W * srandr(0.62, 0.78), w: 34 * UNIT, h: 20 * UNIT };
+  const cab = scene.cabin;
+  tc.fillStyle = '#04070c';
+  for (let x = -4; x < W + 4;) {
+    const dense = 0.55 + 0.45 * vn(x * 0.01 + 3);
+    if (Math.abs(x - cab.x) < cab.w * 0.9) { x += 3; continue; }
+    const h = UNIT * (5 + srand() * 13) * dense, w = h * (0.28 + srand() * 0.12);
+    spruceSmall(tc, x, HY + 1, h, w);
+    x += (2 + srand() * 7) * UNIT * (srand() < 0.08 ? 4 : 1);
+  }
+  tc.fillRect(0, HY - 1.5 * UNIT, W, 3 * UNIT);
+  // cabin
+  const cx = cab.x - cab.w / 2, cy = HY - cab.h;
+  tc.fillStyle = '#07090d'; tc.fillRect(cx, cy + cab.h * 0.3, cab.w, cab.h * 0.7 + 1);
+  tc.fillStyle = '#0b0e14';
+  for (let i = 0; i < 5; i++) tc.fillRect(cx, cy + cab.h * 0.3 + i * cab.h * 0.14, cab.w, 1);
+  tc.fillStyle = '#3c4a66';   // snowy roof
+  tc.beginPath(); tc.moveTo(cx - 4 * UNIT, cy + cab.h * 0.34); tc.lineTo(cab.x, cy - cab.h * 0.2); tc.lineTo(cx + cab.w + 4 * UNIT, cy + cab.h * 0.34); tc.closePath(); tc.fill();
+  tc.fillStyle = '#1b2233';
+  tc.beginPath(); tc.moveTo(cx - 4 * UNIT, cy + cab.h * 0.34); tc.lineTo(cx + cab.w + 4 * UNIT, cy + cab.h * 0.34); tc.lineTo(cx + cab.w + 4 * UNIT, cy + cab.h * 0.40); tc.lineTo(cx - 4 * UNIT, cy + cab.h * 0.40); tc.fill();
+  cab.chim = { x: cx + cab.w * 0.72, y: cy - cab.h * 0.02 };
+  tc.fillStyle = '#07090d'; tc.fillRect(cab.chim.x - 2 * UNIT, cab.chim.y - 7 * UNIT, 4 * UNIT, 10 * UNIT);
+  tc.fillStyle = '#3c4a66'; tc.fillRect(cab.chim.x - 2.5 * UNIT, cab.chim.y - 8 * UNIT, 5 * UNIT, 1.6 * UNIT);
+  cab.win = { x: cx + cab.w * 0.18, y: cy + cab.h * 0.5, w: cab.w * 0.22, h: cab.h * 0.28 };
+  cab.door = { x: cx + cab.w * 0.62, y: cy + cab.h * 0.45, w: cab.w * 0.18, h: cab.h * 0.55 };
+  scene.top = top; scene.glowMask = glowMask;
+
+  // ---- foreground bank (snow) and big trees
+  const bank = mk(dw, dh), bc = bank.getContext('2d');
+  bc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  bc.beginPath(); bc.moveTo(0, H);
+  for (let x = 0; x <= W; x += 2) bc.lineTo(x, bankTop(x));
+  bc.lineTo(W, H); bc.closePath();
+  const g = bc.createLinearGradient(0, SHORE - H * 0.09, 0, H);
+  const mk2 = 0.6 + 0.5 * mk01;
+  g.addColorStop(0, `rgb(${Math.round(50 * mk2)},${Math.round(62 * mk2)},${Math.round(86 * mk2)})`);
+  g.addColorStop(0.35, `rgb(${Math.round(28 * mk2)},${Math.round(36 * mk2)},${Math.round(52 * mk2)})`);
+  g.addColorStop(1, '#0a0e17');
+  bc.fillStyle = g; bc.fill();
+  bc.save(); bc.clip();
+  // drifts: soft light/dark undulations
+  for (let i = 0; i < 26; i++) {
+    const x = srandr(0, W), y = srandr(SHORE, H), rx = srandr(40, 180) * UNIT, ry = rx * srandr(0.08, 0.16);
+    const gg = bc.createRadialGradient(x, y, 0, x, y, rx);
+    const light = srand() < 0.5;
+    gg.addColorStop(0, light ? 'rgba(120,140,180,0.10)' : 'rgba(0,0,10,0.18)'); gg.addColorStop(1, 'rgba(0,0,0,0)');
+    bc.fillStyle = gg; bc.save(); bc.translate(x, y); bc.scale(1, ry / rx); bc.translate(-x, -y); bc.beginPath(); bc.arc(x, y, rx, 0, TAU); bc.fill(); bc.restore();
+  }
+  bc.restore();
+  // water's edge: a dark wet line, reeds poking through snow, a few boulders
+  bc.strokeStyle = 'rgba(0,0,0,0.55)'; bc.lineWidth = 1.5 * UNIT;
+  bc.beginPath(); for (let x = 0; x <= W; x += 3) { const y = bankTop(x); x ? bc.lineTo(x, y + 0.5) : bc.moveTo(x, y + 0.5); } bc.stroke();
+  bc.strokeStyle = '#05080d'; bc.lineWidth = 1;
+  for (let i = 0; i < W / 9; i++) {
+    const x = srandr(0, W), y = bankTop(x) + srandr(1, 10) * UNIT, h = srandr(4, 14) * UNIT;
+    bc.beginPath(); bc.moveTo(x, y); bc.quadraticCurveTo(x + srandr(-2, 2), y - h * 0.6, x + srandr(-4, 4) * UNIT, y - h); bc.stroke();
+  }
+  scene.rocks = [];
+  for (let i = 0; i < 5; i++) {
+    const x = srandr(0.2, 0.8) * W, y = bankTop(x) + srandr(0.02, 0.09) * H, r = srandr(10, 26) * UNIT;
+    scene.rocks.push({ x, y, r });
+    bc.fillStyle = '#070a10'; bc.beginPath(); bc.ellipse(x, y, r, r * 0.55, 0, Math.PI, 0); bc.lineTo(x + r, y + 2); bc.lineTo(x - r, y + 2); bc.fill();
+    bc.fillStyle = `rgba(${Math.round(70 * mk2)},${Math.round(84 * mk2)},${Math.round(112 * mk2)},0.9)`;
+    bc.beginPath(); bc.ellipse(x - r * 0.1, y - r * 0.42, r * 0.78, r * 0.2, 0, Math.PI, 0); bc.fill();
+  }
+  scene.bank = bank;
+  const trees = mk(dw, dh), trc = trees.getContext('2d');
+  trc.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const big = [[W * srandr(0.005, 0.03), 0.95], [W * srandr(0.075, 0.11), 0.72], [W * srandr(0.15, 0.18), 0.42], [W * srandr(0.9, 0.93), 0.82], [W * srandr(0.965, 0.995), 1.0], [W * srandr(0.84, 0.86), 0.36]];
+  scene.perches = [];
+  for (const [x, k] of big) {
+    const h = H * k, base = bankTop(x) + H * 0.03;
+    spruceBig(trc, x, base, h, h * 0.2, mk2);
+    scene.perches.push({ x: x + (x < W / 2 ? 1 : -1) * h * 0.08, y: base - h * 0.55 });
+  }
+  scene.trees = trees;
+}
+function spruceSmall(c, x, base, h, w) {
+  c.beginPath(); c.moveTo(x, base - h);
+  const tiers = 4;
+  for (let i = 1; i <= tiers; i++) { const y = base - h + (h * i) / tiers, ww = (w * i) / tiers; c.lineTo(x + ww, y); c.lineTo(x + ww * 0.45, y - h * 0.06); }
+  for (let i = tiers; i >= 1; i--) { const y = base - h + (h * i) / tiers, ww = (w * i) / tiers; c.lineTo(x - ww * 0.45, y - h * 0.06); c.lineTo(x - ww, y); }
+  c.closePath(); c.fill();
+}
+function spruceBig(c, x, base, h, w, lk) {
+  c.fillStyle = '#03050a'; c.fillRect(x - h * 0.01, base - h * 0.15, h * 0.02, h * 0.15);
+  const tiers = Math.round(12 + h / 60);
+  for (let i = 0; i < tiers; i++) {
+    const k = i / tiers, y = base - h * 0.1 - k * h * 0.88, ww = w * Math.pow(1 - k, 0.85) * (0.8 + srand() * 0.35), th = h * 0.1 * (1 - k * 0.5);
+    c.fillStyle = '#03050a';
+    c.beginPath(); c.moveTo(x, y - th);
+    const n = 7;
+    for (let j = 0; j <= n; j++) { const t = j / n; c.lineTo(x + ww * t, y - th * (1 - t) + th * 0.25 * t * t + (j % 2 ? th * 0.12 : 0)); }
+    for (let j = n; j >= 0; j--) { const t = j / n; c.lineTo(x - ww * t, y - th * (1 - t) + th * 0.25 * t * t + (j % 2 ? th * 0.12 : 0)); }
+    c.closePath(); c.fill();
+    // snow resting on the branch tops
+    c.strokeStyle = `rgba(${Math.round(64 * lk)},${Math.round(78 * lk)},${Math.round(104 * lk)},${0.55 + srand() * 0.3})`;
+    c.lineWidth = Math.max(1, h * 0.006);
+    c.beginPath();
+    for (const s of [-1, 1]) { const a = srandr(0.15, 0.4), b = srandr(0.55, 0.9); c.moveTo(x + s * ww * a, y - th * (1 - a) + th * 0.05); c.lineTo(x + s * ww * b, y - th * (1 - b) + th * 0.25 * b * b); }
+    c.stroke();
+  }
+  c.fillStyle = '#03050a'; c.fillRect(x - 1, base - h, 2, h * 0.08);
+}
+
+// ---------------------------------------------------------------- stars + moon
+const faint = [];
+function buildFaintStars() {
+  faint.length = 0;
+  for (let i = 0; i < 1400; i++) {
+    const ra = Math.random() * TAU, dec = Math.asin(rand(-0.25, 1));
+    faint.push({ ra, dec, b: Math.pow(Math.random(), 3) * 0.75 + 0.16, ph: rand(0, TAU), tw: rand(1, 4) });
+  }
+}
+function toScreen(d) {
+  if (d[2] <= 0.02) return null;
+  return [W / 2 + (d[0] / d[2]) * F, HY - (d[1] / d[2]) * F];
+}
+const sky = { stars: [], moon: null, updated: -99 };
+function updateSky(A) {
+  sky.stars = [];
+  for (const [rah, dec, mag] of STARS) {
+    const d = localDir(rah * 15 * rad, dec * rad, A.lst);
+    const s = toScreen(d); if (!s || d[1] < 0.005 || s[0] < -10 || s[0] > W + 10 || s[1] < -10) continue;
+    sky.stars.push({ x: s[0], y: s[1], b: clamp(Math.pow(2.512, 2 - mag) * 0.55, 0.12, 2.2), ph: rand(0, TAU), el: d[1] });
+  }
+  for (const f of faint) {
+    const d = localDir(f.ra, f.dec, A.lst), s = toScreen(d);
+    f.vis = !!s && d[1] > 0.01 && s[0] > -2 && s[0] < W + 2 && s[1] > -2;
+    if (f.vis) { f.x = s[0]; f.y = s[1]; f.el = d[1]; }
+  }
+  const m = localDir(A.moon.ra, A.moon.dec, A.lst), sd = localDir(A.sun.ra, A.sun.dec, A.lst);
+  const illum = (1 - (m[0] * sd[0] + m[1] * sd[1] + m[2] * sd[2])) / 2;
+  const waxing = Math.sin(A.moon.ra - A.sun.ra) > 0;
+  sky.moon = { dir: m, sun: sd, illum, waxing, alt: Math.asin(clamp(m[1], -1, 1)) };
+  sky.moonLight = illum * clamp(Math.sin(sky.moon.alt) * 3 + 0.2, 0, 1);
+  const s = toScreen(m);
+  sky.moonScreen = s && m[1] > 0 && s[0] > -30 && s[0] < W + 30 && s[1] > -30 ? s : null;
+  if (sky.moonScreen) {   // pre-render the lit disc with the true phase
+    const R = Math.round(13 * UNIT * DPR), c = mk(R * 2 + 2, R * 2 + 2), g = c.getContext('2d'), im = g.createImageData(c.width, c.height);
+    const Fm = m, Rm = norm3(cross3([0, 1, 0], Fm)), Um = cross3(Fm, Rm);
+    const L = [dot3(sd, Rm), dot3(sd, Um), -dot3(sd, Fm)];
+    for (let y = 0; y < c.height; y++) for (let x = 0; x < c.width; x++) {
+      const nx = (x - R - 0.5) / R, ny = -(y - R - 0.5) / R, r2 = nx * nx + ny * ny;
+      if (r2 > 1) continue;
+      const nz = Math.sqrt(1 - r2), l = Math.max(0, nx * L[0] + ny * L[1] + nz * L[2]);
+      const mare = 0.75 + 0.25 * vn2(nx * 3 + 5, ny * 3 + 2) - 0.12 * (vn2(nx * 7, ny * 7) > 0.6 ? 1 : 0);
+      const v = clamp(l * 1.25, 0, 1) * mare, o = (y * c.width + x) * 4, edge = clamp((1 - Math.sqrt(r2)) * R, 0, 1);
+      im.data[o] = 30 + 225 * v; im.data[o + 1] = 34 + 216 * v; im.data[o + 2] = 44 + 196 * v; im.data[o + 3] = 255 * edge;
+    }
+    g.putImageData(im, 0, 0);
+    sky.moonImg = c;
+  }
+}
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm3 = a => { const l = Math.hypot(...a) || 1; return a.map(v => v / l); };
+function drawStars(t, mirror) {
+  const hy2 = HY * 2;
+  ctx.fillStyle = '#ffffff';
+  for (const f of faint) {
+    if (!f.vis) continue;
+    const tw = 0.75 + 0.25 * Math.sin(t * f.tw + f.ph) * (f.el < 0.25 ? 1.6 : 0.6);
+    let y = f.y; if (mirror) { y = hy2 - y; if (y > SHORE) continue; }
+    ctx.globalAlpha = f.b * tw * (mirror ? 0.28 : 1) * clamp(f.el * 12, 0, 1);
+    ctx.fillRect(f.x, y, 1, 1);
+  }
+  for (const s of sky.stars) {
+    const tw = 0.8 + 0.2 * Math.sin(t * 3 + s.ph) * (s.el < 0.25 ? 1.8 : 0.7);
+    let y = s.y; if (mirror) { y = hy2 - y; if (y > SHORE) continue; }
+    const a = clamp(s.b * tw, 0, 1) * (mirror ? 0.3 : 1) * clamp(s.el * 10, 0, 1);
+    ctx.globalAlpha = a; ctx.beginPath(); ctx.arc(s.x, y, 0.7 + s.b * 0.7, 0, TAU); ctx.fill();
+    if (s.b > 0.8) { ctx.globalAlpha = a * 0.18; ctx.beginPath(); ctx.arc(s.x, y, 2.5 + s.b * 2, 0, TAU); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+}
+function drawMoon(mirror) {
+  if (!sky.moonScreen || !sky.moonImg) return;
+  const [x, y0] = sky.moonScreen, y = mirror ? HY * 2 - y0 : y0;
+  const R = sky.moonImg.width / DPR / 2;
+  ctx.save();
+  ctx.globalAlpha = mirror ? 0.35 : 1;
+  const g = ctx.createRadialGradient(x, y, R * 0.8, x, y, R * 5);
+  g.addColorStop(0, `rgba(190,205,235,${0.22 * sky.moon.illum})`); g.addColorStop(1, 'rgba(190,205,235,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, R * 5, 0, TAU); ctx.fill();
+  ctx.drawImage(sky.moonImg, x - R, y - R, R * 2, R * 2);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------- particles + fx
+function addPart(p) { if (parts.length > 900) parts.splice(0, 100); parts.push(Object.assign({ t: 0, vx: 0, vy: 0, g: 0, drag: 1, size: 1, col: '#fff', alpha: 1, layer: 'front' }, p)); }
+function addFx(f) { f.t = 0; fx.push(f); return f; }
+function puff(x, y, n, spread = 10) { for (let i = 0; i < n; i++) addPart({ x: x + rand(-spread, spread) * 0.4, y, vx: rand(-spread, spread), vy: rand(-spread * 1.6, -spread * 0.3), g: 30, drag: 0.3, life: rand(0.5, 1.1), size: rand(1, 2.2) * UNIT, col: '#9fb0cc', alpha: 0.8 }); }
+
+// ---------------------------------------------------------------- silhouettes (vector, facing right, feet at 0,0)
+function withT(x, y, s, f, fn) { ctx.save(); ctx.translate(x, y); ctx.scale(s * f, s); fn(); ctx.restore(); }
+function legs(list, w) {
+  ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.beginPath();
+  for (const l of list) { ctx.moveTo(l[0], l[1]); for (let i = 2; i < l.length; i += 2) ctx.lineTo(l[i], l[i + 1]); }
+  ctx.stroke();
+}
+function mooseSil(ph, headDown, walking) {
+  ctx.fillStyle = SIL; ctx.strokeStyle = SIL;
+  const sw = walking ? 1 : 0;
+  const leg = (hx, o, front) => { const a = Math.sin(ph + o) * 7 * sw, lift = Math.max(0, Math.cos(ph + o)) * 3 * sw; return [hx, -40, hx + a * 0.4 + (front ? 1 : -1), -22, hx + a, -lift]; };
+  legs([leg(-20, 0), leg(-14, Math.PI), leg(16, Math.PI, true), leg(22, 0, true)], 4.2);
+  ctx.beginPath();
+  ctx.moveTo(-30, -42); ctx.bezierCurveTo(-29, -56, -10, -58, 6, -62); ctx.bezierCurveTo(14, -68, 22, -66, 27, -58);
+  ctx.bezierCurveTo(30, -50, 30, -40, 24, -32); ctx.bezierCurveTo(12, -27, -14, -27, -25, -31); ctx.bezierCurveTo(-31, -33, -33, -38, -30, -42); ctx.fill();
+  ctx.save(); ctx.translate(26, -56); ctx.rotate(headDown * 0.95);
+  ctx.beginPath();
+  ctx.moveTo(-6, -6); ctx.lineTo(8, -3); ctx.bezierCurveTo(16, -2, 26, 4, 31, 12); ctx.bezierCurveTo(34, 17, 32, 22, 27, 21);
+  ctx.lineTo(19, 19); ctx.bezierCurveTo(15, 20, 13, 27, 11, 31); ctx.lineTo(9, 22); ctx.bezierCurveTo(4, 20, -2, 16, -6, 12); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(8, -3); ctx.lineTo(4, -10); ctx.lineTo(11, -4); ctx.fill();
+  // palmate antlers
+  for (const [ox, sc] of [[0, 1], [-3, 0.85]]) {
+    ctx.beginPath(); ctx.moveTo(10 + ox, -3); ctx.quadraticCurveTo(4 + ox, -10 * sc, -6 + ox, -13 * sc);
+    const tips = [[-9, -18], [-5, -15], [-2, -21], [1, -16], [4, -21], [7, -16], [10, -19], [11, -12]];
+    for (const [tx, ty] of tips) ctx.lineTo(tx + ox, ty * sc);
+    ctx.quadraticCurveTo(14 + ox, -6, 13 + ox, -2); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+function wolfSil(pose, ph) {
+  ctx.fillStyle = SIL; ctx.strokeStyle = SIL;
+  if (pose === 'walk') {
+    const leg = (hx, o) => { const a = Math.sin(ph + o) * 6, lift = Math.max(0, Math.cos(ph + o)) * 2.5; return [hx, -20, hx + a * 0.5, -10, hx + a, -lift]; };
+    legs([leg(-14, 0), leg(-10, Math.PI), leg(10, Math.PI), leg(14, 0)], 2.8);
+    ctx.beginPath(); ctx.moveTo(-18, -22); ctx.bezierCurveTo(-16, -30, 4, -31, 12, -29); ctx.lineTo(20, -33); ctx.lineTo(21, -39); ctx.lineTo(23, -34); ctx.lineTo(25, -38); ctx.lineTo(26, -32);
+    ctx.lineTo(34, -28); ctx.lineTo(33, -26); ctx.lineTo(24, -25); ctx.bezierCurveTo(18, -22, 14, -16, 10, -17); ctx.bezierCurveTo(0, -16, -12, -17, -18, -19); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-17, -24); ctx.quadraticCurveTo(-28, -22, -32, -12); ctx.quadraticCurveTo(-26, -18, -17, -20); ctx.fill();
+  } else {
+    const howl = pose === 'howl';
+    legs([[8, -18, 8, 0], [12, -18, 12, 0]], 2.8);
+    ctx.beginPath(); ctx.ellipse(-4, -9, 11, 9, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-12, -8); ctx.bezierCurveTo(-10, -22, 2, -30, 10, -30); ctx.bezierCurveTo(16, -30, 16, -20, 14, -12); ctx.lineTo(6, -4); ctx.closePath(); ctx.fill();
+    ctx.save(); ctx.translate(12, -30); ctx.rotate(howl ? -0.9 : 0);
+    ctx.beginPath(); ctx.moveTo(-5, 2); ctx.lineTo(-4, -6); ctx.lineTo(-2, -2); ctx.lineTo(0, -7); ctx.lineTo(2, -2); ctx.lineTo(11, 1); ctx.lineTo(howl ? 10 : 10, howl ? 4 : 3); ctx.lineTo(2, 5); ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.beginPath(); ctx.moveTo(-14, -4); ctx.quadraticCurveTo(-24, -2, -22, 2); ctx.quadraticCurveTo(-16, 1, -12, -1); ctx.fill();
+  }
+}
+function foxSil(pose, ph, dive) {
+  ctx.fillStyle = SIL; ctx.strokeStyle = SIL;
+  ctx.save();
+  if (dive) ctx.rotate(dive);
+  if (pose === 'walk') {
+    const leg = (hx, o) => { const a = Math.sin(ph + o) * 4, lift = Math.max(0, Math.cos(ph + o)) * 2; return [hx, -11, hx + a * 0.5, -5, hx + a, -lift]; };
+    legs([leg(-8, 0), leg(-6, Math.PI), leg(6, Math.PI), leg(8, 0)], 1.8);
+  } else legs([[-8, -11, -9, -5, -7, 0], [7, -11, 8, -5, 7, 0]], 1.8);
+  ctx.beginPath(); ctx.moveTo(-11, -12); ctx.bezierCurveTo(-8, -17, 4, -17, 8, -15); ctx.lineTo(12, -18); ctx.lineTo(12, -23); ctx.lineTo(14, -19); ctx.lineTo(16, -23); ctx.lineTo(17, -18);
+  ctx.lineTo(23, -15); ctx.lineTo(16, -12); ctx.bezierCurveTo(10, -9, 0, -9, -11, -10); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-10, -13); ctx.bezierCurveTo(-20, -16, -28, -10, -28, -6); ctx.bezierCurveTo(-24, -8, -18, -8, -10, -10); ctx.fill();
+  ctx.fillStyle = '#8e9bb4'; ctx.beginPath(); ctx.arc(-27, -6.5, 2, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function owlSil(flap, perched, blink) {
+  ctx.fillStyle = SIL;
+  ctx.beginPath(); ctx.ellipse(0, -9, 5.5, 8.5, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(0, -19, 5.2, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-4.5, -21); ctx.lineTo(-5, -27); ctx.lineTo(-1.5, -23); ctx.moveTo(4.5, -21); ctx.lineTo(5, -27); ctx.lineTo(1.5, -23); ctx.fill();
+  if (!perched) {
+    const a = Math.sin(flap) * 0.9;
+    for (const s of [-1, 1]) { ctx.beginPath(); ctx.moveTo(s * 3, -13); ctx.quadraticCurveTo(s * 12, -13 - a * 14, s * 24, -8 - a * 16); ctx.quadraticCurveTo(s * 13, -5 - a * 5, s * 3, -7); ctx.fill(); }
+  } else if (!blink) {
+    ctx.fillStyle = '#f2c14e'; ctx.beginPath(); ctx.arc(-2, -19.5, 1.1, 0, TAU); ctx.arc(2, -19.5, 1.1, 0, TAU); ctx.fill();
+  }
+}
+function hareSil(pose) {
+  ctx.fillStyle = '#b8c3d8';
+  ctx.beginPath(); ctx.ellipse(0, -6, 7, pose === 'up' ? 6 : 5, pose === 'up' ? -0.9 : 0, 0, TAU); ctx.fill();
+  const hx = pose === 'up' ? 3 : 6, hy = pose === 'up' ? -14 : -9;
+  ctx.beginPath(); ctx.arc(hx, hy, 3.4, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(hx - 1, hy - 7, 1.3, 5, -0.2, 0, TAU); ctx.ellipse(hx + 1, hy - 7, 1.3, 5, 0.15, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#1a2130'; ctx.beginPath(); ctx.arc(hx - 1.6, hy - 11.5, 1, 0, TAU); ctx.arc(hx + 0.8, hy - 11.5, 1, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(hx + 1.3, hy - 0.6, 0.6, 0, TAU); ctx.fill();
+}
+function personSil(pose, t) {
+  ctx.fillStyle = SIL; ctx.strokeStyle = SIL;
+  const step = pose === 'walk' ? Math.sin(t * 7) * 3 : 0;
+  legs([[-2, -12, -2 - step, 0], [2, -12, 2 + step, 0]], 2.4);
+  ctx.beginPath(); ctx.moveTo(-5, -12); ctx.lineTo(-4, -26); ctx.quadraticCurveTo(0, -29, 4, -26); ctx.lineTo(5, -12); ctx.closePath(); ctx.fill();
+  const look = pose === 'look' || pose === 'photo';
+  ctx.beginPath(); ctx.arc(look ? 1 : 0.5, look ? -30 : -30.5, 3.4, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(look ? 0 : 0.5, -34.5, 1.4, 0, TAU); ctx.fill();
+  if (pose === 'photo') { legs([[3, -24, 7, -30, 9, -35]], 2); ctx.fillStyle = '#9fd4ff'; ctx.fillRect(8, -38, 2.5, 3.5); }
+  else if (pose === 'mug') { legs([[3, -24, 7, -22, 8, -26]], 2); }
+}
+function canoeSil(t) {
+  ctx.fillStyle = SIL; ctx.strokeStyle = SIL;
+  ctx.beginPath(); ctx.moveTo(-26, -5); ctx.quadraticCurveTo(-24, -1, -16, 0); ctx.lineTo(16, 0); ctx.quadraticCurveTo(24, -1, 26, -5); ctx.lineTo(20, -3); ctx.lineTo(-20, -3); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-3, -3); ctx.lineTo(-2, -12); ctx.quadraticCurveTo(1, -14, 3, -12); ctx.lineTo(4, -3); ctx.fill();
+  ctx.beginPath(); ctx.arc(0.5, -15, 2.6, 0, TAU); ctx.fill();
+  const a = Math.sin(t * 1.6);
+  ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(-4 + a * 4, -16 + Math.abs(a) * 2); ctx.lineTo(6 - a * 6, 2); ctx.stroke();
+}
+function reindeerSil(ph) {
+  ctx.fillStyle = SIL; ctx.strokeStyle = SIL;
+  const leg = (hx, o) => { const a = Math.sin(ph + o) * 4; return [hx, -16, hx + a * 0.4, -8, hx + a, 0]; };
+  legs([leg(-10, 0), leg(-7, Math.PI), leg(8, Math.PI), leg(11, 0)], 1.8);
+  ctx.beginPath(); ctx.moveTo(-14, -17); ctx.bezierCurveTo(-12, -24, 6, -24, 11, -22); ctx.lineTo(17, -28); ctx.lineTo(22, -26); ctx.lineTo(18, -22); ctx.bezierCurveTo(14, -16, 8, -14, 0, -14); ctx.bezierCurveTo(-8, -14, -13, -14, -14, -17); ctx.fill();
+  legs([[17, -28, 14, -36, 10, -38], [15, -33, 18, -38], [17, -28, 19, -35, 22, -37]], 1);
+}
+
+// ---------------------------------------------------------------- entities
+class Ent {
+  constructor(o) { Object.assign(this, { x: 0, y: 0, s: 1, f: 1, ph: 0, dead: false, layer: 'near', alpha: 1, reflect: false }, o); }
+  update(dt) { if (this.brain) { const r = this.brain.next(dt); if (r.done) this.dead = true; } }
+  draw() {}
+}
+function* moveTo(e, tx, speed, anim = true) {
+  e.f = Math.sign(tx - e.x) || e.f;
+  while (Math.abs(tx - e.x) > 0.5) {
+    const dt = yield;
+    const step = Math.min(Math.abs(tx - e.x), speed * dt);
+    e.x += Math.sign(tx - e.x) * step;
+    if (anim) e.ph += dt * speed / (e.stride || 6) / e.s;
+    if (e.follow) e.y = e.follow(e.x);
+  }
+}
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+
+// ---------------------------------------------------------------- events
+const nearY = x => bankTop(x) + H * 0.045;
+const farY = () => HY - 0.5;
+function* evMeteor() {
+  const n = chance(0.3) ? 2 : 1;
+  for (let i = 0; i < n; i++) { meteor(); yield* wait(rand(1, 4)); }
+  yield* wait(2);
+}
+function meteor(bright = 1, rx, ry) {
+  const x = rx ?? rand(0.1, 0.9) * W, y = ry ?? rand(0.05, 0.4) * HY;
+  const ang = rand(0.35, 1.1) * coin() + Math.PI / 2, sp = rand(500, 900) * UNIT;
+  addFx({ kind: 'meteor', x, y, vx: Math.cos(ang) * sp * Math.sign(Math.cos(ang) || 1), vy: Math.abs(Math.sin(ang)) * sp * 0.6, dur: rand(0.4, 0.9), bright, green: chance(0.3) });
+}
+function* evSubstorm() {
+  let t = 0;
+  while (t < 70) { const dt = yield; t += dt; world.boost = t < 12 ? smooth(0, 12, t) : t < 45 ? 1 : 1 - smooth(45, 70, t); }
+  world.boost = 0;
+}
+function* evMoose() {
+  const far = chance(0.55), dir = coin();
+  const s = far ? 0.2 * UNIT : 1.25 * UNIT;
+  const x0 = dir > 0 ? -60 * s : W + 60 * s;
+  const e = new Ent({ x: x0, y: far ? farY() : nearY(x0), s, f: dir, stride: 10, layer: far ? 'far' : 'near', reflect: far, head: 0, walking: true, follow: far ? null : nearY });
+  e.draw = () => withT(e.x, e.y, e.s, e.f, () => mooseSil(e.ph, e.head, e.walking));
+  ents.push(e);
+  const mid = W * rand(0.3, 0.7);
+  yield* moveTo(e, mid, 16 * s);
+  e.walking = false;
+  if (far) {
+    for (let k = 0; k < 20; k++) { e.head = k / 20; yield* wait(0.05); }
+    for (let i = 0; i < 3; i++) { addFx({ kind: 'ring', x: e.x + e.f * 30 * s, y: HY + 1.5 * UNIT, dur: 3, r: 14 * s }); yield* wait(rand(1.8, 3)); }
+    for (let k = 20; k >= 0; k--) { e.head = k / 20; yield* wait(0.05); }
+  } else {
+    yield* wait(2);
+    e.f = -e.f; yield* wait(2.5); e.f = -e.f; yield* wait(1.5);
+    for (let k = 0; k < 16; k++) { e.head = k / 16 * 0.6; yield* wait(0.05); }
+    yield* wait(4);
+    for (let k = 16; k >= 0; k--) { e.head = k / 16 * 0.6; yield* wait(0.05); }
+  }
+  e.walking = true;
+  yield* moveTo(e, dir > 0 ? W + 70 * s : -70 * s, 16 * s);
+  e.dead = true;
+}
+function* evWolf() {
+  const dir = coin(), s = 0.95 * UNIT, x0 = dir > 0 ? -40 * s : W + 40 * s;
+  const rock = scene.rocks.length ? pick(scene.rocks) : null;
+  const e = new Ent({ x: x0, y: nearY(x0), s, f: dir, stride: 7, pose: 'walk', follow: nearY });
+  e.draw = () => withT(e.x, e.y, e.s, e.f, () => wolfSil(e.pose, e.ph));
+  ents.push(e);
+  const tx = rock ? rock.x : W * rand(0.35, 0.65);
+  yield* moveTo(e, tx, 26 * s);
+  if (rock) { e.follow = null; e.y = rock.y - rock.r * 0.45; }
+  e.pose = 'sit'; yield* wait(2);
+  const howls = randi(2, 3);
+  for (let i = 0; i < howls; i++) {
+    e.pose = 'howl'; addFx({ kind: 'howl', x: e.x + e.f * 20 * s, y: e.y - 42 * s, dur: 3.2 });
+    yield* wait(3.2);
+    e.pose = 'sit'; yield* wait(rand(2, 3.5));
+  }
+  e.follow = nearY; e.pose = 'walk';
+  yield* moveTo(e, dir > 0 ? W + 50 * s : -50 * s, 30 * s);
+  e.dead = true;
+}
+function* evOwl() {
+  if (!scene.perches.length) return;
+  const from = pick(scene.perches), to = pick(scene.perches.filter(p => p !== from)) || from;
+  const s = 0.9 * UNIT;
+  const e = new Ent({ x: from.x, y: from.y, s, f: Math.sign(to.x - from.x) || 1, flap: 0, perched: true, blink: false, layer: 'front' });
+  e.draw = () => withT(e.x, e.y, e.s, e.f, () => owlSil(e.flap, e.perched, e.blink));
+  ents.push(e);
+  yield* wait(3);
+  e.perched = false;
+  const x0 = from.x, y0 = from.y, dur = Math.abs(to.x - from.x) / (160 * UNIT) + 2;
+  for (let t = 0; t < dur;) { const dt = yield; t += dt; const k = t / dur; e.x = lerp(x0, to.x, smooth(0, 1, k)); e.y = lerp(y0, to.y, k) - Math.sin(k * Math.PI) * H * 0.08; e.flap += dt * (k > 0.3 && k < 0.7 ? 4 : 11); }
+  e.perched = true; e.f = to.x < W / 2 ? 1 : -1;
+  for (let i = 0; i < 8; i++) { yield* wait(rand(1.2, 3)); e.blink = true; yield* wait(0.15); e.blink = false; if (chance(0.3)) e.f = -e.f; }
+  e.perched = false;
+  const tx = e.x + e.f * W * 0.5;
+  for (let t = 0; t < 3;) { const dt = yield; t += dt; e.x = lerp(e.x, tx, dt * 0.8); e.y -= dt * 80 * UNIT; e.flap += dt * 12; }
+  e.dead = true;
+}
+function* evFox() {
+  const dir = coin(), s = 1.0 * UNIT, x0 = dir > 0 ? -40 * s : W + 40 * s;
+  const e = new Ent({ x: x0, y: nearY(x0), s, f: dir, stride: 5, pose: 'walk', dive: 0, follow: nearY });
+  e.draw = () => withT(e.x, e.y, e.s, e.f, () => foxSil(e.pose, e.ph, e.dive));
+  ents.push(e);
+  yield* moveTo(e, W * rand(0.3, 0.7), 34 * s);
+  e.pose = 'stand'; yield* wait(1.2); e.f = -e.f; yield* wait(0.8); e.f = -e.f; yield* wait(1.5);
+  // the mousing pounce: up, over, head first into the snow
+  const x0p = e.x, tx = e.x + e.f * 40 * s, by = e.y; e.follow = null;
+  for (let t = 0; t < 0.9;) { const dt = yield; t += dt; const k = t / 0.9; e.x = lerp(x0p, tx, k); e.y = by - Math.sin(k * Math.PI) * 38 * s; e.dive = -e.f * 0 + (k - 0.3) * 1.6 * (1); }
+  e.y = by + 6 * s; e.dive = 1.3; puff(e.x + e.f * 10 * s, by, 14, 16 * UNIT);
+  yield* wait(1.4);
+  e.dive = 0; e.y = by; e.follow = nearY; puff(e.x, by, 6, 10 * UNIT);
+  yield* wait(1.2);
+  e.pose = 'walk';
+  yield* moveTo(e, dir > 0 ? W + 50 * s : -50 * s, 40 * s);
+  e.dead = true;
+}
+function* evHare() {
+  const dir = coin(), s = 0.9 * UNIT, x0 = dir > 0 ? -20 : W + 20;
+  const e = new Ent({ x: x0, y: nearY(x0), s, f: dir, pose: 'sit', hop: 0 });
+  e.draw = () => withT(e.x, e.y - e.hop, e.s, e.f, () => hareSil(e.pose));
+  ents.push(e);
+  const hopTo = function* (tx) { while (Math.abs(tx - e.x) > 4) { const x0h = e.x, x1 = e.x + Math.sign(tx - e.x) * Math.min(22 * s, Math.abs(tx - e.x)); e.f = Math.sign(x1 - x0h); for (let t = 0; t < 0.35;) { const dt = yield; t += dt; e.x = lerp(x0h, x1, t / 0.35); e.y = nearY(e.x); e.hop = Math.sin(t / 0.35 * Math.PI) * 9 * s; } e.hop = 0; yield* wait(rand(0.05, 0.3)); } };
+  yield* hopTo(W * rand(0.3, 0.7));
+  yield* wait(1); e.pose = 'up'; yield* wait(2.5); e.pose = 'sit'; yield* wait(1.5);
+  yield* hopTo(dir > 0 ? W + 20 : -20);
+  e.dead = true;
+}
+function* evCabin() {
+  const cab = scene.cabin; if (!cab) return;
+  scene.door = 0;
+  for (let t = 0; t < 1;) { const dt = yield; t += dt; scene.door = t; }
+  const s = 0.2 * UNIT;
+  const p = new Ent({ x: cab.door.x + cab.door.w / 2, y: farY(), s, f: 1, pose: 'walk', layer: 'far', reflect: true });
+  p.draw = () => withT(p.x, p.y, p.s * 1.9, p.f, () => personSil(p.pose, world.t));
+  ents.push(p);
+  const tx = cab.x + coin() * cab.w * rand(0.9, 1.4);
+  p.f = Math.sign(tx - p.x) || 1;
+  while (Math.abs(p.x - tx) > 0.5) { const dt = yield; p.x += Math.sign(tx - p.x) * Math.min(Math.abs(tx - p.x), dt * 6 * UNIT); }
+  p.pose = 'look'; yield* wait(4);
+  if (chance(0.6)) { p.pose = 'photo'; for (let i = 0; i < randi(1, 3); i++) { yield* wait(rand(1.2, 2.5)); addFx({ kind: 'flash', x: p.x + 2 * UNIT, y: p.y - 12 * UNIT * 0.2 * 1.9 * 5, dur: 0.18 }); } yield* wait(1.5); }
+  p.pose = 'mug'; yield* wait(5);
+  p.pose = 'walk'; const back = cab.door.x + cab.door.w / 2; p.f = Math.sign(back - p.x) || 1;
+  while (Math.abs(p.x - back) > 0.5) { const dt = yield; p.x += Math.sign(back - p.x) * Math.min(Math.abs(back - p.x), dt * 6 * UNIT); }
+  p.dead = true;
+  for (let t = 0; t < 1;) { const dt = yield; t += dt; scene.door = 1 - t; }
+  scene.door = 0;
+}
+function* evCanoe() {
+  const dir = coin(), yk = rand(0.25, 0.75), y = lerp(HY + 6 * UNIT, SHORE - 14 * UNIT, yk), s = lerp(0.3, 0.8, yk) * UNIT;
+  const x0 = dir > 0 ? -40 * s : W + 40 * s;
+  const e = new Ent({ x: x0, y, s, f: dir, layer: 'water', reflect: true });
+  e.draw = () => withT(e.x, e.y, e.s, e.f, () => canoeSil(world.t));
+  e.lamp = true;
+  ents.push(e);
+  while (dir > 0 ? e.x < W + 40 * s : e.x > -40 * s) {
+    const dt = yield; e.x += dir * dt * 26 * s;
+    if (chance(dt * 1.5)) addFx({ kind: 'wake', x: e.x - dir * 24 * s, y: e.y + 0.5, dur: 5, r: 10 * s, dir });
+  }
+  e.dead = true;
+}
+function* evSatellite() {
+  const n = chance(0.3) ? 2 : 1;
+  for (let i = 0; i < n; i++) {
+    const y0 = rand(0.05, 0.45) * HY, dir = coin();
+    addFx({ kind: 'sat', x: dir > 0 ? -10 : W + 10, y: y0, vx: dir * rand(28, 48) * UNIT, vy: rand(-6, 6) * UNIT, dur: (W + 20) / (38 * UNIT) + 4, flare: chance(0.25) ? rand(0.3, 0.7) : -1 });
+    yield* wait(rand(4, 12));
+  }
+  yield* wait(10);
+}
+function* evSnow() {
+  for (let t = 0; t < 70;) { const dt = yield; t += dt; world.snow = t < 10 ? t / 10 : t > 55 ? (70 - t) / 15 : 1; }
+  world.snow = 0;
+}
+function* evShower() {
+  const rx = W * rand(0.3, 0.7), ry = HY * rand(0.05, 0.25);
+  for (let t = 0; t < 45;) {
+    const dt = yield; t += dt;
+    if (chance(dt * 0.9)) {
+      const a = rand(0, TAU), d = rand(30, 160) * UNIT;
+      const x = rx + Math.cos(a) * d, y = ry + Math.sin(a) * d * 0.6, sp = rand(600, 1000) * UNIT;
+      addFx({ kind: 'meteor', x, y, vx: Math.cos(a) * sp, vy: Math.abs(Math.sin(a)) * sp * 0.7 + 60, dur: rand(0.3, 0.7), bright: rand(0.6, 1.2), green: chance(0.4) });
+    }
+  }
+  yield* wait(3);
+}
+function* evFireball() {
+  const dir = coin(), x = dir > 0 ? W * rand(0.05, 0.3) : W * rand(0.7, 0.95), y = HY * rand(0.05, 0.2);
+  const f = addFx({ kind: 'fireball', x, y, vx: dir * rand(220, 320) * UNIT, vy: rand(90, 140) * UNIT, dur: 2.6, trail: [] });
+  for (let t = 0; t < 2.6;) { const dt = yield; t += dt; world.flash = Math.max(world.flash, Math.sin(clamp(t / 2.6, 0, 1) * Math.PI) * 0.8 * (0.8 + 0.2 * Math.sin(t * 40))); }
+  yield* wait(12);
+}
+function* evRed() {
+  for (let t = 0; t < 110;) { const dt = yield; t += dt; world.red = (t < 20 ? smooth(0, 20, t) : t > 80 ? 1 - smooth(80, 110, t) : 1) * 1.1; world.boost = Math.max(world.boost, world.red * 0.4); }
+  world.red = 0; world.boost = 0;
+}
+function* evSteve() {
+  world.steveX = rand(-0.25, 0.25);
+  for (let t = 0; t < 80;) { const dt = yield; t += dt; world.steve = t < 15 ? smooth(0, 15, t) : t > 60 ? 1 - smooth(60, 80, t) : 1; }
+  world.steve = 0;
+}
+function* evReindeer() {
+  const dir = coin(), n = randi(6, 10), s = 0.22 * UNIT, herd = [];
+  for (let i = 0; i < n; i++) {
+    const x0 = (dir > 0 ? -30 : W + 30) - dir * i * rand(22, 34) * s;
+    const e = new Ent({ x: x0, y: farY(), s, f: dir, ph: rand(0, TAU), layer: 'far', reflect: true, v: rand(13, 16) * s });
+    e.draw = () => withT(e.x, e.y, e.s, e.f, () => reindeerSil(e.ph));
+    herd.push(e); ents.push(e);
+  }
+  while (herd.some(e => (dir > 0 ? e.x < W + 40 : e.x > -40))) {
+    const dt = yield;
+    for (const e of herd) { e.x += dir * e.v * dt; e.ph += dt * 5; }
+  }
+  herd.forEach(e => (e.dead = true));
+}
+const COMMON = { meteor: 1.6, substorm: 1.3, moose: 1.3, wolf: 1.1, owl: 1.1, fox: 1.2, cabin: 1.0, canoe: 1.0, satellite: 1.2, snow: 0.8, hare: 1.0 };
+const RARE = { shower: 1, fireball: 1, red: 1, steve: 0.8, reindeer: 1 };
+const EVENTS = { meteor: evMeteor, substorm: evSubstorm, moose: evMoose, wolf: evWolf, owl: evOwl, fox: evFox, cabin: evCabin, canoe: evCanoe, satellite: evSatellite, snow: evSnow, hare: evHare,
+  shower: evShower, fireball: evFireball, red: evRed, steve: evSteve, reindeer: evReindeer };
+const director = { cur: null, name: '', cool: 6, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 3 : rand(12, 26); cleanup(); }
+  } else if ((director.cool -= dt) <= 0) {
+    const all = Object.keys(EVENTS);
+    let name;
+    if (FORCE) name = FORCE === 'all' ? all[director.idx++ % all.length] : FORCE;
+    else do { name = chance(0.13) ? weighted(RARE) : weighted(COMMON); } while (name === director.last);
+    if (!EVENTS[name]) { director.cool = 5; return; }
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; cleanup(); }
+  }
+}
+function cleanup() {
+  for (const e of ents) e.dead = true;
+  world.boost = 0; world.red = 0; world.steve = 0; world.snow = 0; scene.door = 0;
+}
+
+// ---------------------------------------------------------------- update + render
+function updateAurora(dt) {
+  const kp = kpNow(world.t);
+  const elev = clamp(16 + 5.2 * kp + world.boost * 9, 13, 72) * rad;
+  const Z0 = 1 / Math.tan(elev);
+  const base = (0.13 + 0.085 * kp) * (1 + 1.4 * world.boost);
+  const tZ = [Z0, Z0 * 1.9 + 1.2, Z0 * 3.4 + 3.5], tI = [base, base * (kp > 3 ? 0.32 : 0.16), kp > 5 ? base * 0.22 : 0];
+  const k = world.t < 0.5 ? 1 : 1 - Math.exp(-dt / 6);
+  for (let i = 0; i < 3; i++) { world.arcs.Z[i] = lerp(world.arcs.Z[i], tZ[i], k); world.arcs.I[i] = lerp(world.arcs.I[i], tI[i], k); }
+  const breathe = 0.82 + 0.18 * Math.sin(world.t * 0.07) * Math.sin(world.t * 0.023 + 1);
+  world.arcI = world.arcs.I.map(v => v * breathe);
+  world.speedMul = 1 + 0.12 * kp + 2.2 * world.boost;
+  world.phase += dt * world.speedMul;
+  world.glow = world.arcI[0] + world.arcI[1] * 0.5;
+}
+let lastSky = -99;
+function update(dt) {
+  world.t += dt;
+  updateAurora(dt);
+  if (world.t - lastSky > 5 || lastSky < 0) { lastSky = world.t; updateSky(astro(Date.now())); }
+  runDirector(dt);
+  for (const e of ents) if (!e.dead) e.update(dt);
+  for (let i = ents.length - 1; i >= 0; i--) if (ents[i].dead) ents.splice(i, 1);
+  for (const p of parts) { p.t += dt; const kd = Math.pow(p.drag, dt); p.vx *= kd; p.vy *= kd; p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt; }
+  for (let i = parts.length - 1; i >= 0; i--) if (parts[i].t > parts[i].life) parts.splice(i, 1);
+  for (const f of fx) f.t += dt;
+  for (let i = fx.length - 1; i >= 0; i--) if (fx[i].t > fx[i].dur) fx.splice(i, 1);
+  world.flash = Math.max(0, world.flash - dt * 1.2);
+  // chimney smoke
+  if (scene.cabin && chance(dt * 3)) { const c = scene.cabin.chim; addPart({ x: c.x, y: c.y - 8 * UNIT, vx: rand(2, 6) * UNIT, vy: -rand(5, 9) * UNIT, drag: 0.9, life: rand(5, 8), size: rand(2, 3.5) * UNIT, col: '#6c7a94', alpha: 0.16, layer: 'smoke', grow: 1.2 }); }
+  // snowfall
+  if (world.snow > 0) for (let i = 0; i < world.snow * dt * 120 * (W / 1400); i++) { const z = rand(0.3, 1); addPart({ x: rand(-20, W + 20), y: -5, vx: rand(-8, 8), vy: 40 * z * UNIT, life: H / (40 * z * UNIT) + 1, size: z * 2.2 * UNIT, col: '#dfe8f7', alpha: 0.35 + 0.5 * z, layer: 'snow', z, ph: rand(0, TAU) }); }
+}
+function drawFx(kind, fn) { for (const f of fx) if (f.kind === kind) fn(f); }
+function render() {
+  const A = world.arcI || world.arcs.I;
+  gl.uniform2f(U.uRes, cv.width, cv.height);
+  gl.uniform1f(U.uScale, RS); gl.uniform1f(U.uHY, HY); gl.uniform1f(U.uF, F); gl.uniform1f(U.uW, W);
+  gl.uniform1f(U.uPhase, world.phase); gl.uniform1f(U.uTime, world.t);
+  gl.uniform3f(U.uArcZ, ...world.arcs.Z); gl.uniform3f(U.uArcI, ...A);
+  gl.uniform1f(U.uRed, world.red); gl.uniform1f(U.uBoost, world.boost);
+  gl.uniform1f(U.uMoonLight, sky.moonLight || 0); gl.uniform3fv(U.uMoonDir, sky.moon ? sky.moon.dir : [0, -1, 0]);
+  gl.uniform1f(U.uFlash, world.flash); gl.uniform1f(U.uSteve, world.steve); gl.uniform1f(U.uSteveX, world.steveX);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const t = world.t;
+  // sky objects
+  drawStars(t, false);
+  drawMoon(false);
+  drawFx('sat', f => { const x = f.x + f.vx * f.t, y = f.y + f.vy * f.t, fl = f.flare > 0 ? Math.exp(-(((f.t / f.dur - f.flare) * 14) ** 2)) : 0; ctx.fillStyle = '#e8eeff'; ctx.globalAlpha = 0.55 + fl * 0.45; ctx.beginPath(); ctx.arc(x, y, 0.8 + fl * 2.2, 0, TAU); ctx.fill(); ctx.globalAlpha = 1; });
+  drawFx('meteor', f => {
+    const k = f.t / f.dur, x = f.x + f.vx * f.t, y = f.y + f.vy * f.t, a = Math.sin(k * Math.PI) * f.bright, L = 0.16;
+    const g = ctx.createLinearGradient(x, y, x - f.vx * L, y - f.vy * L);
+    g.addColorStop(0, f.green ? `rgba(200,255,220,${a})` : `rgba(255,255,245,${a})`); g.addColorStop(1, 'rgba(160,200,255,0)');
+    ctx.strokeStyle = g; ctx.lineWidth = 1.3 * UNIT; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - f.vx * L, y - f.vy * L); ctx.stroke();
+  });
+  drawFx('fireball', f => {
+    const x = f.x + f.vx * f.t, y = f.y + f.vy * f.t, k = f.t / f.dur;
+    if (k < 1) f.trail.push([x, y, f.t]);
+    ctx.lineCap = 'round';
+    for (let i = 1; i < f.trail.length; i++) {
+      const [x0, y0, t0] = f.trail[i - 1], [x1, y1] = f.trail[i], age = f.t - t0;
+      ctx.strokeStyle = `rgba(170,190,220,${clamp(0.35 - age * 0.03, 0, 0.35)})`; ctx.lineWidth = (2 + age * 1.5) * UNIT;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    }
+    if (k < 1) {
+      const g = ctx.createRadialGradient(x, y, 0, x, y, 22 * UNIT);
+      g.addColorStop(0, 'rgba(255,255,240,1)'); g.addColorStop(0.2, 'rgba(160,255,190,0.8)'); g.addColorStop(1, 'rgba(80,200,140,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 22 * UNIT, 0, TAU); ctx.fill();
+      if (chance(0.3)) addPart({ x, y, vx: f.vx * 0.6 + rand(-40, 40), vy: f.vy * 0.6 + rand(-20, 40), life: rand(0.3, 0.7), size: 1.6 * UNIT, col: '#fff6c0', alpha: 1, layer: 'sky' });
+    }
+  });
+  for (const p of parts) if (p.layer === 'sky') { ctx.globalAlpha = p.alpha * (1 - p.t / p.life); ctx.fillStyle = p.col; ctx.fillRect(p.x, p.y, p.size, p.size); }
+  ctx.globalAlpha = 1;
+  // mountains, treeline, cabin
+  ctx.drawImage(scene.top, 0, 0, W, scene.top.height / DPR);
+  if (world.glow > 0.02 || world.flash > 0.01) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = clamp(world.glow * 0.16 + world.flash * 0.25, 0, 0.6);
+    ctx.drawImage(scene.glowMask, 0, 0, W, scene.glowMask.height / DPR);
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  }
+  drawCabinLights(t, false);
+  for (const p of parts) if (p.layer === 'smoke') { const k = p.t / p.life; ctx.globalAlpha = p.alpha * Math.sin(k * Math.PI); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (1 + k * 3), 0, TAU); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  for (const e of ents) if (e.layer === 'far') e.draw();
+  // lake: rippled reflections of everything above the horizon
+  drawReflections(t);
+  for (const e of ents) if (e.layer === 'water') { drawLamp(e); e.draw(); }
+  drawFx('wake', f => { const k = f.t / f.dur; ctx.strokeStyle = `rgba(150,170,200,${0.25 * (1 - k)})`; ctx.lineWidth = 1; ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r * (1 + k * 3), f.r * (0.12 + k * 0.3), 0, 0, TAU); ctx.stroke(); });
+  drawFx('ring', f => { const k = f.t / f.dur; ctx.strokeStyle = `rgba(150,170,200,${0.35 * (1 - k)})`; ctx.lineWidth = 1; ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r * (0.3 + k * 2.5), f.r * (0.06 + k * 0.4), 0, 0, TAU); ctx.stroke(); });
+  // near bank
+  ctx.drawImage(scene.bank, 0, 0, W, H);
+  drawSparkles(t);
+  for (const e of ents) if (e.layer === 'near') e.draw();
+  for (const p of parts) if (p.layer === 'front') { const k = p.t / p.life; ctx.globalAlpha = p.alpha * (1 - k); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, TAU); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  ctx.drawImage(scene.trees, 0, 0, W, H);
+  for (const e of ents) if (e.layer === 'front') e.draw();
+  drawFx('flash', f => { const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, 60 * UNIT); g.addColorStop(0, `rgba(230,240,255,${0.9 * (1 - f.t / f.dur)})`); g.addColorStop(1, 'rgba(230,240,255,0)'); ctx.fillStyle = g; ctx.fillRect(f.x - 60 * UNIT, f.y - 60 * UNIT, 120 * UNIT, 120 * UNIT); });
+  drawFx('howl', f => { const k = f.t / f.dur; ctx.strokeStyle = `rgba(200,215,240,${0.45 * Math.sin(k * Math.PI)})`; ctx.lineWidth = 1; for (let i = 0; i < 3; i++) { const r = (8 + i * 7 + k * 10) * UNIT; ctx.beginPath(); ctx.arc(f.x, f.y, r, -1.2, -0.5); ctx.stroke(); } });
+  for (const p of parts) if (p.layer === 'snow') { const tw = Math.sin(t * 1.5 + p.ph) * 12 * p.z; ctx.globalAlpha = p.alpha; ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x + tw, p.y, p.size / 2, 0, TAU); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  if (world.flash > 0.01) { ctx.globalCompositeOperation = 'lighter'; ctx.fillStyle = `rgba(90,140,120,${world.flash * 0.2})`; ctx.fillRect(0, 0, W, H); ctx.globalCompositeOperation = 'source-over'; }
+  drawHud();
+}
+function drawCabinLights(t, mirror) {
+  const cab = scene.cabin; if (!cab) return;
+  const fl = 0.85 + 0.1 * Math.sin(t * 7.3) * Math.sin(t * 3.1) + 0.05 * Math.sin(t * 17);
+  const w = cab.win, d = cab.door;
+  const Y = y => (mirror ? HY * 2 - y : y);
+  ctx.fillStyle = `rgba(255,${Math.round(170 + 30 * fl)},90,${0.9 * fl})`;
+  ctx.fillRect(w.x, mirror ? Y(w.y + w.h) : w.y, w.w, w.h);
+  if (scene.door > 0) ctx.fillRect(d.x, mirror ? Y(d.y + d.h) : d.y, d.w * scene.door, d.h);
+  const g = ctx.createRadialGradient(w.x + w.w / 2, Y(w.y + w.h / 2), 0, w.x + w.w / 2, Y(w.y + w.h / 2), 26 * UNIT);
+  g.addColorStop(0, `rgba(255,180,90,${0.25 * fl})`); g.addColorStop(1, 'rgba(255,180,90,0)');
+  ctx.fillStyle = g; ctx.fillRect(w.x - 30 * UNIT, Y(w.y + w.h / 2) - 30 * UNIT, 60 * UNIT + w.w, 60 * UNIT);
+}
+function drawReflections(t) {
+  // the sky itself is reflected by the shader; here: stars, moon, mountains, cabin light, far-shore walkers
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, HY, W, SHORE - HY + H * 0.1); ctx.clip();
+  drawStars(t, true);
+  drawMoon(true);
+  const src = scene.top, sh = src.height, strip = 2;
+  ctx.globalAlpha = 0.5;
+  for (let y = HY; y < SHORE + H * 0.02; y += strip) {
+    const dy = y - HY, srcY = HY - dy - strip;
+    if (srcY < 0) break;
+    const amp = (0.15 + dy * 0.012) * UNIT, off = Math.sin(y * 0.21 + t * 1.1) * amp + Math.sin(y * 0.063 - t * 0.5) * amp * 0.7;
+    ctx.drawImage(src, 0, srcY * DPR, src.width, strip * DPR, off, y, W, strip);
+  }
+  ctx.globalAlpha = 1;
+  // mirror the far-shore creatures
+  ctx.globalAlpha = 0.45;
+  ctx.translate(0, HY * 2); ctx.scale(1, -1);
+  for (const e of ents) if (e.reflect && e.layer === 'far') e.draw();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalAlpha = 1;
+  // warm streak of the cabin window on the water
+  const cab = scene.cabin;
+  if (cab) {
+    const x = cab.win.x + cab.win.w / 2;
+    for (let i = 0; i < 26; i++) {
+      const y = HY + 2 + i * 2.2 * UNIT, w = (cab.win.w * 0.8 + i * 0.5) * (0.6 + 0.4 * Math.sin(t * 2 + i * 1.7));
+      ctx.fillStyle = `rgba(255,170,80,${0.32 * (1 - i / 26)})`; ctx.fillRect(x - w / 2 + Math.sin(t * 1.4 + i) * UNIT, y, w, 1);
+    }
+  }
+  for (const e of ents) if (e.layer === 'water' && e.reflect) {
+    ctx.save(); ctx.globalAlpha = 0.35; ctx.translate(0, e.y * 2); ctx.scale(1, -1); e.draw(); ctx.restore();
+  }
+  ctx.fillStyle = 'rgba(2,5,10,0.18)'; ctx.fillRect(0, HY, W, SHORE - HY + H * 0.1);   // water is darker than the air
+  ctx.restore();
+}
+function drawLamp(e) {
+  if (!e.lamp) return;
+  const x = e.x + e.f * 0.5 * e.s, y = e.y - 15 * e.s, dir = e.f;
+  const sweep = Math.sin(world.t * 0.4) * 0.3;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  const L = 90 * e.s, a0 = (dir > 0 ? 0 : Math.PI) + sweep + 0.25 * dir;
+  const g = ctx.createRadialGradient(x, y, 0, x, y, L);
+  g.addColorStop(0, 'rgba(255,245,210,0.35)'); g.addColorStop(1, 'rgba(255,245,210,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, L, a0 - 0.18, a0 + 0.18); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(255,250,230,0.9)'; ctx.beginPath(); ctx.arc(x, y, 1.2 * UNIT, 0, TAU); ctx.fill();
+  for (let i = 0; i < 18; i++) { ctx.fillStyle = `rgba(255,240,200,${0.25 * (1 - i / 18)})`; ctx.fillRect(x - 2 + Math.sin(world.t * 2 + i) * UNIT, e.y + 2 + i * 2 * UNIT * e.s * 2, 4, 1); }
+  ctx.restore();
+}
+function drawSparkles(t) {
+  if (!scene.sparkles) { scene.sparkles = []; for (let i = 0; i < W / 10; i++) { const x = rand(0, W); scene.sparkles.push({ x, y: rand(bankTop(x) + 6, H), ph: rand(0, TAU), sp: rand(0.3, 1.2) }); } }
+  ctx.fillStyle = '#dce8ff';
+  for (const s of scene.sparkles) { const a = Math.pow(Math.max(0, Math.sin(t * s.sp + s.ph)), 30); if (a < 0.05) continue; ctx.globalAlpha = a * 0.8; ctx.fillRect(s.x, s.y, 1.2, 1.2); }
+  ctx.globalAlpha = 1;
+}
+function drawHud() {
+  if (HUD === 'off') return;
+  const kp = kpNow(world.t), m = 26, right = HUD.includes('r'), top = HUD.includes('t');
+  const x = right ? W - m : m, y = top ? m : H - m - 44;
+  const src = KP_FORCE !== null ? 'Kp set by #kp' : live.state === 'live' ? `Live from NOAA SWPC · ${Math.max(1, Math.round((Date.now() - live.time) / 60000))} min ago` : live.state === 'cache' ? 'NOAA SWPC (cached)' : 'Offline · a typical night';
+  const moon = sky.moon ? `Moon ${Math.round(sky.moon.illum * 100)}% ${sky.moon.illum > 0.97 ? 'full' : sky.moon.illum < 0.03 ? 'new' : sky.moon.waxing ? 'waxing' : 'waning'}${sky.moon.alt < 0 ? ' · below horizon' : ''}` : '';
+  ctx.save();
+  ctx.font = '600 10.5px -apple-system, "SF Pro Text", "Helvetica Neue", Arial, sans-serif';
+  ctx.textAlign = right ? 'right' : 'left'; ctx.textBaseline = 'top';
+  ctx.fillStyle = 'rgba(210,230,245,0.55)';
+  ctx.fillText(`AURORA  ·  KP ${kp.toFixed(1)}  ·  ${kpWord(kp).toUpperCase()}`, x, y);
+  ctx.font = '400 11px -apple-system, "SF Pro Text", "Helvetica Neue", Arial, sans-serif';
+  ctx.fillStyle = 'rgba(190,210,230,0.42)';
+  ctx.fillText(src, x, y + 17);
+  ctx.fillText(`Sky over ${OBS_LAT === 69.65 && OBS_LON === 18.96 ? 'Tromsø' : `${OBS_LAT.toFixed(1)}°, ${OBS_LON.toFixed(1)}°`} right now${moon ? ' · ' + moon : ''}`, x, y + 32);
+  if (DEBUG) ctx.fillText(`event ${director.name || '-'} · ents ${ents.length} · parts ${parts.length} · ${perf.ms.toFixed(1)} ms · arcs ${world.arcs.Z.map(v => v.toFixed(1)).join('/')}`, x, top ? y + 48 : y - 16);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------- resize + loop
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  RS = QUALITY === 'high' ? DPR : QUALITY === 'low' ? 0.5 : Math.min(DPR, 1) * 0.75;
+  cv.width = Math.round(W * RS); cv.height = Math.round(H * RS);
+  ov.width = Math.round(W * DPR); ov.height = Math.round(H * DPR);
+  gl.viewport(0, 0, cv.width, cv.height);
+  UNIT = H / 900; HY = Math.round(H * 0.63); F = H * 0.62; SHORE = Math.round(H * 0.86);
+  ents.length = 0; parts.length = 0; fx.length = 0;
+  director.cur = null; director.cool = 6;
+  cleanup();
+  const A = astro(Date.now());
+  updateSky(A);
+  scene.moonK = clamp(sky.moonLight || 0, 0, 1);
+  scene.moonSide = sky.moon && sky.moon.dir[0] > 0 ? 1 : -1;
+  scene.sparkles = null;
+  buildLandscape();
+  lastSky = -99;
+}
+scene.seed0 = seed;
+buildFaintStars();
+addEventListener('resize', resize);
+resize();
+const perf = { ms: 0 };
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  const t0 = performance.now();
+  try { update(dt); render(); } catch (e) { console.error(e); }
+  perf.ms = lerp(perf.ms, performance.now() - t0, 0.1);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
