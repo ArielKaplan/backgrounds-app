@@ -3,6 +3,19 @@
 <head>
 <meta charset="utf-8">
 <title>Pixel Space Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Space",
+ "description": "Retro pixel space: battles, comets, rare cosmic events.",
+ "params": [
+  {"key": "pixels", "label": "Pixel size", "type": "range", "min": 100, "max": 400, "step": 10, "default": 270, "help": "Rows of big pixels on screen. Smaller = chunkier, bigger characters."},
+  {"key": "event", "label": "Repeat one event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["battle", "battle"], ["chase", "chase"], ["orbit", "orbit"], ["fleet", "fleet"], ["asteroids", "asteroids"], ["borg", "borg"], ["supernova", "supernova"], ["wormhole", "wormhole"], ["blackhole", "blackhole"], ["whale", "whale"], ["armada", "armada"], ["all", "all"]], "help": "Test mode: keeps repeating one event. 'all' cycles through every event."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #07051a; }
   canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }

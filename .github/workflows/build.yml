@@ -1,0 +1,70 @@
+name: Build apps
+
+# Builds Backgrounds for macOS and Windows, runs the tests, and smoke-tests both apps on real desktops.
+# Download the apps from the run's "Artifacts" section (Backgrounds-mac / Backgrounds-windows).
+on:
+  push:
+    branches: ['**']
+    paths: ['app/**', 'Wallpaper - */**', '.github/workflows/build.yml']
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm i --no-save playwright@1.56.1 && npx playwright install --with-deps chromium
+      - name: Settings page tests
+        run: node app/tests/settings.test.mjs --shots smoke
+      - name: Wallpaper load tests
+        run: node app/tests/wallpapers.test.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: settings-screenshots, path: smoke, retention-days: 14 }
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: app/mac/build.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: Backgrounds-mac, path: app/mac/build/Backgrounds-mac.zip, retention-days: 90 }
+      - name: Smoke test
+        run: bash app/tests/smoke-mac.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: smoke-mac, path: smoke, retention-days: 14 }
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: pwsh
+        run: app/windows/build.ps1
+      - uses: actions/upload-artifact@v4
+        with: { name: Backgrounds-windows, path: app/windows/build/Backgrounds-windows.zip, retention-days: 90 }
+
+  windows-smoke:
+    needs: windows-build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]   # classic desktop / Windows 11 24H2-style "raised" desktop
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: Backgrounds-windows, path: dl }
+      - name: Unpack
+        shell: pwsh
+        run: Expand-Archive dl/Backgrounds-windows.zip -DestinationPath app/windows/build
+      - name: Smoke test
+        shell: pwsh
+        run: app/tests/smoke-windows.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: smoke-${{ matrix.os }}, path: smoke, retention-days: 14 }

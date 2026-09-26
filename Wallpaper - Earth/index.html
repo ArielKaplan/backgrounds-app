@@ -3,6 +3,34 @@
 <head>
 <meta charset="utf-8">
 <title>Live Earth Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Live Earth",
+ "description": "A slowly turning globe with real, live weather.",
+ "params": [
+  {"key": "lens", "label": "Data lens", "type": "select", "default": "", "options": [["", "Cycle through all"], ["clouds", "Clouds"], ["wind", "Wind"], ["temp", "Temperature"], ["rain", "Rain"]]},
+  {"key": "cycle", "label": "Minutes per lens", "type": "range", "min": 1, "max": 15, "step": 0.5, "default": 3},
+  {"key": "view", "label": "View", "type": "select", "default": "spin", "options": [["spin", "Spin"], ["day", "Sway over the day side"], ["night", "Sway over the night side"], ["home", "Hang over home"]]},
+  {"key": "spin", "label": "Spin (degrees/second)", "type": "range", "min": 0, "max": 5, "step": 0.05, "default": 0.75},
+  {"key": "home", "label": "Home location", "type": "text", "default": "", "placeholder": "lat,lon e.g. 40.7,-74", "help": "Adds a pin and local weather callouts."},
+  {"key": "size", "label": "Globe size", "type": "range", "min": 0.3, "max": 1.5, "step": 0.02, "default": 0.82, "help": "Diameter as a fraction of screen height."},
+  {"key": "x", "label": "Globe position X", "type": "range", "min": 0, "max": 1, "step": 0.01, "default": 0.5},
+  {"key": "y", "label": "Globe position Y", "type": "range", "min": 0, "max": 1, "step": 0.01, "default": 0.5},
+  {"key": "lat", "label": "Starting latitude", "type": "number", "min": -90, "max": 90, "step": 0.1, "default": "", "placeholder": "auto"},
+  {"key": "lon", "label": "Starting longitude", "type": "number", "min": -180, "max": 180, "step": 0.1, "default": "", "placeholder": "auto"},
+  {"key": "units", "label": "Temperature units", "type": "select", "default": "", "options": [["", "Automatic (system locale)"], ["c", "Celsius"], ["f", "Fahrenheit"]]},
+  {"key": "quality", "label": "Quality", "type": "select", "default": "medium", "options": [["low", "Low (lightest)"], ["medium", "Medium"], ["high", "High (full Retina)"]]},
+  {"key": "hud", "label": "Info box", "type": "select", "default": "bl", "options": [["bl", "Bottom left"], ["br", "Bottom right"], ["tl", "Top left"], ["tr", "Top right"], ["off", "Hidden"]]},
+  {"key": "fps", "label": "Frame rate cap", "type": "range", "min": 10, "max": 60, "step": 5, "default": 30, "help": "Lower = less CPU/GPU."},
+  {"key": "offline", "label": "Offline mode", "type": "toggle", "default": false, "help": "Never touch the network (simulated data)."},
+  {"key": "time", "label": "Clock shift (hours)", "type": "range", "min": -12, "max": 12, "step": 1, "default": 0, "group": "testing", "help": "Preview other sun positions."},
+  {"key": "event", "label": "Repeat one event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["city", "city"], ["extreme", "extreme"], ["dawn", "dawn"], ["quake", "quake"], ["iss", "iss"], ["aurora", "aurora"], ["home", "home"], ["storm", "storm"], ["meteor", "meteor"], ["all", "all"]], "help": "Test mode: keeps repeating one event. 'all' cycles through every event."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
   canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }

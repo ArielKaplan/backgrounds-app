@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backgrounds Settings</title>
+<!--
+  Settings window for the Backgrounds app. The same file is used by the Mac and the Windows app;
+  only the native bridge differs:
+    Mac      window.webkit.messageHandlers.bridge.postMessage(msg)
+    Windows  window.chrome.webview.postMessage(msg)
+  Native replies/events arrive through window.__bridgeReceive(msg) (Mac) or the webview 'message'
+  event (Windows). Messages:  -> {id, cmd, args}   <- {reply: id, ok, result|error}   <- {event, data}
+
+  Wallpaper parameters come from the <script type="application/json" id="wallpaper-settings"> block in
+  each wallpaper's index.html. Without that block, the "#key=value  description" lines of the page's
+  header comment are used instead, so a new wallpaper still gets a (plainer) settings panel.
+  The parameters are turned into the page's URL hash (#pixels=200&hud=off); only values that differ
+  from the default are written, so "Reset to defaults" simply clears them.
+-->
+<style>
+  :root {
+    --bg: #f5f5f7; --panel: #ffffff; --panel2: #fafafb; --line: #e3e3e8; --text: #1d1d1f; --muted: #6e6e76;
+    --accent: #3a6ff7; --accent-text: #ffffff; --accent-soft: #e8eefe; --danger: #d13b3b; --ok: #1e9e5a; --warn: #c07a00;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 1px 1px rgba(0,0,0,.04);
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1f; --panel: #252528; --panel2: #2b2b2f; --line: #38383d; --text: #f2f2f4; --muted: #9a9aa2;
+      --accent: #5b8cff; --accent-text: #ffffff; --accent-soft: #2a3553; --danger: #ff6b6b; --ok: #4cd08a; --warn: #f0b429;
+      --shadow: none; color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+         display: flex; flex-direction: column; overflow: hidden; user-select: none; -webkit-user-select: none; }
+  button, input, select { font: inherit; color: inherit; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+  .tabs { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
+  .tabs button { border: 0; background: none; padding: 4px 12px; border-radius: 6px; cursor: pointer; }
+  .tabs button[aria-selected="true"] { background: var(--panel); box-shadow: var(--shadow); font-weight: 600; }
+  .grow { flex: 1; }
+  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); }
+  .btn { border: 1px solid var(--line); background: var(--panel); padding: 5px 12px; border-radius: 7px; cursor: pointer; box-shadow: var(--shadow); white-space: nowrap; }
+  .btn:hover { background: var(--panel2); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .btn.primary:hover { filter: brightness(1.06); }
+  .btn.small { padding: 3px 9px; font-size: 12px; }
+  main { flex: 1; display: flex; min-height: 0; }
+  .view { flex: 1; display: none; min-height: 0; }
+  .view.on { display: flex; }
+
+  /* wallpapers view */
+  #list { width: 250px; flex: none; overflow-y: auto; border-right: 1px solid var(--line); background: var(--panel); padding: 8px; }
+  .item { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 2px; }
+  .item:hover { background: var(--panel2); }
+  .item[aria-selected="true"] { background: var(--accent-soft); }
+  .item .n { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .item .d { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
+  .item .tag { margin-left: auto; font-weight: 400; font-size: 11px; color: var(--muted); }
+  #detail { flex: 1; overflow-y: auto; padding: 18px 22px 28px; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .dhead { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+  .dhead h2 { margin: 0; font-size: 19px; }
+  .dhead p { margin: 3px 0 0; color: var(--muted); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px 14px; margin-bottom: 14px; box-shadow: var(--shadow); }
+  .card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 10px 0 4px; font-weight: 600; }
+  .row { display: grid; grid-template-columns: 190px 1fr; gap: 4px 14px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); }
+  .card h3 + .row, .card > .row:first-child { border-top: 0; }
+  .row label.l { font-weight: 500; }
+  .row .help { grid-column: 2; color: var(--muted); font-size: 12px; }
+  .row .ctl { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .row .ctl input[type=range] { flex: 1; min-width: 80px; accent-color: var(--accent); }
+  .row .ctl output { min-width: 44px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .row .ctl input[type=text], .row .ctl input[type=number], .row .ctl input[type=time], .row .ctl select {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; min-width: 0; max-width: 320px; flex: 1; }
+  .row .ctl input:focus, .row .ctl select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row.changed label.l::after { content: " •"; color: var(--accent); }
+  .switch { position: relative; width: 36px; height: 21px; flex: none; }
+  .switch input { opacity: 0; width: 100%; height: 100%; margin: 0; position: absolute; cursor: pointer; z-index: 1; }
+  .switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--line); transition: background .15s; }
+  .switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 17px; height: 17px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform .15s; }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span::after { transform: translateX(15px); }
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  details.testing > summary { cursor: pointer; padding: 10px 0; color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .hash { font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); word-break: break-all; user-select: text; -webkit-user-select: text; }
+  .note { font-size: 12px; color: var(--muted); padding: 8px 0 10px; }
+  .note.err { color: var(--danger); }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0 16px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; background: var(--panel); padding: 5px 10px; cursor: pointer; border-left: 1px solid var(--line); }
+  .seg button:first-child { border-left: 0; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
+  .screens .row { grid-template-columns: 1fr auto; }
+  .muted { color: var(--muted); }
+  .path { font: 12px ui-monospace, Menlo, Consolas, monospace; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; -webkit-user-select: text; min-width: 0; flex: 1; }
+
+  /* general view */
+  #general { overflow-y: auto; padding: 18px 22px; justify-content: center; }
+  #general > div { width: 100%; max-width: 680px; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 7px 14px; border-radius: 8px; opacity: 0; transition: .2s; pointer-events: none; font-size: 12px; max-width: 80%; }
+  #toast.on { opacity: .92; transform: translateX(-50%); }
+  #fatal { display: none; padding: 40px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Backgrounds</h1>
+  <div class="tabs" role="tablist">
+    <button role="tab" id="tab-wallpapers" aria-selected="true" data-view="wallpapers">Wallpapers</button>
+    <button role="tab" id="tab-general" aria-selected="false" data-view="general">General</button>
+  </div>
+  <div class="grow"></div>
+  <span class="pill" id="status">…</span>
+  <button class="btn" id="pause">Pause</button>
+</header>
+<main>
+  <section class="view on" id="wallpapers">
+    <nav id="list" aria-label="Wallpapers"></nav>
+    <div id="detail"></div>
+  </section>
+  <section class="view" id="general"><div>
+    <div class="card screens">
+      <h3>Screens</h3>
+      <div class="row"><div>Show wallpapers on</div>
+        <div class="seg" id="arrangement">
+          <button data-v="same">All screens (same)</button><button data-v="perScreen">Each screen separately</button><button data-v="main">Main screen only</button>
+        </div></div>
+      <div id="screenRows"></div>
+    </div>
+    <div class="card">
+      <h3>Behaviour</h3>
+      <div class="row"><label class="l" for="g-login">Start at login</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-login"><span></span></label></div></div>
+      <div class="row"><label class="l" for="g-covered">Pause when covered</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-covered"><span></span></label></div>
+        <div class="help">Stops animating while a maximized or full-screen window hides the wallpaper.</div></div>
+      <div class="row"><label class="l" for="g-battery">Pause on battery</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-battery"><span></span></label></div>
+        <div class="help">Freezes the wallpaper on its last frame while the computer is unplugged.</div></div>
+    </div>
+    <div class="card">
+      <h3>Wallpapers folder</h3>
+      <div class="row" style="grid-template-columns:1fr"><div class="ctl"><span class="path" id="folder"></span></div></div>
+      <div class="actions">
+        <button class="btn" id="f-open">Open folder</button>
+        <button class="btn" id="f-change">Change…</button>
+        <button class="btn" id="f-restore">Restore built-in wallpapers</button>
+        <button class="btn" id="f-reload">Reload wallpapers</button>
+      </div>
+      <div class="note">Each wallpaper is a folder with an <b>index.html</b> (or a single .html file). Edit or add them here, then choose <b>Reload wallpapers</b>.</div>
+    </div>
+    <div class="actions"><span class="muted" id="version"></span><div class="grow"></div><button class="btn" id="quit">Quit Backgrounds</button></div>
+  </div></section>
+</main>
+<div id="fatal"></div>
+<div id="toast"></div>
+<script>
+'use strict';
+
+// ------------------------------------------------------------------ bridge
+const Bridge = (() => {
+  let seq = 0;
+  const pending = new Map(), listeners = new Map();
+  const mac = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge;
+  const win = window.chrome && window.chrome.webview;
+  function receive(msg) {
+    if (typeof msg === 'string') { try { msg = JSON.parse(msg); } catch (e) { return; } }
+    if (!msg) return;
+    if (msg.reply != null) {
+      const p = pending.get(msg.reply); if (!p) return;
+      pending.delete(msg.reply);
+      msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error || 'failed'));
+    } else if (msg.event) (listeners.get(msg.event) || []).forEach(f => f(msg.data));
+  }
+  window.__bridgeReceive = receive;
+  if (win) win.addEventListener('message', e => receive(e.data));
+  return {
+    available: !!(mac || win || window.__bridgeMock),
+    call(cmd, args = {}) {
+      const id = ++seq, msg = { id, cmd, args };
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        if (mac) mac.postMessage(msg);
+        else if (win) win.postMessage(msg);
+        else if (window.__bridgeMock) Promise.resolve(window.__bridgeMock(msg)).then(r => receive({ reply: id, ok: true, result: r }), e => receive({ reply: id, ok: false, error: String(e && e.message || e) }));
+        else reject(new Error('no bridge'));
+      });
+    },
+    on(ev, f) { if (!listeners.has(ev)) listeners.set(ev, []); listeners.get(ev).push(f); },
+  };
+})();
+
+// ------------------------------------------------------------------ parameters
+// Parse the wallpaper's settings block; fall back to its header comment ("#key=value   description").
+function manifestFor(w) {
+  if (w._m) return w._m;
+  let m = null, error = null;
+  if (w.manifest) {
+    try { m = JSON.parse(w.manifest); if (!Array.isArray(m.params)) throw new Error('"params" must be a list'); }
+    catch (e) { error = 'The settings block in this wallpaper’s index.html has an error: ' + e.message; m = null; }
+  }
+  if (!m) m = { params: parseHeader(w.header || ''), fromHeader: true };
+  m.params = m.params.filter(p => p && typeof p.key === 'string' && p.key);
+  for (const p of m.params) {
+    if (!p.type) p.type = 'text';
+    if (p.default === undefined) p.default = p.type === 'toggle' ? false : '';
+    if (p.options) p.options = p.options.map(o => Array.isArray(o) ? [String(o[0]), String(o[1] != null ? o[1] : o[0])] : (o && typeof o === 'object') ? [String(o.value), String(o.label != null ? o.label : o.value)] : [String(o), String(o)]);
+  }
+  m.error = error;
+  return (w._m = m);
+}
+function parseHeader(text) {
+  const out = [], seen = new Set();
+  const re = /^[ \t*\/]*#([a-zA-Z][\w-]*)(?:=(\S+))?[ \t]{2,}(\S.*)$/gm;
+  let r;
+  while ((r = re.exec(text))) {
+    const [, key, example, help] = r;
+    if (seen.has(key)) continue; seen.add(key);
+    const testing = /^(event|speed|debug)$/.test(key) || /\btest/i.test(help);
+    out.push(example == null
+      ? { key, label: key, type: 'toggle', default: false, help: help.trim(), group: testing ? 'testing' : undefined }
+      : { key, label: key, type: 'text', default: '', placeholder: 'e.g. ' + example, help: help.trim(), group: testing ? 'testing' : undefined });
+  }
+  return out;
+}
+const isEmpty = v => v === undefined || v === null || v === '';
+function isDefault(p, v) {
+  if (isEmpty(v)) return true;
+  if (p.type === 'toggle') return (!!v && v !== '0' && v !== 'false') === !!p.default;
+  if (p.type === 'range' || p.type === 'number') return !isEmpty(p.default) && Number(v) === Number(p.default);
+  return String(v) === String(p.default);
+}
+function buildHash(m, values) {
+  const parts = [];
+  for (const p of m.params) {
+    if (p.type === 'action') continue;
+    const v = values[p.key];
+    if (p.type === 'toggle') {
+      // Wallpapers test toggles with params.has(key), so a toggle can only be switched on by the hash.
+      if (v && v !== '0' && v !== 'false' && !p.default) parts.push(encodeURIComponent(p.key));
+      continue;
+    }
+    if (isDefault(p, v)) continue;
+    parts.push(encodeURIComponent(p.key) + '=' + encodeURIComponent(String(v).trim()));
+  }
+  return parts.join('&');
+}
+
+// ------------------------------------------------------------------ state
+let S = null;           // state from native
+let selected = null;    // wallpaper id shown in the detail pane
+const $ = s => document.querySelector(s);
+const h = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v; else if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else if (k in e && k !== 'list') e[k] = v; else e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k.nodeType ? k : String(k));
+  return e;
+};
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('on'), 2200); }
+function fail(e) { console.error(e); toast('Error: ' + (e && e.message || e)); }
+
+const settings = () => S.settings;
+function wpById(id) { return S.wallpapers.find(w => w.id === id); }
+function wpName(id) { const w = wpById(id); return w ? displayName(w) : id; }
+function displayName(w) { const m = manifestFor(w); return (m && !m.fromHeader && m.name) || w.name; }
+function normalizeSettings(s) {
+  s.arrangement = ['same', 'perScreen', 'main'].includes(s.arrangement) ? s.arrangement : 'same';
+  if (!s.screens || typeof s.screens !== 'object') s.screens = {};
+  if (!s.params || typeof s.params !== 'object') s.params = {};
+  // Native code may round-trip booleans as 1/0.
+  for (const k of ['pauseWhenCovered', 'pauseOnBattery']) s[k] = typeof s[k] === 'number' ? !!s[k] : typeof s[k] === 'boolean' ? s[k] : true;
+  s.paused = !!s.paused;
+  if (s.wallpaper === undefined) s.wallpaper = null;
+  return s;
+}
+// Which screens currently show wallpaper `id`
+function screensShowing(id) {
+  const s = settings();
+  if (s.arrangement === 'perScreen') return S.screens.filter(sc => (s.screens[sc.id] !== undefined ? s.screens[sc.id] : s.wallpaper) === id);
+  if (s.arrangement === 'main') return s.wallpaper === id ? S.screens.filter(sc => sc.primary) : [];
+  return s.wallpaper === id ? S.screens : [];
+}
+
+let saveTimer = null;
+function save(delay = 0) {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    // The page owns the settings; keep ours (edits may have happened while this call was in flight).
+    Bridge.call('setSettings', { settings: settings() }).then(st => { if (st) applyState(st, { keepSettings: true }); }).catch(fail);
+  }, delay);
+}
+
+// ------------------------------------------------------------------ render
+// opts.keepSettings: reply to our own save, keep the local settings object.
+// opts.quiet: don't rebuild the detail pane while the user is using one of its controls.
+function applyState(st, opts = {}) {
+  const prev = S;
+  if (opts.keepSettings && prev) st.settings = prev.settings;
+  const wallpapersChanged = !prev || JSON.stringify(prev.wallpapers.map(w => [w.id, w.manifest])) !== JSON.stringify(st.wallpapers.map(w => [w.id, w.manifest]));
+  const settingsChanged = !prev || prev.settings !== st.settings;
+  S = st; normalizeSettings(S.settings);
+  if (!selected || !wpById(selected)) selected = settings().wallpaper && wpById(settings().wallpaper) ? settings().wallpaper : (S.wallpapers[0] && S.wallpapers[0].id);
+  renderHeader(); renderList(); renderGeneral();
+  const busy = document.activeElement && $('#detail').contains(document.activeElement) && document.activeElement.tagName !== 'BUTTON';
+  if (wallpapersChanged || (settingsChanged && !(opts.quiet && busy))) renderDetail();
+}
+function renderHeader() {
+  const s = settings(), st = $('#status');
+  let text = 'Playing', cls = 'ok';
+  if (s.paused) { text = 'Paused'; cls = 'warn'; }
+  else if (s.pauseOnBattery && S.onBattery) { text = 'Paused on battery'; cls = 'warn'; }
+  const any = S.screens.some(sc => screenWallpaper(sc.id));
+  if (!any) { text = 'No wallpaper chosen'; cls = ''; }
+  st.textContent = text; st.className = 'pill ' + cls;
+  $('#pause').textContent = s.paused ? 'Resume' : 'Pause';
+}
+function screenWallpaper(screenId) {
+  const s = settings(), sc = S.screens.find(x => x.id === screenId);
+  if (s.arrangement === 'perScreen') return s.screens[screenId] !== undefined ? s.screens[screenId] : s.wallpaper;
+  if (s.arrangement === 'main') return sc && sc.primary ? s.wallpaper : null;
+  return s.wallpaper;
+}
+function renderList() {
+  const list = $('#list'); list.textContent = '';
+  if (!S.wallpapers.length) { list.append(h('div', { class: 'empty' }, 'No wallpapers found in the folder.')); return; }
+  for (const w of S.wallpapers) {
+    const on = screensShowing(w.id).length > 0, m = manifestFor(w);
+    const tag = on ? (S.screens.length > 1 && settings().arrangement === 'perScreen' ? screensShowing(w.id).length + ' screen' + (screensShowing(w.id).length > 1 ? 's' : '') : 'On') : '';
+    list.append(h('button', { class: 'item', 'aria-selected': String(w.id === selected), onclick: () => { selected = w.id; renderList(); renderDetail(); } },
+      h('div', { class: 'n' }, on ? h('span', { class: 'dot', title: 'Showing now' }) : null, displayName(w), tag ? h('span', { class: 'tag' }, tag) : null),
+      h('div', { class: 'd' }, (!m.fromHeader && m.description) || w.id)));
+  }
+}
+function renderDetail() {
+  const d = $('#detail'); d.textContent = '';
+  const w = wpById(selected);
+  if (!w) { d.append(h('div', { class: 'empty' }, S.wallpapers.length ? 'Choose a wallpaper on the left.' : 'Add wallpaper folders to the wallpapers folder (General tab), then Reload.')); return; }
+  const m = manifestFor(w), s = settings();
+  // Looked up on every use: the settings object can be replaced by native events (menu bar changes).
+  const store = () => {
+    const all = settings().params, v = all[w.id] || (all[w.id] = { values: {}, hash: '' });
+    if (!v.values || typeof v.values !== 'object') v.values = {};
+    return v;
+  };
+  const showing = screensShowing(w.id);
+
+  // header + use buttons
+  const useBtns = [];
+  if (s.arrangement === 'perScreen' && S.screens.length > 1) {
+    for (const sc of S.screens) {
+      const on = screenWallpaper(sc.id) === w.id;
+      useBtns.push(h('button', { class: 'btn small' + (on ? ' primary' : ''), title: on ? 'Showing on this screen' : 'Show on this screen',
+        onclick: () => { s.screens[sc.id] = on ? null : w.id; save(); renderAll(); } }, (on ? '✓ ' : '') + screenLabel(sc)));
+    }
+  } else {
+    const on = s.wallpaper === w.id;
+    useBtns.push(h('button', { class: 'btn' + (on ? '' : ' primary'), onclick: () => { s.wallpaper = on ? null : w.id; save(); renderAll(); } },
+      on ? 'Stop using' : 'Use as wallpaper'));
+  }
+  d.append(h('div', { class: 'dhead' },
+    h('div', { class: 'grow' }, h('h2', {}, displayName(w)), h('p', {}, (!m.fromHeader && m.description) || '')),
+  ));
+  d.append(h('div', { class: 'actions' }, useBtns,
+    h('div', { class: 'grow' }),
+    h('button', { class: 'btn small', onclick: () => Bridge.call('reload', { wallpaper: w.id }).then(() => toast('Reloaded')).catch(fail), disabled: !showing.length }, 'Reload'),
+    h('button', { class: 'btn small', onclick: () => Bridge.call('openWallpaperFolder', { id: w.id }).catch(fail), title: 'Open this wallpaper’s files to edit them' }, 'Show files')));
+
+  if (m.error) d.append(h('div', { class: 'note err' }, m.error + ' Showing the options from its header comment instead.'));
+  if (!m.params.length) { d.append(h('div', { class: 'note' }, 'This wallpaper has no adjustable options.')); return; }
+  if (m.fromHeader && !m.error) d.append(h('div', { class: 'note' }, 'Options read from the page’s header comment. Add a wallpaper-settings block to its index.html for sliders and menus.'));
+
+  const main = h('div', { class: 'card' }), test = h('div', { class: 'card' });
+  const hashEl = h('div', { class: 'hash' });
+  const resetBtn = h('button', { class: 'btn', onclick: () => {
+    store().values = {}; store().hash = ''; save(); renderDetail(); toast('Reset to defaults');
+  } }, 'Reset to defaults');
+  const refresh = () => {
+    const st = store();
+    st.hash = buildHash(m, st.values);
+    hashEl.textContent = st.hash ? '#' + st.hash : 'All defaults';
+    resetBtn.disabled = !Object.keys(st.values).some(k => { const p = m.params.find(q => q.key === k); return p && !isDefault(p, st.values[k]); });
+  };
+  let nTest = 0;
+  for (const p of m.params) {
+    const row = paramRow(p, store, w, () => { refresh(); rowState(); });
+    const rowState = () => row.classList.toggle('changed', p.type !== 'action' && !isDefault(p, store().values[p.key]));
+    rowState();
+    if (p.group === 'testing') { test.append(row); nTest++; } else main.append(row);
+  }
+  if (main.childNodes.length) d.append(main);
+  if (nTest) d.append(h('details', { class: 'testing' }, h('summary', {}, 'Testing options'), test));
+  d.append(h('div', { class: 'actions' }, resetBtn, h('div', { class: 'grow' })));
+  d.append(h('div', { class: 'note' }, showing.length ? 'Changes apply to the desktop as you make them.' : 'This wallpaper isn’t showing right now. Your changes are saved for when you use it.'));
+  d.append(hashEl);
+  refresh();
+}
+function screenLabel(sc) { return sc.name + (sc.primary && S.screens.length > 1 ? ' (main)' : ''); }
+
+function paramRow(p, store, w, changed) {
+  const id = 'p-' + p.key;
+  const val = () => store().values[p.key];
+  const cur = () => (isEmpty(val()) ? p.default : val());
+  const set = (v, delay) => {
+    const values = store().values;
+    if (isDefault(p, v)) delete values[p.key]; else values[p.key] = v;
+    changed(); save(delay);   // changed() rebuilds the hash before the save goes out
+  };
+  let ctl;
+  switch (p.type) {
+    case 'range': {
+      const out = h('output', {});
+      const fmt = v => { const n = Number(v); const dec = String(p.step || 1).split('.')[1]; return dec ? n.toFixed(dec.length) : String(n); };
+      const inp = h('input', { type: 'range', id, min: p.min, max: p.max, step: p.step || 1, value: cur(),
+        oninput: () => { out.value = fmt(inp.value); set(Number(inp.value), 700); } });
+      out.value = fmt(cur());
+      ctl = [inp, out];
+      break;
+    }
+    case 'number': {
+      const inp = h('input', { type: 'number', id, min: p.min, max: p.max, step: p.step || 'any', placeholder: p.placeholder || '', value: isEmpty(val()) ? (isEmpty(p.default) ? '' : p.default) : val(),
+        onchange: () => set(inp.value === '' ? '' : Number(inp.value), 0) });
+      ctl = [inp];
+      break;
+    }
+    case 'select': {
+      const opts = (p.options || []).slice();
+      const v = String(cur());
+      if (!opts.some(o => o[0] === v)) opts.push([v, v]);
+      const sel = h('select', { id, onchange: () => set(sel.value, 0) }, opts.map(([val, label]) => h('option', { value: val }, label)));
+      sel.value = v;
+      ctl = [sel];
+      break;
+    }
+    case 'toggle': {
+      const inp = h('input', { type: 'checkbox', id, onchange: () => set(inp.checked, 0) });
+      inp.checked = !isEmpty(cur()) && !!cur() && cur() !== '0' && cur() !== 'false';
+      ctl = [h('label', { class: 'switch' }, inp, h('span'))];
+      break;
+    }
+    case 'time': {
+      const inp = h('input', { type: 'time', id, value: isEmpty(val()) ? '' : val(), onchange: () => set(inp.value, 0) });
+      ctl = [inp, h('button', { class: 'btn small', onclick: () => { inp.value = ''; set('', 0); } }, 'Real time')];
+      break;
+    }
+    case 'action': {
+      // Two clicks (no confirm(): a plain WKWebView silently answers "no" to it).
+      const label = p.button || p.label || p.key;
+      const btn = h('button', { class: 'btn', id, onclick: () => {
+        if (!btn.dataset.armed) {
+          btn.dataset.armed = '1'; btn.textContent = 'Click again to confirm';
+          clearTimeout(btn.t); btn.t = setTimeout(() => { delete btn.dataset.armed; btn.textContent = label; }, 3000);
+          return;
+        }
+        clearTimeout(btn.t); delete btn.dataset.armed; btn.textContent = label;
+        Bridge.call('reloadOnce', { wallpaper: w.id, extra: encodeURIComponent(p.key) + (p.value != null ? '=' + encodeURIComponent(p.value) : '') })
+          .then(r => toast(r && r.message || 'Done')).catch(fail);
+      } }, label);
+      ctl = [btn];
+      break;
+    }
+    default: {
+      const inp = h('input', { type: 'text', id, placeholder: p.placeholder || '', value: isEmpty(val()) ? (isEmpty(p.default) ? '' : p.default) : val(),
+        spellcheck: false, onchange: () => set(inp.value.trim(), 0), onkeydown: e => { if (e.key === 'Enter') inp.blur(); } });
+      ctl = [inp];
+    }
+  }
+  return h('div', { class: 'row' },
+    h('label', { class: 'l', htmlFor: id }, p.type === 'action' ? '' : (p.label || p.key)),
+    h('div', { class: 'ctl' }, ctl),
+    p.help ? h('div', { class: 'help' }, p.help) : null);
+}
+
+function renderGeneral() {
+  const s = settings();
+  for (const b of $('#arrangement').children) b.setAttribute('aria-pressed', String(b.dataset.v === s.arrangement));
+  const rows = $('#screenRows'); rows.textContent = '';
+  const opts = () => [h('option', { value: '' }, 'None (normal wallpaper)'), ...S.wallpapers.map(w => h('option', { value: w.id }, displayName(w)))];
+  if (s.arrangement === 'perScreen') {
+    for (const sc of S.screens) {
+      const sel = h('select', { onchange: () => { s.screens[sc.id] = sel.value || null; save(); renderAll(); } }, opts());
+      sel.value = screenWallpaper(sc.id) || '';
+      rows.append(h('div', { class: 'row' }, h('div', {}, screenLabel(sc), h('div', { class: 'muted' }, sc.width + ' × ' + sc.height)), h('div', { class: 'ctl' }, sel)));
+    }
+  } else {
+    const sel = h('select', { onchange: () => { s.wallpaper = sel.value || null; save(); renderAll(); } }, opts());
+    sel.value = s.wallpaper || '';
+    const where = s.arrangement === 'main' ? (S.screens.find(x => x.primary) || {}).name || 'Main screen' : S.screens.length > 1 ? 'All ' + S.screens.length + ' screens' : (S.screens[0] || {}).name || 'Screen';
+    rows.append(h('div', { class: 'row' }, h('div', {}, where), h('div', { class: 'ctl' }, sel)));
+  }
+  $('#g-login').checked = !!S.launchAtLogin;
+  $('#g-covered').checked = s.pauseWhenCovered;
+  $('#g-battery').checked = s.pauseOnBattery;
+  $('#folder').textContent = S.folder || '';
+  $('#folder').title = S.folder || '';
+  $('#version').textContent = 'Backgrounds ' + (S.version || '') + ' · ' + (S.platform === 'mac' ? 'macOS' : S.platform === 'windows' ? 'Windows' : S.platform || '');
+}
+function renderAll() { renderHeader(); renderList(); renderGeneral(); renderDetail(); }
+
+// ------------------------------------------------------------------ wiring
+for (const t of document.querySelectorAll('[role=tab]')) t.addEventListener('click', () => {
+  for (const u of document.querySelectorAll('[role=tab]')) u.setAttribute('aria-selected', String(u === t));
+  for (const v of document.querySelectorAll('.view')) v.classList.toggle('on', v.id === t.dataset.view);
+});
+for (const b of $('#arrangement').children) b.addEventListener('click', () => {
+  const s = settings();
+  if (b.dataset.v === 'perScreen' && s.arrangement !== 'perScreen') for (const sc of S.screens) if (s.screens[sc.id] === undefined) s.screens[sc.id] = s.wallpaper;
+  s.arrangement = b.dataset.v; save(); renderAll();
+});
+$('#pause').onclick = () => { settings().paused = !settings().paused; save(); renderHeader(); };
+$('#g-covered').onchange = e => { settings().pauseWhenCovered = e.target.checked; save(); };
+$('#g-battery').onchange = e => { settings().pauseOnBattery = e.target.checked; save(); renderHeader(); };
+$('#g-login').onchange = e => Bridge.call('setLaunchAtLogin', { enabled: e.target.checked })
+  .then(r => { S.launchAtLogin = !!(r && r.enabled); e.target.checked = S.launchAtLogin; if (r && r.message) toast(r.message); })
+  .catch(err => { e.target.checked = !e.target.checked; fail(err); });
+$('#f-open').onclick = () => Bridge.call('openFolder').catch(fail);
+$('#f-change').onclick = () => Bridge.call('chooseFolder').then(st => { if (st) { applyState(st); toast('Folder changed'); } }).catch(fail);
+$('#f-restore').onclick = () => Bridge.call('restoreBuiltins').then(r => { applyState(r.state, { keepSettings: true }); toast(r.added.length ? 'Added: ' + r.added.join(', ') : 'All built-in wallpapers are already there'); }).catch(fail);
+$('#f-reload').onclick = () => Bridge.call('reload', {}).then(st => { if (st) applyState(st, { keepSettings: true }); toast('Reloaded'); }).catch(fail);
+$('#quit').onclick = () => Bridge.call('quit').catch(fail);
+document.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 'w') Bridge.call('closeSettings').catch(() => {}); });
+Bridge.on('state', st => applyState(st, { quiet: true }));
+
+if (!Bridge.available) {
+  $('main').style.display = 'none'; $('header').style.display = 'none';
+  const f = $('#fatal'); f.style.display = 'block'; f.textContent = 'This is the settings page of the Backgrounds app. Open it from the app’s menu bar / tray icon.';
+} else {
+  Bridge.call('getState').then(st => applyState(st)).catch(fail);
+}
+</script>
+</body>
+</html>

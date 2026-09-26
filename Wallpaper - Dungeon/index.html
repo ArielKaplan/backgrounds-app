@@ -3,6 +3,21 @@
 <head>
 <meta charset="utf-8">
 <title>Pixel Dungeon Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Dungeon",
+ "description": "A hero crawls a procedural dungeon on its own.",
+ "params": [
+  {"key": "pixels", "label": "Pixel size", "type": "range", "min": 100, "max": 400, "step": 10, "default": 240, "help": "Rows of big pixels on screen. Smaller = chunkier, bigger characters."},
+  {"key": "floor", "label": "Start floor", "type": "range", "min": 0, "max": 9, "step": 1, "default": 0, "help": "Later floors change the theme."},
+  {"key": "boss", "label": "Boss", "type": "select", "default": "", "options": [["", "Random"], ["king", "king"], ["slime", "slime"], ["eye", "eye"], ["knight", "knight"], ["lich", "lich"]]},
+  {"key": "event", "label": "Force a rare event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["mimic", "mimic"], ["shop", "shop"], ["dog", "dog"], ["rat", "rat"], ["golden", "golden"]], "help": "Test mode: makes one rare event happen often."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #0c0a12; }
   canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }

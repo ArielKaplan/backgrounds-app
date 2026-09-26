@@ -1,1 +1,6 @@
 .DS_Store
+app/windows/bin/
+app/windows/obj/
+app/windows/build/
+app/mac/build/
+node_modules/

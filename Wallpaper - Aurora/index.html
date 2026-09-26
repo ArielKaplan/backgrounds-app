@@ -3,6 +3,26 @@
 <head>
 <meta charset="utf-8">
 <title>Aurora Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Aurora",
+ "description": "Northern lights over a mountain lake, driven by live Kp.",
+ "params": [
+  {"key": "kp", "label": "Aurora strength (Kp)", "type": "select", "default": "", "options": [["", "Live (NOAA)"], ["0", "0"], ["1", "1"], ["2", "2"], ["3", "3"], ["4", "4"], ["5", "5"], ["6", "6"], ["7", "7"], ["8", "8"], ["9", "9"]]},
+  {"key": "lat", "label": "Observer latitude", "type": "number", "min": -90, "max": 90, "step": 0.01, "default": "", "placeholder": "69.65 (Tromsø)"},
+  {"key": "lon", "label": "Observer longitude", "type": "number", "min": -180, "max": 180, "step": 0.01, "default": "", "placeholder": "18.96 (Tromsø)"},
+  {"key": "seed", "label": "Valley seed", "type": "number", "step": 1, "default": "", "placeholder": "new valley each load", "help": "Any number gives the same mountains every time."},
+  {"key": "quality", "label": "Quality", "type": "select", "default": "medium", "options": [["low", "Low (lightest)"], ["medium", "Medium"], ["high", "High (full Retina)"]]},
+  {"key": "hud", "label": "Info box", "type": "select", "default": "bl", "options": [["bl", "Bottom left"], ["br", "Bottom right"], ["tl", "Top left"], ["tr", "Top right"], ["off", "Hidden"]]},
+  {"key": "fps", "label": "Frame rate cap", "type": "range", "min": 10, "max": 60, "step": 5, "default": 30, "help": "Lower = less CPU/GPU."},
+  {"key": "offline", "label": "Offline mode", "type": "toggle", "default": false, "help": "Never touch the network (simulated data)."},
+  {"key": "event", "label": "Repeat one event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["meteor", "meteor"], ["substorm", "substorm"], ["moose", "moose"], ["wolf", "wolf"], ["owl", "owl"], ["fox", "fox"], ["cabin", "cabin"], ["canoe", "canoe"], ["satellite", "satellite"], ["snow", "snow"], ["hare", "hare"], ["shower", "shower"], ["fireball", "fireball"], ["red", "red"], ["steve", "steve"], ["reindeer", "reindeer"], ["all", "all"]], "help": "Test mode: keeps repeating one event. 'all' cycles through every event."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #02040a; }
   canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }

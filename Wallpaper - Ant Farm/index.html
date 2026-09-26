@@ -3,6 +3,23 @@
 <head>
 <meta charset="utf-8">
 <title>Pixel Ant Farm Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Ant Farm",
+ "description": "A pixel ant colony that really digs, and keeps growing.",
+ "params": [
+  {"key": "pixels", "label": "Pixel size", "type": "range", "min": 100, "max": 400, "step": 10, "default": 200, "help": "Rows of big pixels on screen. Smaller = chunkier, bigger characters."},
+  {"key": "hud", "label": "Colony counter", "type": "select", "default": "", "options": [["", "Shown"], ["off", "Hidden"]]},
+  {"key": "time", "label": "Pretend time", "type": "time", "default": "", "help": "Leave empty to follow your real clock."},
+  {"key": "fresh", "label": "Don't save the colony", "type": "toggle", "default": false, "help": "A brand new colony on every load."},
+  {"key": "reset", "label": "Start a new colony", "type": "action", "help": "Deletes the saved colony and starts over (once)."},
+  {"key": "event", "label": "Repeat one event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["crumbs", "crumbs"], ["rain", "rain"], ["worm", "worm"], ["beetle", "beetle"], ["aphids", "aphids"], ["dig", "dig"], ["ladybug", "ladybug"], ["snail", "snail"], ["butterfly", "butterfly"], ["hatch", "hatch"], ["leaf", "leaf"], ["flight", "flight"], ["raid", "raid"], ["cicada", "cicada"], ["mole", "mole"], ["fossil", "fossil"], ["all", "all"]], "help": "Test mode: keeps repeating one event. 'all' cycles through every event."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #2a1c14; }
   canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }

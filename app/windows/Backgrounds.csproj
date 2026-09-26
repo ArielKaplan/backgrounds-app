@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Backgrounds for Windows. Targets .NET Framework 4.8, which is part of Windows 10 (1903+) and 11,
+    so nothing extra has to be installed; pages render with the WebView2 runtime that ships with Windows.
+    Build: build.ps1 (or: dotnet build -c Release)
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>Backgrounds</AssemblyName>
+    <RootNamespace>Backgrounds</RootNamespace>
+    <ApplicationIcon>..\icons\Backgrounds.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Version>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)..\VERSION').Trim())</Version>
+    <Product>Backgrounds</Product>
+    <Description>Animated HTML wallpapers</Description>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Web.Extensions" />
+    <Reference Include="Microsoft.CSharp" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4191.47" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\icons\Backgrounds.ico" LogicalName="Backgrounds.ico" />
+    <None Include="..\shared\settings.html" Link="settings.html" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
