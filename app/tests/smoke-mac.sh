@@ -47,6 +47,23 @@ sleep 3
 screencapture -x "$SHOTS/mac-2-desktop.png" || true
 log show --last 2m --predicate 'process == "Backgrounds"' --style compact 2>/dev/null | tail -40 > "$SHOTS/mac-log.txt"
 cat "$SHOTS/mac-log.txt" | grep -i backgrounds | tail -20
+pkill -x Backgrounds; sleep 2
+
+# Settings written the way the settings page writes them reach the wallpaper: City at night.
+python3 - <<'PY'
+import json, os
+p = os.path.expanduser('~/Library/Application Support/Backgrounds/config.json')
+c = json.load(open(p))
+c['settings']['wallpaper'] = 'City'
+c['settings'].setdefault('params', {})['City'] = {'values': {'time': 'night'}, 'hash': 'time=night'}
+json.dump(c, open(p, 'w'))
+PY
+open "$APP"; sleep 15
+check 'pgrep -x Backgrounds >/dev/null' 'app restarts with edited settings'
+check 'grep -q "time=night" ~/Library/Application\ Support/Backgrounds/config.json' 'settings kept after restart'
+osascript -e 'tell application "System Events" to set visible of every process whose name is "Backgrounds" to false' 2>/dev/null
+sleep 2
+screencapture -x "$SHOTS/mac-3-city-night.png" || true
 pkill -x Backgrounds
 if [ $fail -gt 0 ]; then echo "$fail FAILED"; exit 1; fi
 echo "all passed"

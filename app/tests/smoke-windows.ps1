@@ -31,6 +31,10 @@ public static class W {
       EnumChildWindows(t, (c, l2) => { if (Text(c) == "Backgrounds wallpaper") res.Add(c); return true; }, IntPtr.Zero); return true; }, IntPtr.Zero);
     return res;
   }
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  public static int VisibleKids(IntPtr h) {   // direct children that are visible (the WebView2 host windows)
+    int n = 0; for (IntPtr c = GetWindow(h, 5); c != IntPtr.Zero; c = GetWindow(c, 2)) if (IsWindowVisible(c)) n++; return n;
+  }
   public static List<string> Children(IntPtr h) {
     var res = new List<string>();
     EnumChildWindows(h, (c, l) => { res.Add(Cls(c)); return true; }, IntPtr.Zero);
@@ -113,6 +117,37 @@ if ($hosts.Count -ge 1) {
 Start-Sleep 3
 Shot 'windows-3-after-explorer-restart'
 Check (!$proc.HasExited) 'app still running'
+
+# Pause when covered: a maximized window hides the wallpaper, so the WebView should stop rendering.
+$hosts = [W]::Hosts()
+if ($hosts.Count -ge 1) {
+  $h = $hosts[0]
+  Check ([W]::VisibleKids($h) -ge 1) 'web view visible before covering'
+  $np = Start-Process notepad.exe -WindowStyle Maximized -PassThru
+  Start-Sleep 5
+  Shot 'windows-4-covered'
+  Check ([W]::VisibleKids($h) -eq 0) 'web view paused while a maximized window covers it'
+  Stop-Process -Id $np.Id -Force -ErrorAction SilentlyContinue
+  Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep 4
+  Check ([W]::VisibleKids($h) -ge 1) 'web view resumes when uncovered'
+}
+
+# Settings written the way the settings page writes them reach the wallpaper: City at night.
+Stop-Process -Id $proc.Id -Force; Start-Sleep 2
+$cfgPath = "$env:APPDATA\Backgrounds\config.json"
+$cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+$cfg.settings.wallpaper = 'City'
+$params = [pscustomobject]@{ City = [pscustomobject]@{ values = [pscustomobject]@{ time = 'night' }; hash = 'time=night' } }
+$cfg.settings | Add-Member -NotePropertyName params -NotePropertyValue $params -Force
+$cfg | ConvertTo-Json -Depth 20 | Set-Content $cfgPath -Encoding UTF8
+$proc = Start-Process $exe -PassThru
+Start-Sleep 20
+Check (!$proc.HasExited) 'app restarts with edited settings'
+Check ((Get-Content $cfgPath -Raw) -match 'time=night') 'settings kept after restart'
+(New-Object -ComObject Shell.Application).MinimizeAll()
+Start-Sleep 3
+Shot 'windows-5-city-night'
 
 Write-Host '--- log.txt'
 Get-Content "$env:LOCALAPPDATA\Backgrounds\log.txt" -ErrorAction SilentlyContinue | Write-Host
