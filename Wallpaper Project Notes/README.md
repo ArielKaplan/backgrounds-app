@@ -30,10 +30,31 @@ before reporting it as done.
 | `Wallpaper - Sheep` | `index.html` | Side-view pasture, inspired by the 90s "desktop sheep" (Screen Mate Poo / eSheep). A flock of cute, dumb sheep walk on ledges (cliff, boulder, haystack, fence, stump), fall off and tumble, sit dangling their legs, ride on each other's backs. Events: follow-the-leader off the cliff, sheep tower + sneeze, butterfly bonk, baa chorus (someone says MOO), sheepdog, nap pile + snore bubble, head stuck in hay, ball game, pronking, fainting frog gag; rare: fleece blown off, wolf in sheep's clothing, floating fluffy sheep, counting sheep over the fence at night, snow day with a sheep-collecting snowball. |
 | `Wallpaper - Football` | `index.html` | Tecmo Bowl-style auto-playing football. Horizontal field with crowd, HUD scoreboard, refs. Two random made-up teams (16 in `TEAMS`), 4 quarters (`#quarter=` minutes), overtime, final + Gatorade bath, then a new game. Plays in `PLAYS` (dive, sweep, sneak, draw, slants, curls, outs, bomb, screen, flea flicker, reverse, halfback pass, hail mary, kneel) plus kickoffs/onside, punts/fake punts, field goals/PATs/two-point tries. AI: blocking engagements with shed timers, man coverage, QB reads by receiver openness, carrier picks the safest heading. Sideshows: animals on the field (dog/squirrel/goose/cat/pig with a security guard), penalties with flag + ref, injuries with a cart, TD celebrations, halftime marching band. Weather: rain, snow, fog, wind, night. Options `#teams=BAY-MTN #weather=snow #play=flea #event=animal|injury|penalty`. Built in marker-separated chunks (`// @@...@@` comments remain as section ends). |
 | `Wallpaper - City` | `index.html` | The most complex: slow camera flyover (~10 min each way, then back) of a procedurally laid-out NYC-like grid. See the City section below. |
+| `Wallpaper - Earth` | `index.html` (~1 MB) | **Live weather globe** (WebGL2, not pixel art). Slowly orbiting Earth with real, live data: EUMETSAT cloud map (via clouds.matteason.co.uk, 3-hourly), Open-Meteo grid + ~100 cities (temperature/wind/pressure/rain/thunder), NASA GIBS IMERG precipitation, USGS M4.5+ quakes, live ISS position + orbit, NOAA Kp-driven aurora ovals, true subsolar point/terminator, real moon position + phase, sidereal star field + Milky Way. Lenses cycle: satellite clouds → wind (particle streamlines, isobars, H/L) → temperature → precipitation. Callout "events" pick real things on the visible side (city weather, hottest/coldest, sunrise line, quakes, ISS, aurora). NASA Blue Marble / Black Marble textures are embedded as data URIs so it works offline (falls back to an archived cloud map; HUD says OFFLINE). |
+| `Wallpaper - Aurora` | `index.html` | **Northern lights over a mountain lake** (WebGL sky + vector silhouettes). Aurora curtains are ray-intersected vertical sheets; height, brightness, extra arcs and red tops follow the live NOAA planetary Kp. Real stars for Tromsø (Big Dipper/Cassiopeia turn with sidereal time), real moon. Faceted moonlit mountains, rippled lake reflections, cabin with smoke. Events: meteor, substorm, moose, wolf howl, owl, fox mousing pounce, cabin person + camera flash, canoe with headlamp, satellites, snow, hare; rare meteor shower, fireball, red aurora, STEVE, reindeer herd. `#kp=` to force. |
+| `Wallpaper - Room` | `index.html` | **Cozy lofi pixel room + cat, with the real weather outside.** Open-Meteo at the user's location (`#lat/#lon`, else one-time IP lookup via get.geojs.io, cached a week; `#noip` disables) every 15 min: rain on the glass with running drops, snow, fog, frost when freezing, wind in the tree, thunder (can cause a power cut). Real sun/moon/season/clock; desk display shows time + outdoor temp. Cat pathfinds between floor/radiator/sill/chair/desk/shelf. Events: laser, mug knock, bird at window, yarn, sleeps on keyboard, record, box, zoomies, fishbowl, nap (sunbeam), plant, window watch; rare blackout, UFO, friend cat, balloon, fireworks. `#weather= #time= #cat= #theme=`. |
+| `Wallpaper - Ant Farm` | `index.html` | **Pixel ant colony cross-section that really digs.** Soil grid; tunnels carved pixel by pixel by diggers who haul soil to the mound; BFS distance fields for navigation (entrance/queen/nursery/food/trash/dig fronts); foragers, nurses, queen laying eggs → larvae → pupae → new (pale callow) ants. Colony saved in localStorage per screen size (`#reset`, `#fresh`), so it grows over days (HUD "COLONY DAY n"). Events: crumbs (trail + column), rain (water seeps into tunnels, mushrooms after), worm, beetle (guards), aphid farming, dig push, ladybug, snail, butterfly, hatch, leaf; rare nuptial flight, red-ant raid, cicada emergence, mole tunnel, buried fossil. |
+| `Wallpaper - Train` | `index.html` | **Side-scrolling steam train journey.** Camera rides with the train; parallax far/mid/back/ground/front layers stream procedural items by biome along a ~10-minute looping route (farm, forest, mountain, lake, snow, town, coast, desert). Animated drive rods, smoke, passengers in windows (wave back at kids), lit windows + headlight at night. Set pieces: tunnels (dark bore, arched portals), river bridge with truss, station stop (brakes to align, people board/alight, whistle), level crossing. Events: freight train, cows (MOO), balloons, bird flock, wave, crossing, station, tunnel, bridge, rain + rainbow, banner plane; rare UFO, dragon, whale, horse-rider race, rocket launch. `#biome= #loco=`. |
 | (loose) | `Flowing Day.heic` | A time-of-day dynamic wallpaper made with Swift/ImageIO (8 frames + `apple_desktop:h24` metadata). Added via System Settings → Wallpaper → Add Photo → **From Files**. |
 
 Zips (`Pixel Space Wallpaper.zip`, `Pixel Meadow Wallpaper.zip`) contain just that folder's `index.html`,
 for moving to another computer. The user may ask for zips of the others.
+
+## Live data (Earth, Aurora, Room)
+
+These three fetch real data when online and must degrade gracefully (Plash may load before the network is up):
+- Every fetch has a timeout; failures retry with backoff (30 s doubling, capped at the normal interval). The HUD
+  always says whether data is LIVE / cached / simulated / OFFLINE. `#offline` never touches the network.
+- All endpoints are free, key-less and CORS-enabled (the page runs from `file://`, origin `null`):
+  clouds.matteason.co.uk (EUMETSAT clouds, CC0), api.open-meteo.com (weather; free tier is 10k calls/day and counts each
+  location, so Earth refreshes its ~585-location grid every 2 h and caches in localStorage), gibs.earthdata.nasa.gov
+  (IMERG), earthquake.usgs.gov, api.wheretheiss.at, services.swpc.noaa.gov (Kp; parser handles both the old array-of-arrays
+  and the newer array-of-objects formats), get.geojs.io (Room's one-time IP location).
+- Earth's textures are embedded `<img src="data:...">` tags at the bottom of the file (data URIs avoid WebGL cross-origin
+  tainting from `file://`). They are NASA public domain (Blue Marble, Black Marble lights with coastline noise removed,
+  water mask, topography) and were resized to 2048x1024.
+- The cloud session that built these had no network access to these hosts, so the live paths were verified against
+  mocked responses of the documented formats (see "How to test"); first real-world run may still reveal surprises.
 
 ## Shared conventions across the pixel wallpapers
 
@@ -70,6 +91,11 @@ for moving to another computer. The user may ask for zips of the others.
    measure render/update ms per frame; for City, count on-screen car disappearances, overlapping car pairs,
    red-light entries, and stuck/gridlocked cars.
 4. Be honest in reports: say what was verified by numbers vs. by screenshot vs. not checked.
+5. Headless Chromium can run the WebGL ones with SwiftShader: launch with
+   `--use-angle=swiftshader --enable-unsafe-swiftshader --ignore-gpu-blocklist`. It is slow (~5 fps), so time-based
+   tests need `#speed=`. For the live ones, intercept the API hosts with Playwright `page.route` and serve mock JSON/images
+   (the session that built them kept a mock set with a toy global circulation for Open-Meteo, a colourised IMERG PNG, etc).
+6. Always `node --check` the extracted `<script>` after edits: a single `-(x) ** 2` (needs parentheses) kills the page.
 
 ## Pitfalls already hit (don't repeat)
 

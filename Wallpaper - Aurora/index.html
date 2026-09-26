@@ -805,7 +805,7 @@ function* evCabin() {
   p.f = Math.sign(tx - p.x) || 1;
   while (Math.abs(p.x - tx) > 0.5) { const dt = yield; p.x += Math.sign(tx - p.x) * Math.min(Math.abs(tx - p.x), dt * 6 * UNIT); }
   p.pose = 'look'; yield* wait(4);
-  if (chance(0.6)) { p.pose = 'photo'; for (let i = 0; i < randi(1, 3); i++) { yield* wait(rand(1.2, 2.5)); addFx({ kind: 'flash', x: p.x + 2 * UNIT, y: p.y - 12 * UNIT * 0.2 * 1.9 * 5, dur: 0.18 }); } yield* wait(1.5); }
+  if (chance(0.6)) { p.pose = 'photo'; for (let i = 0; i < randi(1, 3); i++) { yield* wait(rand(1.2, 2.5)); addFx({ kind: 'flash', x: p.x + p.f * 9 * p.s * 1.9, y: p.y - 36 * p.s * 1.9, dur: 0.18 }); } yield* wait(1.5); }
   p.pose = 'mug'; yield* wait(5);
   p.pose = 'walk'; const back = cab.door.x + cab.door.w / 2; p.f = Math.sign(back - p.x) || 1;
   while (Math.abs(p.x - back) > 0.5) { const dt = yield; p.x += Math.sign(back - p.x) * Math.min(Math.abs(back - p.x), dt * 6 * UNIT); }
