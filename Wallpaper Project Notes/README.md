@@ -40,6 +40,19 @@ before reporting it as done.
 Zips (`Pixel Space Wallpaper.zip`, `Pixel Meadow Wallpaper.zip`) contain just that folder's `index.html`,
 for moving to another computer. The user may ask for zips of the others.
 
+## The Backgrounds app (replaces Plash / Wallpaper Engine)
+
+`app/` holds a small native app for **macOS** (Swift + WKWebView, like Plash) and **Windows** (C# .NET 4.8 +
+WebView2, windows attached behind the desktop icons) that shows these wallpapers, plus a shared HTML settings
+window (`app/shared/settings.html`). See `app/README.md`. On first launch it copies the wallpapers into
+**Pictures/Backgrounds** (folders named without the "Wallpaper - " prefix) and loads them from there.
+
+**Every wallpaper now has a settings block** in its `<head>`: `<script type="application/json" id="wallpaper-settings">`
+listing its `#options` (key, label, type range/number/select/toggle/text/time/action, default, group "testing").
+The app's settings panel is generated from it. **When you add or change an option, update this block too**
+(and the header comment). `node app/tests/wallpapers.test.mjs` checks every block is valid, every listed option is
+really read by the page, and every page loads without errors with and without options.
+
 ## Live data (Earth, Aurora, Room)
 
 These three fetch real data when online and must degrade gracefully (Plash may load before the network is up):
