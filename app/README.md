@@ -83,7 +83,8 @@ Each release:
 
 1. Bump `app/VERSION` (e.g. `1.2.0`) and add a `## 1.2.0` section at the top of `app/CHANGELOG.md`
    (shown to users in the update prompt).
-2. Commit, then tag and push: `git tag v1.2.0 && git push origin v1.2.0`
+2. Commit and push to `main`, then either tag and push (`git tag v1.2.0 && git push origin v1.2.0`) or, on GitHub,
+   **Actions › Build apps › Run workflow** (branch `main`) with **publish** ticked: the workflow creates the tag.
 3. The **Build apps** workflow builds and tests both apps, signs them, and publishes the GitHub release with
    `Backgrounds-mac.zip`, `Backgrounds-windows.zip` and `update.json`. Installed apps pick it up within a day.
 
