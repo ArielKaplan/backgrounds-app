@@ -3,6 +3,9 @@
 Release notes for Backgrounds. The section for a version is shown in the app when that update is offered,
 so write it for users. Add a new section at the top before tagging a release.
 
+## 1.2.1
+- Ski Mountain: the chairlift now runs all night (it used to stop after 21:00, leaving skiers stuck on the chairs), and the slope is floodlit whenever it's dark.
+
 ## 1.2.0
 - New wallpaper, Zen Garden: a koi pond, raked gravel, a monk and a calico cat, following the real seasons.
 - New wallpaper, Marble Machine: a hamster-powered marble run in an inventor mouse's workshop.
