@@ -3,6 +3,14 @@
 Release notes for Backgrounds. The section for a version is shown in the app when that update is offered,
 so write it for users. Add a new section at the top before tagging a release.
 
+## 1.2.0
+- New wallpaper, Zen Garden: a koi pond, raked gravel, a monk and a calico cat, following the real seasons.
+- New wallpaper, Marble Machine: a hamster-powered marble run in an inventor mouse's workshop.
+- New wallpaper, Dino Valley: brachiosaurs, triceratops and raptors under a smoking volcano (and now and then a T-rex).
+- New wallpaper, Ski Mountain: a chairlift, skiers and snowboarders, a terrain park and floodlit night skiing.
+- New wallpaper, Pirate Voyage: a pirate ship with its crew, parrot and monkey, dolphins, storms and the odd kraken.
+- The new wallpapers are added to your Backgrounds folder; the ones you already have are left as they are.
+
 ## 1.1.0
 - Backgrounds can now update itself: it checks once a day and asks before installing. You can also use
   "Check for Updates" in the menu or in Settings › General.

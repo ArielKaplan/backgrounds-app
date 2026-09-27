@@ -1,0 +1,1156 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel Dino Valley Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Dino Valley",
+ "description": "A prehistoric valley under a smoking volcano, full of dinosaurs.",
+ "params": [
+  {"key": "pixels", "label": "Pixel size", "type": "range", "min": 100, "max": 400, "step": 10, "default": 200, "help": "Rows of big pixels on screen. Smaller = chunkier, bigger dinosaurs."},
+  {"key": "herd", "label": "Resident dinosaurs", "type": "select", "default": "", "options": [["", "The usual crowd"], ["few", "A few"], ["many", "Lots"]]},
+  {"key": "time", "label": "Pretend time", "type": "time", "default": "", "help": "Leave empty to follow your real clock."},
+  {"key": "event", "label": "Repeat one event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["hatch", "hatch"], ["raptors", "raptors"], ["stampede", "stampede"], ["drink", "drink"], ["fish", "fish"], ["headbutt", "headbutt"], ["thief", "thief"], ["rain", "rain"], ["rumble", "rumble"], ["stego", "stego"], ["anky", "anky"], ["trex", "trex"], ["eruption", "eruption"], ["meteor", "meteor"], ["traveler", "traveler"], ["plesio", "plesio"], ["all", "all"]], "help": "Test mode: keeps repeating one event. 'all' cycles through every event."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #8ac0e0; }
+  canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL DINO VALLEY — a prehistoric valley under a smoking volcano
+   Brachiosaurs browse the monkey-puzzle trees, a triceratops family grazes,
+   compys scurry, pterosaurs glide over the lake and a nest of eggs waits in the ferns.
+   Day and night follow your clock; at night the herd sleeps and the volcano glows.
+   Options (add to the end of the address, combine with &):
+     #pixels=200        vertical resolution in big pixels
+     #herd=many         resident dinosaurs: few / many
+     #time=21:00        pretend local time
+     #event=trex        test mode: repeat one event (or "all")
+     #speed=3           run time faster (testing)
+     #debug             event name, time
+   Events: hatch raptors stampede drink fish headbutt thief rain rumble stego anky
+   Rare:   trex  eruption  meteor  traveler (someone from the future with a camera)  plesio
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const num = (k, d) => { const v = parseFloat(params.get(k)); return Number.isFinite(v) ? v : d; };
+const ROWS = Math.round(Math.min(600, Math.max(80, num('pixels', 200))));
+const FORCE = params.get('event');
+const TIME_SCALE = num('speed', 1);
+const DEBUG = params.has('debug');
+const TIME_FORCE = params.get('time');
+const HERD = params.get('herd') || '';
+const FPS = 30;
+
+const canvas = document.getElementById('c');
+const mainCtx = canvas.getContext('2d');
+let ctx = mainCtx;
+let W, H;
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const TAU = Math.PI * 2;
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  if (!e.length) return null;
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgbStr = c => `rgb(${c.map(v => Math.round(clamp(v, 0, 255))).join(',')})`;
+const mixRgb = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const mixHex = (a, b, t) => rgbStr(mixRgb(hexRgb(a), hexRgb(b), t));
+function px(x, y, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+function disc(cx, cy, r, c) { if (c) ctx.fillStyle = c; cx = Math.round(cx); cy = Math.round(cy); for (let dy = -Math.floor(r); dy <= r; dy++) { const w = Math.floor(Math.sqrt(Math.max(0, r * r - dy * dy))); ctx.fillRect(cx - w, cy + dy, w * 2 + 1, 1); } }
+function ellipse(cx, cy, rx, ry, c) { ctx.fillStyle = c; for (let dy = -Math.ceil(ry); dy <= ry; dy++) { const k = 1 - (dy * dy) / (ry * ry); if (k < 0) continue; const w = Math.round(rx * Math.sqrt(k)); ctx.fillRect(Math.round(cx - w), Math.round(cy + dy), w * 2 + 1, 1); } }
+function line(x0, y0, x1, y1, c, w = 1) { const n = Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))) || 1; ctx.fillStyle = c; for (let i = 0; i <= n; i++) ctx.fillRect(Math.round(lerp(x0, x1, i / n) - (w - 1) / 2), Math.round(lerp(y0, y1, i / n) - (w - 1) / 2), w, w); }
+const hash = n => { n = Math.sin(n * 127.1 + 311.7) * 43758.5453; return n - Math.floor(n); };
+const hash2 = (x, y) => hash(x * 57.3 + y * 131.7);
+function vnoise(x) { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return lerp(hash(i), hash(i + 1), u); }
+function vnoise2(x, y) { const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy, u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy); return lerp(lerp(hash2(ix, iy), hash2(ix + 1, iy), u), lerp(hash2(ix, iy + 1), hash2(ix + 1, iy + 1), u), v); }
+function fbm(x) { return vnoise(x) * 0.55 + vnoise(x * 2.1 + 13) * 0.3 + vnoise(x * 4.3 + 7) * 0.15; }
+function mk(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+function withCtx(c, fn) { const old = ctx; ctx = c.getContext('2d'); ctx.imageSmoothingEnabled = false; try { fn(); } finally { ctx = old; } }
+const FONT = {
+  A: '.X.X.XXXXX.XX.X', B: 'XX.X.XXX.X.XXX.', C: '.XXX..X..X...XX', D: 'XX.X.XX.XX.XXX.', E: 'XXXX..XX.X..XXX', F: 'XXXX..XX.X..X..',
+  G: '.XXX..X.XX.X.XX', H: 'X.XX.XXXXX.XX.X', I: 'XXX.X..X..X.XXX', J: '..X..X..XX.X.X.', K: 'X.XX.XXX.X.XX.X', L: 'X..X..X..X..XXX',
+  M: 'X.XXXXXXXX.XX.X', N: 'XX.X.XX.XX.XX.X', O: '.X.X.XX.XX.X.X.', P: 'XX.X.XXX.X..X..', Q: '.X.X.XX.XXX..XX', R: 'XX.X.XXX.X.XX.X',
+  S: '.XXX...X...XXX.', T: 'XXX.X..X..X..X.', U: 'X.XX.XX.XX.XXXX', V: 'X.XX.XX.XX.X.X.', W: 'X.XX.XXXXXXXX.X', X: 'X.XX.X.X.X.XX.X',
+  Y: 'X.XX.X.X..X..X.', Z: 'XXX..X.X.X..XXX', ' ': '...............', '!': '.X..X..X.....X.', '-': '......XXX......', '.': '.............X.',
+  0: 'XXXX.XX.XX.XXXX', 1: '.X.XX..X..X.XXX', 2: 'XX...X.X.X..XXX', 3: 'XX...X.X...XXX.', 4: 'X.XX.XXXX..X..X', 5: 'XXXX..XX...XXX.',
+  6: '.XXX..XXXX.XXXX', 7: 'XXX..X.X..X..X.', 8: 'XXXX.XXXXX.XXXX', 9: 'XXXX.XXXX..XXX.', ':': '....X.....X....', '?': 'XX...X.X.....X.',
+};
+const textW = s => String(s).length * 4 - 1;
+function text(str, x, y, col = '#ffffff', shadow = null) {
+  str = String(str).toUpperCase();
+  const draw = (ox, oy, c) => { ctx.fillStyle = c; for (let i = 0; i < str.length; i++) { const g = FONT[str[i]] || FONT['?']; for (let k = 0; k < 15; k++) if (g[k] === 'X') ctx.fillRect(Math.round(x + ox + i * 4 + (k % 3)), Math.round(y + oy + Math.floor(k / 3)), 1, 1); } };
+  if (shadow) draw(1, 1, shadow);
+  draw(0, 0, col);
+}
+
+// ---------------------------------------------------------------- sprite builder
+const INK = '#23201e';
+class SB {
+  constructor(w, h) { this.w = w; this.h = h; this.g = new Array(w * h).fill(null); }
+  set(x, y, c) { x = Math.round(x); y = Math.round(y); if (x >= 0 && y >= 0 && x < this.w && y < this.h) this.g[y * this.w + x] = c; return this; }
+  get(x, y) { return x >= 0 && y >= 0 && x < this.w && y < this.h ? this.g[y * this.w + x] : null; }
+  ell(cx, cy, rx, ry, c, shade) {
+    for (let y = Math.floor(cy - ry - 1); y <= Math.ceil(cy + ry + 1); y++)
+      for (let x = Math.floor(cx - rx - 1); x <= Math.ceil(cx + rx + 1); x++) {
+        const dx = (x - cx) / (rx + 0.35), dy = (y - cy) / (ry + 0.35);
+        if (dx * dx + dy * dy > 1) continue;
+        this.set(x, y, shade && dx * 0.35 + dy * 0.95 > 0.5 ? shade : c);
+      }
+    return this;
+  }
+  rect(x, y, w, h, c) { for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.set(x + i, y + j, c); return this; }
+  seg(x0, y0, x1, y1, r, c, shade, r1) { const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) * 2) + 1; for (let i = 0; i <= n; i++) { const t = i / n, rr = r1 == null ? r : lerp(r, r1, t); this.ell(lerp(x0, x1, t), lerp(y0, y1, t), rr, rr, c, shade); } return this; }
+  curve(pts, r0, r1, c, shade) { // smooth chain through points (quadratic-ish), tapering
+    const n = 24; for (let i = 0; i <= n; i++) { const t = i / n, p = bez(pts, t); this.ell(p[0], p[1], lerp(r0, r1, t), lerp(r0, r1, t), c, shade); } return this;
+  }
+  line(x0, y0, x1, y1, c) { const n = Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))) || 1; for (let i = 0; i <= n; i++) this.set(lerp(x0, x1, i / n), lerp(y0, y1, i / n), c); return this; }
+  paint(fn) { for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) { const c = this.g[y * this.w + x]; if (c) { const n = fn(x, y, c); if (n) this.g[y * this.w + x] = n; } } return this; }
+  outline(c = INK) {
+    const add = [];
+    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
+      if (this.get(x, y)) continue;
+      if (this.get(x - 1, y) || this.get(x + 1, y) || this.get(x, y - 1) || this.get(x, y + 1)) add.push([x, y]);
+    }
+    for (const [x, y] of add) this.set(x, y, c);
+    return this;
+  }
+}
+function bez(pts, t) { let p = pts.map(q => q.slice()); while (p.length > 1) { const n = []; for (let i = 0; i < p.length - 1; i++) n.push([lerp(p[i][0], p[i + 1][0], t), lerp(p[i][1], p[i + 1][1], t)]); p = n; } return p[0]; }
+function bake(b, ax, ay) {
+  const r = mk(b.w, b.h), l = mk(b.w, b.h), rc = r.getContext('2d'), lc = l.getContext('2d');
+  for (let y = 0; y < b.h; y++) for (let x = 0; x < b.w; x++) {
+    const c = b.g[y * b.w + x]; if (!c) continue;
+    rc.fillStyle = c; rc.fillRect(x, y, 1, 1); lc.fillStyle = c; lc.fillRect(b.w - 1 - x, y, 1, 1);
+  }
+  return { r, l, w: b.w, h: b.h, ax, ay };
+}
+function drawSpr(s, x, y, facing = 1, alpha = 1) {
+  const X = Math.round(x - (facing > 0 ? s.ax : s.w - 1 - s.ax)), Y = Math.round(y - s.ay);
+  if (alpha < 1) ctx.globalAlpha = Math.max(0, alpha);
+  ctx.drawImage(facing > 0 ? s.r : s.l, X, Y);
+  if (alpha < 1) ctx.globalAlpha = 1;
+}
+const ICONS = {};
+function icon(name, rows, col) {
+  const b = new SB(rows[0].length + 2, rows.length + 2);
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== '.') b.set(x + 1, y + 1, ch === 'o' ? '#ffffff' : col); }));
+  ICONS[name] = bake(b.outline('#ffffff'), Math.floor(b.w / 2), b.h - 1);
+}
+icon('heart', ['.X.X.', 'XoXXX', 'XXXXX', '.XXX.', '..X..'], '#ff5a8a');
+icon('note', ['..XX', '..XX', '..X.', 'XXX.', 'XX..'], '#6a5aff');
+icon('bang', ['X', 'X', 'X', '.', 'X'], '#ff4a3a');
+icon('q', ['XXX', '..X', '.X.', '...', '.X.'], '#3a6aff');
+icon('z', ['XXX', '..X', '.X.', 'XXX'], '#7a8aff');
+icon('sparkle', ['.X.', 'XoX', '.X.'], '#ffc83a');
+icon('dots', ['X.X.X'], '#6a6070');
+icon('sweat', ['.X', 'XX', 'XX'], '#5ab0ff');
+icon('anger', ['X.X', '...', 'X.X'], '#ff4a3a');
+icon('swirl', ['XXX', 'X.X', 'X.X', '..X'], '#b85aff');
+
+// ---------------------------------------------------------------- dinosaur sprites (all face right; anchor = feet)
+// walk phase for a leg: returns [dx, lift]
+function legPhase(pose, k) {
+  const m = /^(walk|run)(\d)$/.exec(pose); if (!m) return [0, 0];
+  const run = m[1] === 'run', f = (parseInt(m[2], 10) - 1) / (run ? 2 : 4) * TAU + k * Math.PI;
+  return [Math.sin(f) * (run ? 4 : 3.2), Math.max(0, Math.cos(f)) * (run ? 2.5 : 1.5)];
+}
+function leg(b, hx, hy, fy, pose, k, r, col, shade, foot) {
+  const [dx, lift] = legPhase(pose, k);
+  const kx = hx + dx * 0.4 + 0.8, ky = lerp(hy, fy, 0.55);
+  b.seg(hx, hy, kx, ky, r, col, shade); b.seg(kx, ky, hx + dx, fy - lift - r * 0.4, r * 0.85, col, shade);
+  b.ell(hx + dx + 0.8, fy - lift - 0.4, r * 1.05, 0.9, foot || shade);
+}
+// theropod-style leg: thigh forward to the knee, shin back to the ankle, toes forward
+function bipedLeg(b, hx, hy, fy, pose, k, r, col, shade, thigh = true) {
+  const [dx, lift] = legPhase(pose, k), L = fy - hy, s = Math.max(0.6, r / 2);
+  const knee = [hx + 2.2 * s + dx * 0.5, hy + L * 0.42], ankle = [hx - 1.2 * s + dx, hy + L * 0.82 - lift], toe = [ankle[0] + 3.2 * s, fy - lift];
+  if (thigh) b.ell(hx + 0.5 * s, hy + L * 0.18, r * 1.5, r * 2, col, shade);
+  b.seg(hx, hy, knee[0], knee[1], r * 1.05, col, shade); b.seg(knee[0], knee[1], ankle[0], ankle[1], r * 0.72, col, shade);
+  b.seg(ankle[0], ankle[1], toe[0], toe[1] - 0.3, r * 0.55, shade); b.set(toe[0] + 0.8, toe[1], '#f0e8d0');
+}
+function spots(b, col, n, x0, y0, x1, y1, base) { for (let i = 0; i < n; i++) { const x = lerp(x0, x1, hash(i * 3.3 + x0)), y = lerp(y0, y1, hash(i * 7.7 + y0)); if (b.get(x, y) === base) b.set(x, y, col); } }
+function brachioSpr(pose) {
+  const b = new SB(76, 80), C = '#7ab0a0', CS = '#568e80', BL = '#a8d0c0', D = '#44766a', fy = 78;
+  const sleep = pose === 'sleep';
+  const by = sleep ? 62 : 46;
+  // thick tail held out behind
+  b.curve([[18, by - 1], [7, by + 1], [0, by + (sleep ? 10 : 7)]], 5.5, 1.3, C, CS);
+  if (!sleep) { leg(b, 21, by + 5, fy, pose, 1, 4, CS, D); leg(b, 40, by + 2, fy, pose, 0, 3.8, CS, D); }
+  b.ell(28, by, 17, 11, C, CS); b.ell(39, by - 5, 11, 11, C, CS);
+  b.ell(30, by + 7, 12, 3, '#88c0b0', '#6aa294');
+  if (!sleep) { leg(b, 24, by + 6, fy, pose, 0, 4.2, C, CS); leg(b, 42, by + 3, fy, pose, 1, 4, C, CS); }
+  else { b.ell(22, by + 9, 6, 3, C, CS); b.ell(43, by + 8, 5.5, 3, C, CS); }
+  // neck + head
+  let head = [54, 9], ctrl = [48, 24];
+  if (pose === 'eat') { head = [56, 5]; ctrl = [46, 18]; }
+  if (pose === 'eat2') { head = [57, 8]; ctrl = [47, 20]; }
+  if (pose === 'drink') { head = [66, fy - 4]; ctrl = [62, by - 12]; }
+  if (pose === 'call') { head = [51, 4]; ctrl = [47, 22]; }
+  if (sleep) { head = [62, fy - 5]; ctrl = [56, by - 14]; }
+  b.curve([[42, by - 10], ctrl, head], 5.2, 2.8, C, CS);
+  const [hx, hy] = head;
+  b.ell(hx + 1, hy, 4.4, 3, C, CS); b.ell(hx + 5, hy + 1, 2.6, 2, C, CS); b.ell(hx, hy - 2.6, 2.3, 1.8, C);
+  b.set(hx + 1.2, hy - 0.6, sleep ? CS : INK); if (!sleep) b.set(hx + 1.7, hy - 1.1, '#ffffff');
+  b.line(hx + 3, hy + 1.8, hx + 7, hy + 1.8, D);
+  if (pose === 'call') { b.set(hx + 6, hy + 2.6, '#8a3a3a'); b.set(hx + 5, hy + 2.7, '#8a3a3a'); }
+  spots(b, D, 60, 14, by - 11, 48, by + 2, C);
+  for (let i = 0; i < 14; i++) b.set(18 + i * 2, by - 10 + Math.abs(i - 7) * 0.5, D);
+  return bake(b.outline(INK), 30, fy);
+}
+function trexSpr(pose) {
+  const b = new SB(64, 50), C = '#7e9e52', CS = '#5a7a3c', BL = '#dcd4a4', St = '#4e6a32', fy = 48;
+  const roar = pose === 'roar', sniff = pose === 'sniff', trip = pose === 'trip';
+  if (trip) { // flat on its belly, legs in the air
+    b.curve([[20, 40], [8, 40], [1, 38]], 5, 1.2, C, CS); b.ell(27, 40, 14, 6.5, C, CS); b.ell(28, 44, 11, 2.4, BL);
+    b.seg(22, 36, 19, 27, 3.4, C, CS); b.seg(19, 27, 22, 22, 1.8, CS); b.seg(30, 36, 33, 28, 3, CS); b.seg(33, 28, 36, 24, 1.6, CS);
+    b.ell(47, 41, 8.5, 5, C, CS); b.ell(48, 45, 7, 2, C, CS);
+    for (const [x, y] of [[48, 39], [50, 39], [49, 40], [48, 41], [50, 41]]) b.set(x, y, INK);
+    return bake(b.outline(INK), 28, fy);
+  }
+  const run = pose.startsWith('run'), lean = run ? 2 : 0;
+  // tail: thick at the hips, whippy at the tip
+  b.curve([[20, 24 + lean], [9, 22], [0, 17 + lean * 2]], 6.5, 1, C, CS);
+  bipedLeg(b, 23, 27, fy, pose, 1, 3.4, CS, St);
+  b.ell(27, 25 + lean * 0.5, 13, 9, C, CS); b.ell(36, 24 + lean * 0.5, 7.5, 8.5, C, CS); b.ell(32, 30, 10, 3.4, BL, '#c8c090');
+  // head on a thick S-neck
+  let hx = 47, hy = 15 + lean, jaw = 0;
+  if (roar) { hx = 46; hy = 12; jaw = 4; }
+  if (sniff) { hx = 50; hy = 25; }
+  b.curve([[37, 21 + lean * 0.5], [41, 17 + lean], [hx - 5, hy + 1]], 5.5, 4.5, C, CS);
+  b.ell(hx, hy, 8.5, 5.5, C, CS); b.ell(hx + 6.5, hy + 1, 4.5, 3.6, C, CS);
+  b.ell(hx + 2, hy + 4.5 + jaw, 7.5, 2.3, CS);
+  if (jaw > 0) { for (let x = hx - 3; x <= hx + 9; x++) { b.set(x, hy + 3.5, '#8a2a2a'); b.set(x, hy + 3.5 + jaw * 0.6, '#a83a3a'); } for (let x = hx - 1; x <= hx + 9; x += 2) { b.set(x, hy + 3, '#fff8e0'); b.set(x + 1, hy + 4.5 + jaw * 0.5, '#fff8e0'); } }
+  else { b.line(hx - 4, hy + 3, hx + 9, hy + 3.2, St); for (let x = hx - 1; x <= hx + 9; x += 2) b.set(x, hy + 3.6, '#fff8e0'); }
+  b.set(hx + 1, hy - 2, INK); b.set(hx + 1.6, hy - 2.4, '#ffe040'); b.line(hx - 1, hy - 3.6, hx + 3, hy - 3.4, St); b.set(hx + 9, hy - 0.5, St);
+  // the famous tiny arm
+  b.seg(38, 27, 41, 30, 1, C, CS); b.set(42, 30.6, '#fff8e0'); b.set(41, 31, '#fff8e0');
+  bipedLeg(b, 25, 28, fy, pose, 0, 3.8, C, CS);
+  for (let i = 0; i < 7; i++) { const x = 14 + i * 4; b.set(x, 17 + Math.abs(i - 3) * 0.4, St); b.set(x + 1, 18 + Math.abs(i - 3) * 0.4, St); }
+  return bake(b.outline(INK), 27, fy);
+}
+function trikeSpr(pose, baby) {
+  const s = baby ? 0.55 : 1, b = new SB(Math.ceil(48 * s) + 4, Math.ceil(32 * s) + 4), C = '#cc8a4e', CS = '#a86a36', F = '#e8b464', FR = '#8a4a2a', BL = '#ecd0a0', fy = Math.ceil(30 * s) + 2;
+  const S = v => v * s + 1;
+  const sleep = pose === 'sleep';
+  const dy = sleep ? 6 : 0;
+  b.curve([[S(12), S(17 + dy)], [S(5), S(19 + dy)], [S(0), S(22 + dy)]], 3.2 * s, 0.8, C, CS);
+  if (!sleep) { leg(b, S(13), S(19), fy, pose, 1, 2.6 * s, CS, '#7a4a2a'); leg(b, S(28), S(20), fy, pose, 0, 2.4 * s, CS, '#7a4a2a'); }
+  b.ell(S(21), S(17 + dy), 13 * s, 8 * s, C, CS); b.ell(S(22), S(22 + dy), 9 * s, 2.6 * s, BL);
+  if (!sleep) { leg(b, S(15), S(20), fy, pose, 0, 2.8 * s, C, CS); leg(b, S(30), S(21), fy, pose, 1, 2.6 * s, C, CS); }
+  const eat = pose === 'eat' || sleep, hx = S(35), hy = S(eat ? 20 : 15) + (sleep ? S(4) : 0);
+  // frill
+  b.ell(hx - 3 * s, hy - 5 * s, 6.5 * s, 7.5 * s, FR); b.ell(hx - 3 * s, hy - 5 * s, 5.5 * s, 6.5 * s, F, '#d49a50');
+  if (!baby) for (let a = -2.4; a < 0.9; a += 0.55) b.set(hx - 3 + Math.cos(a) * 6.8, hy - 5 + Math.sin(a) * 7.8, '#f4e0b0');
+  b.ell(hx + 2 * s, hy + 1 * s, 5 * s, 4 * s, C, CS); b.ell(hx + 6 * s, hy + 2 * s, 2.5 * s, 2 * s, C, CS); b.set(hx + 8.5 * s, hy + 2.6 * s, '#5a3a2a');
+  if (!baby) { b.seg(hx + 2, hy - 2, hx + 10, hy - 7, 1, '#f4ecd8', '#d8ccb0', 0.5); b.seg(hx + 6.5, hy, hx + 8.5, hy - 2.5, 0.8, '#f4ecd8'); }
+  else { b.set(hx + 2, hy - 2, '#f4ecd8'); b.set(hx + 6, hy, '#f4ecd8'); }
+  b.set(hx + 2 * s, hy - 0.2, sleep ? CS : INK); if (!sleep && !baby) b.set(hx + 2.5, hy - 0.8, '#ffffff');
+  spots(b, CS, baby ? 6 : 16, S(12), S(11), S(30), S(18), C);
+  return bake(b.outline(INK), Math.round(S(21)), fy);
+}
+function stegoSpr(pose) {
+  const b = new SB(52, 36), C = '#8aa06a', CS = '#687e4c', P = '#e0784a', PS = '#b0502e', BL = '#d8dcb0', fy = 34;
+  b.curve([[14, 22], [6, 20], [1, 16]], 3.4, 1, C, CS);
+  for (const [x, y] of [[2, 15], [3, 13]]) { b.seg(x, y, x - 2, y - 4, 0.7, '#f0e8d0'); b.seg(x + 1, y + 1, x + 4, y - 3, 0.7, '#f0e8d0'); }
+  leg(b, 15, 24, fy, pose, 1, 3.2, CS, '#4e623a'); leg(b, 32, 25, fy, pose, 0, 2.6, CS, '#4e623a');
+  // plates along the arched back
+  const plate = (x, y, h, col, hi) => { for (let k = 0; k <= h; k++) { const w = Math.min(k + 0.5, (1 - k / h) * 2.2 + 0.3); for (let xx = -w; xx <= w; xx += 0.5) b.set(x + xx + k * 0.2, y - k, xx < -w * 0.3 ? hi : col); } };
+  for (let i = 0; i < 4; i++) { const t = (i + 0.9) / 5, x = lerp(8, 36, t), y = 16 - Math.sin(t * Math.PI) * 7; plate(x, y, 3 + Math.sin(t * Math.PI) * 5, PS, '#c86a40'); }
+  const back = b.g.slice();
+  for (let i = 0; i < 5; i++) { const t = (i + 0.4) / 5, x = lerp(8, 36, t), y = 18 - Math.sin(t * Math.PI) * 7; plate(x, y, 3 + Math.sin(t * Math.PI) * 6, P, '#f4a070'); }
+  // a dark seam between neighbouring plates so they read separately
+  for (let i = 0; i < b.g.length; i++) if (back[i] && b.g[i] !== back[i] && (b.g[i - 1] === back[i - 1] && back[i - 1])) b.g[i] = INK;
+  b.ell(22, 22, 14, 8, C, CS); b.ell(23, 27, 10, 2.5, BL);
+  leg(b, 17, 25, fy, pose, 0, 3.4, C, CS); leg(b, 34, 26, fy, pose, 1, 2.8, C, CS);
+  const eat = pose === 'eat';
+  b.seg(34, 23, 40, eat ? 29 : 25, 2.4, C, CS); b.ell(42, eat ? 30 : 26, 3.4, 2.2, C, CS); b.set(43, eat ? 29 : 25, INK); b.set(45.5, eat ? 31 : 27, '#5a4a3a');
+  spots(b, '#6e8450', 20, 12, 16, 32, 26, C);
+  return bake(b.outline(INK), 23, fy);
+}
+function paraSpr(pose, baby) {
+  const s = baby ? 0.5 : 1, b = new SB(Math.ceil(38 * s) + 4, Math.ceil(34 * s) + 4), C = '#9ab85a', CS = '#76943e', Cr = '#e06a3a', BL = '#e8e8b8', St = '#5a7a2e', fy = Math.ceil(32 * s) + 2;
+  const S = v => v * s + 1;
+  const low = pose === 'eat' || pose === 'sleep';
+  b.curve([[S(12), S(17)], [S(5), S(15)], [S(0), S(low ? 18 : 12)]], 3 * s, 0.8, C, CS);
+  bipedLeg(b, S(15), S(19), fy, pose, 1, 2.4 * s, CS, '#5a6e2e');
+  b.ell(S(17), S(17), 10 * s, 7 * s, C, CS); b.ell(S(22), S(15), 5 * s, 5 * s, C, CS); b.ell(S(18), S(21), 6.5 * s, 2.2 * s, BL);
+  bipedLeg(b, S(16), S(20), fy, pose, 0, 2.3 * s, C, CS);
+  if (low) leg(b, S(24), S(21), fy, pose, 1, 1.8 * s, C, CS);
+  else b.seg(S(23), S(19), S(26), S(23), 1 * s, C, CS);
+  let hx = S(29), hy = S(7);
+  if (pose === 'call') { hx = S(28); hy = S(4); }
+  if (low) { hx = S(33); hy = S(pose === 'sleep' ? 26 : 25); }
+  b.seg(S(22), S(15), hx - 2 * s, hy + 1 * s, 2.6 * s, C, CS);
+  b.ell(hx, hy, 3.3 * s, 2.3 * s, C, CS); b.ell(hx + 3 * s, hy + 1 * s, 2 * s, 1.4 * s, C, CS);
+  if (!baby) b.seg(hx - 1, hy - 1.5, low ? hx - 5 : hx - 9, low ? hy - 9 : hy - 5, 1.1, Cr, '#b04a2a');
+  else b.set(hx - 1.5, hy - 2, Cr);
+  b.set(hx + 0.5, hy - 0.4, pose === 'sleep' ? CS : INK);
+  for (let i = 0; i < 5; i++) b.set(S(12 + i * 2.5), S(13), St), b.set(S(12 + i * 2.5), S(14), St);
+  return bake(b.outline(INK), Math.round(S(17)), fy);
+}
+function raptorSpr(pose) {
+  const b = new SB(28, 18), C = '#9a94a8', CS = '#76708a', St = '#e0843a', fy = 16;
+  const run = pose.startsWith('run');
+  b.curve([[9, 8], [4, 7], [0, run ? 6 : 8]], 1.6, 0.6, C, CS);
+  bipedLeg(b, 11, 10, fy, pose, 1, 1.3, CS, '#5a5468', false);
+  b.ell(12, 9, 5.5, 3, C, CS); b.line(8, 7, 15, 7, St); b.set(10, 8, St); b.set(13, 8, St);
+  bipedLeg(b, 12, 10, fy, pose, 0, 1.5, C, CS);
+  b.seg(15, 10, 18, 12, 0.7, C); b.set(17, 11, '#3a8ad0'); b.set(16, 10, '#3a8ad0');
+  const hx = run ? 20 : 19, hy = run ? 6.5 : 5;
+  b.seg(15, 8, hx - 1, hy + 0.5, 1.3, C, CS); b.ell(hx, hy, 2.6, 1.6, C, CS); b.ell(hx + 2.5, hy + 0.6, 1.6, 1, C);
+  b.set(hx, hy - 0.6, '#ffe040'); b.set(hx + 0.4, hy - 0.6, INK); b.line(hx + 1, hy + 1.2, hx + 4, hy + 1.2, '#4a3a4a');
+  return bake(b.outline(INK), 12, fy);
+}
+function pteroSpr(pose) {
+  const b = new SB(42, 24), C = '#c87a5a', CS = '#9a5a40', M = '#e8a07a', MS = '#c07a58', fy = 12;
+  const perch = pose === 'perch';
+  const tipY = pose === 'flap1' ? 1 : pose === 'flap2' ? 21 : 9, elbowY = pose === 'flap1' ? 6 : pose === 'flap2' ? 16 : 9;
+  if (!perch) for (const side of [-1, 1]) {
+    // membrane: leading edge shoulder -> elbow -> tip, trailing edge tip -> hip
+    const sh = [20, 10], el = [20 + side * 8, elbowY], tip = [20 + side * 19, tipY], hip = [20 - 2 * side * 0.3, 13];
+    for (let t = 0; t <= 1; t += 0.02) {
+      const lead = t < 0.45 ? [lerp(sh[0], el[0], t / 0.45), lerp(sh[1], el[1], t / 0.45)] : [lerp(el[0], tip[0], (t - 0.45) / 0.55), lerp(el[1], tip[1], (t - 0.45) / 0.55)];
+      const trail = [lerp(hip[0], tip[0], t), lerp(hip[1], tip[1], t) + Math.sin(t * Math.PI) * 2.5];
+      const n = Math.ceil(Math.hypot(trail[0] - lead[0], trail[1] - lead[1]) * 2) + 1;
+      for (let k = 0; k <= n; k++) b.set(lerp(lead[0], trail[0], k / n), lerp(lead[1], trail[1], k / n), k / n > 0.6 ? MS : M);
+    }
+    b.line(sh[0], sh[1], el[0], el[1], CS); b.line(el[0], el[1], tip[0], tip[1], CS);
+  }
+  b.ell(20, 11, 4.5, 2.4, C, CS);
+  b.seg(23, 10, 26, 9, 1.3, C); b.line(27, 9, 37, 10.5, '#e8d090'); b.line(27, 10, 36, 11, '#c8a870'); b.seg(24, 8, 17, 4.5, 0.9, '#e06040');
+  b.set(26, 8.4, INK);
+  if (perch) { b.seg(18, 10, 14, 5, 1.8, M, CS); b.seg(22, 10, 25, 5, 1.4, M, CS); b.line(19, 13, 19, 17, '#6a4a3a'); b.line(21, 13, 22, 17, '#6a4a3a'); return bake(b.outline(INK), 20, 17); }
+  b.line(18, 13, 15, 15, '#6a4a3a');
+  return bake(b.outline(INK), 20, fy);
+}
+function compySpr(pose) {
+  const b = new SB(14, 9), C = '#7ab04a', CS = '#5a8a36', fy = 7;
+  b.line(5, 4, 0, 3, CS); b.ell(6, 4, 2.6, 1.6, C, CS); b.seg(8, 3.5, 10, 2, 0.8, C); b.ell(11, 1.8, 1.5, 1, C); b.set(11.5, 1.4, INK);
+  const k = pose === 'walk1' || pose === 'run1' ? 1 : pose === 'walk2' || pose === 'run2' ? -1 : 0;
+  b.line(6, 5, 6 - k, fy, CS); b.line(7, 5, 7 + k, fy, CS);
+  return bake(b.outline(INK), 6, fy);
+}
+function ankySpr(pose) {
+  const b = new SB(44, 22), C = '#9a7e5a', CS = '#7a603e', A = '#c8a878', D = '#5a4430', fy = 20;
+  const swing = pose === 'swing' ? 1 : pose === 'swing2' ? -1 : 0;
+  b.curve([[10, 12], [4, 12 + swing * 2], [1, 10 + swing * 4]], 2.2, 1.2, C, CS); b.ell(1.5, 10 + swing * 4, 3, 2.4, D, '#3e2e20');
+  leg(b, 12, 14, fy, pose, 1, 2.4, CS, D); leg(b, 28, 14, fy, pose, 0, 2.2, CS, D);
+  b.ell(20, 12, 14, 6.5, C, CS);
+  for (let x = 9; x <= 31; x += 3) for (let y = 7; y <= 13; y += 3) b.set(x + ((y / 3) % 2), y, A);
+  for (let x = 8; x <= 32; x += 4) b.set(x, 16.5, '#e8d8b0');
+  leg(b, 14, 15, fy, pose, 0, 2.6, C, CS); leg(b, 30, 15, fy, pose, 1, 2.4, C, CS);
+  b.ell(35, 14, 4, 3, C, CS); b.set(36, 13, INK); b.set(33, 11.5, '#e8d8b0'); b.set(35, 11, '#e8d8b0');
+  return bake(b.outline(INK), 20, fy);
+}
+function pachySpr(pose) {
+  const b = new SB(22, 22), C = '#b89a6e', CS = '#94784e', Dm = '#8a6ab8', fy = 20;
+  const charge = pose === 'charge' || pose.startsWith('run');
+  b.curve([[8, 12], [3, 11], [0, charge ? 9 : 12]], 2, 0.6, C, CS);
+  bipedLeg(b, 9, 13, fy, pose, 1, 1.6, CS, '#6a5438', false);
+  b.ell(10, 12, 5, 4, C, CS);
+  bipedLeg(b, 10, 14, fy, pose, 0, 1.8, C, CS);
+  const hx = charge ? 17 : 15, hy = charge ? 10 : 6;
+  b.seg(13, 10, hx - 1, hy + 1, 1.8, C, CS);
+  b.ell(hx, hy, 3.6, 3.2, Dm, '#6a4a98'); for (let a = 0; a < TAU; a += 0.9) b.set(hx + Math.cos(a) * 3.8, hy + Math.sin(a) * 3.4, '#d8c8f0');
+  b.ell(hx + 2.6, hy + 2, 1.8, 1.3, C); b.set(hx + 1.6, hy + 0.8, INK);
+  return bake(b.outline(INK), 10, fy);
+}
+function oviSpr(pose) {
+  const b = new SB(20, 18), C = '#6a8ac8', CS = '#4e6aa4', Cr = '#f06a8a', fy = 16;
+  b.curve([[7, 9], [3, 8], [0, 6]], 1.8, 0.8, C, CS); b.set(0, 5, Cr); b.set(1, 5, Cr);
+  bipedLeg(b, 8, 11, fy, pose, 1, 1.3, CS, '#3e5488', false);
+  b.ell(9, 10, 4, 3.2, C, CS); b.seg(11, 10, 14, 12, 0.8, C); b.set(14, 11, Cr); b.set(13, 12, Cr);
+  bipedLeg(b, 9, 12, fy, pose, 0, 1.5, C, CS);
+  b.seg(11, 8, 13, 5, 1.2, C, CS); b.ell(14, 4, 2.2, 1.8, C, CS); b.ell(14, 2, 1.2, 1.3, Cr); b.set(16.4, 4.6, '#f0c050'); b.set(15.5, 4.8, '#f0c050'); b.set(14.4, 3.6, INK);
+  if (pose === 'carry') b.ell(15, 12, 1.6, 2, '#f4ecd8', '#d8ccb0');
+  return bake(b.outline(INK), 9, fy);
+}
+function galliSpr(pose) {
+  const b = new SB(22, 24), C = '#c8b890', CS = '#a8946a', fy = 22;
+  b.curve([[8, 12], [3, 12], [0, 10]], 1.8, 0.6, C, CS);
+  bipedLeg(b, 9, 14, fy, pose, 1, 1.2, CS, '#7a6a4a', false);
+  b.ell(10, 12, 4.5, 3.2, C, CS);
+  bipedLeg(b, 10, 14, fy, pose, 0, 1.3, C, CS);
+  b.curve([[13, 10], [15, 6], [16, 2]], 1.3, 0.9, C, CS); b.ell(17, 2, 1.8, 1.2, C); b.line(18, 2.5, 20, 2.8, '#6a5a4a'); b.set(17, 1.6, INK);
+  return bake(b.outline(INK), 10, fy);
+}
+function plesioSpr(pose) {
+  const b = new SB(22, 30), C = '#5a8aa0', CS = '#3e6a80', BL = '#b8d8e0', fy = 28;
+  const up = pose === 'look' ? 0 : 3;
+  b.curve([[6, 28], [4, 16], [12, 4 + up]], 3.2, 1.8, C, CS); b.ell(15, 4 + up, 3.6, 2.2, C, CS); b.ell(18, 5 + up, 1.8, 1.2, C);
+  b.set(15.5, 3 + up, INK); b.set(16, 2.6 + up, '#ffffff');
+  for (let y = 12; y < 26; y += 3) b.set(5, y, BL);
+  return bake(b.outline(INK), 6, fy);
+}
+function humanSpr(pose) {
+  const b = new SB(14, 20), Kh = '#c8b078', KS = '#a08858', Sk = '#f0c8a0', fy = 18;
+  const k = pose === 'walk1' || pose === 'run1' ? 1 : pose === 'walk2' || pose === 'run2' ? -1 : 0;
+  b.line(6 - k, 13, 6 - k * 2, fy, KS); b.line(7 + k, 13, 7 + k * 2, fy, KS); b.set(6 - k * 2, fy, '#5a3a2a'); b.set(7 + k * 2, fy, '#5a3a2a');
+  b.ell(6.5, 10, 2.4, 3.4, Kh, KS); b.rect(5, 12, 4, 1, '#6a4a2a');
+  b.ell(7, 4.5, 2.2, 2.2, Sk, '#d8a47c'); b.set(8.2, 4.3, INK);
+  b.ell(6.6, 2.6, 3.4, 1.4, '#e8dcc0', '#c8b890'); b.rect(3, 3, 8, 1, '#c8b890');
+  if (pose === 'photo') { b.rect(8, 7, 3, 2, '#3a3a44'); b.set(10, 7, '#8ae0ff'); b.line(6, 8, 8, 8, Sk); }
+  else if (pose === 'wave') { b.line(8, 8, 10, 5, Kh); b.set(10, 4, Sk); }
+  else b.line(8, 8, 8 + k, 11, Kh);
+  b.rect(4, 8, 2, 4, '#8a5a3a');
+  return bake(b.outline(INK), 7, fy);
+}
+const sprCache = new Map();
+function spr(key, fn) { let s = sprCache.get(key); if (!s) { s = fn(); sprCache.set(key, s); } return s; }
+const SPECIES = {
+  brachio: { fn: brachioSpr, walk: 4, spd: 5, h: 70 },
+  trex: { fn: trexSpr, walk: 4, spd: 12, h: 44 },
+  trike: { fn: p => trikeSpr(p, false), walk: 4, spd: 7, h: 30 },
+  babytrike: { fn: p => trikeSpr(p, true), walk: 4, spd: 7, h: 18 },
+  stego: { fn: stegoSpr, walk: 4, spd: 6, h: 32 },
+  para: { fn: p => paraSpr(p, false), walk: 4, spd: 10, h: 32 },
+  babypara: { fn: p => paraSpr(p, true), walk: 4, spd: 8, h: 18 },
+  raptor: { fn: raptorSpr, walk: 4, spd: 30, h: 16 },
+  compy: { fn: compySpr, walk: 2, spd: 14, h: 7 },
+  anky: { fn: ankySpr, walk: 4, spd: 5, h: 20 },
+  pachy: { fn: pachySpr, walk: 4, spd: 10, h: 20 },
+  ovi: { fn: oviSpr, walk: 4, spd: 12, h: 16 },
+  galli: { fn: galliSpr, walk: 4, spd: 24, h: 22 },
+  ptero: { fn: pteroSpr, walk: 0, spd: 30, h: 12 },
+  plesio: { fn: plesioSpr, walk: 0, spd: 0, h: 28 },
+  human: { fn: humanSpr, walk: 2, spd: 14, h: 18 },
+};
+
+// ---------------------------------------------------------------- world + layout
+const world = { t: 0, night: 0, dusk: 0, parts: [], popups: [], ents: [], rain: 0, cloud: 0, shake: 0, lightning: 0, lava: 0.2, flash: 0, meteor: null, portal: null, eggs: [], nestMom: null };
+let HOR, LAKEX, LAKEY, LAKERX, LAKERY, VX, VTOP, NESTX, NESTY, WFX;
+let bgCanvas, frontCanvas, lakeCanvas;
+const trees = [];
+function layout() {
+  HOR = Math.round(H * 0.56);
+  LAKEX = Math.round(W * 0.55); LAKEY = Math.round(H * 0.64); LAKERX = Math.round(W * 0.2); LAKERY = Math.round(H * 0.04);
+  VX = Math.round(W * 0.8); VTOP = Math.round(H * 0.17);
+  NESTX = Math.round(W * 0.14); NESTY = Math.round(H * 0.955);
+  WFX = Math.round(W * 0.2);
+}
+const LANES = () => [Math.round(H * 0.73), Math.round(H * 0.8), Math.round(H * 0.87), Math.round(H * 0.93)];
+const onLake = (x, y) => ((x - LAKEX) / LAKERX) ** 2 + ((y - LAKEY) / (LAKERY + 2)) ** 2 < 1;
+
+function localHour() {
+  if (TIME_FORCE) { const [h, m] = TIME_FORCE.split(':').map(Number); return ((((h || 0) + (m || 0) / 60 + world.t / 3600) % 24) + 24) % 24; }
+  const d = new Date(); return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+}
+function updateLight() {
+  const h = localHour();
+  const day = smooth(5.3, 7.3, h) * (1 - smooth(18, 20, h));
+  world.night = clamp(1 - day, 0, 1);
+  world.dusk = Math.max(Math.exp(-(((h - 6.4) / 0.8) ** 2)), Math.exp(-(((h - 19) / 0.8) ** 2))) * (1 - world.cloud * 0.7);
+  world.sunP = (h - 6) / 12; world.moonP = (((h - 18) / 12) % 2 + 2) % 2;
+}
+
+// ---------------------------------------------------------------- plants
+function treeFern(x, base, h, sway) {
+  // trunk
+  for (let y = 0; y < h; y++) { const xx = x + Math.sin(y * 0.08) * 1.5; rect(xx - 1, base - y, 3, 1, y % 3 ? '#6a4a30' : '#54382a'); }
+  const tx = x + Math.sin(h * 0.08) * 1.5, ty = base - h;
+  for (let i = 0; i < 9; i++) {
+    const a = -Math.PI / 2 + (i - 4) * 0.42 + (sway || 0), len = 12 + hash(i + x) * 6;
+    for (let k = 0; k < len; k++) { const t = k / len, xx = tx + Math.cos(a) * k, yy = ty + Math.sin(a) * k + t * t * 7; px(xx, yy, t > 0.7 ? '#4a8a3a' : '#3a7a34'); if (k % 2 === 0 && k > 2) { px(xx + Math.sin(a) * 1.5, yy - Math.cos(a) * 1.5 + 1, '#5aa044'); px(xx - Math.sin(a) * 1.5, yy + Math.cos(a) * 1.5 + 1, '#2e6a2c'); } }
+  }
+}
+function cycad(x, base, s = 1) {
+  for (let y = 0; y < 6 * s; y++) rect(x - 2 * s + (y % 2), base - y, 4 * s, 1, y % 2 ? '#8a6a3a' : '#a07a44');
+  for (let i = 0; i < 7; i++) { const a = -Math.PI / 2 + (i - 3) * 0.5, len = (8 + hash(i * 3 + x) * 3) * s; for (let k = 0; k < len; k++) { const xx = x + Math.cos(a) * k, yy = base - 6 * s + Math.sin(a) * k + (k / len) ** 2 * 4 * s; px(xx, yy, '#3e7a36'); if (k % 2) { px(xx, yy - 1, '#5aa04a'); px(xx, yy + 1, '#2e5e2a'); } } }
+}
+function araucaria(x, base, h) {
+  rect(x - 1, base - h, 3, h, '#6a4a34'); rect(x - 1, base - h, 1, h, '#8a6444');
+  for (let k = 0; k < 7; k++) {
+    const y = base - h + 4 + k * (h * 0.09), w = 6 + k * 1.6 - (k > 5 ? 3 : 0);
+    for (const s of [-1, 1]) for (let i = 0; i < w; i++) { const xx = x + s * i, yy = y + i * 0.25; px(xx, yy, '#2e5a34'); px(xx, yy - 1, '#3e7040'); if (i % 2) px(xx, yy + 1, '#24482a'); }
+  }
+  ellipse(x, base - h + 2, 4, 3, '#2e5a34'); ellipse(x - 1, base - h + 1, 3, 2, '#3e7040');
+}
+function horsetails(x, base) { for (let i = 0; i < 5; i++) { const xx = x + i * 1.5 - 3, h = 6 + hash(i + x) * 6; for (let y = 0; y < h; y++) px(xx + Math.sin(y * 0.3) * 0.5, base - y, y % 3 === 0 ? '#2e5e2a' : '#5a9a44'); } }
+
+// ---------------------------------------------------------------- background bake
+function bakeBackground() {
+  bgCanvas = mk(W, H);
+  withCtx(bgCanvas, () => {
+    // far plateaus
+    for (const [c, amp, off, sc, seed] of [['#a8a8cc', 26, 22, 0.35, 1.3], ['#8e92b8', 18, 12, 0.22, 4.1]]) for (let x = 0; x < W; x++) { const top = HOR - off - amp * fbm(x / (W * sc) + seed); rect(x, top, 1, HOR - top + 1, c); }
+    // the volcano
+    const hb = W * 0.2;
+    for (let x = Math.floor(VX - hb * 1.4); x < VX + hb * 1.4; x++) {
+      const d = Math.abs(x - VX) / hb, top = VTOP + (d < 0.12 ? 1.5 : Math.pow(Math.max(0, d - 0.12), 0.8) * (HOR - VTOP) * 0.85);
+      if (top >= HOR) continue;
+      for (let y = Math.round(top); y <= HOR; y++) { const k = (y - VTOP) / (HOR - VTOP); let c = mixHex('#6a5a6e', '#8a7a86', k); if (x > VX + (y - VTOP) * 0.05) c = mixHex('#5a4a5e', '#7a6a78', k); if (hash2(x, y) < 0.12) c = mixHex(c, '#3a2e3e', 0.3); rect(x, y, 1, 1, c); }
+    }
+    // lava streaks near the rim
+    for (let i = 0; i < 4; i++) { let x = VX + rand(-4, 4), y = VTOP + 2; for (let k = 0; k < rand(8, 22); k++) { x += rand(-0.8, 0.8) + (x > VX ? 0.4 : -0.4); y += 1; px(x, y, '#c84a2a'); } }
+    world.craterY = VTOP + 1;
+    // distant jungle band
+    for (let x = 0; x < W; x++) { const top = HOR - 4 - 8 * fbm(x / 23 + 7); rect(x, top, 1, HOR - top + 2, hash(x) < 0.3 ? '#4a7a5a' : '#588a62'); }
+    for (let i = 0; i < W / 9; i++) { const x = rand(0, W); araucaria(x, HOR + 1, rand(10, 18)); }
+    // cliff + waterfall on the left
+    const cx0 = 0, cx1 = W * 0.28, ct = H * 0.3;
+    for (let x = cx0; x < cx1; x++) { const k = x / cx1, top = ct + (k > 0.6 ? (k - 0.6) * 2.5 * (HOR - ct) : 0) + fbm(x * 0.2) * 6; for (let y = Math.round(top); y < HOR + 6; y++) { let c = (y - top) < 3 ? '#5a8a44' : mixHex('#8a6a54', '#6a4e40', vnoise2(x * 0.15, y * 0.08)); if ((y - top) > 3 && hash2(x, y) < 0.07) c = '#5a4234'; if ((y - top) > 3 && Math.floor(y * 0.7 + x * 0.1) % 7 === 0) c = mixHex(c, '#4a3428', 0.4); rect(x, y, 1, 1, c); } }
+    for (let i = 0; i < 12; i++) { const x = rand(0, cx1 * 0.7); cycad(x, ct + fbm(x * 0.2) * 6 + 2, 0.7); }
+    world.wfTop = ct + fbm(WFX * 0.2) * 6 + 2;
+    // valley floor
+    for (let y = HOR; y < H; y++) for (let x = 0; x < W; x++) {
+      const k = (y - HOR) / (H - HOR), n = vnoise2(x * 0.05, y * 0.12), f = hash2(x, y);
+      let c = mixRgb([118, 160, 78], [92, 136, 58], k * 0.6 + n * 0.4);
+      if (f < 0.06) c = mixRgb(c, [70, 110, 44], 0.6); else if (f > 0.95) c = mixRgb(c, [170, 200, 110], 0.5);
+      if (vnoise2(x * 0.03 + 50, y * 0.08) > 0.72) c = mixRgb(c, [160, 130, 90], 0.45);   // bare earth patches
+      ctx.fillStyle = rgbStr(c); ctx.fillRect(x, y, 1, 1);
+    }
+    // river from the waterfall to the lake
+    let rx = WFX, ry = HOR + 2;
+    while (ry < LAKEY && rx < LAKEX - LAKERX + 6) { const w = 3 + (ry - HOR) * 0.08; ellipse(rx, ry, w, 1.5, '#4a8ab0'); rx += 1.3; ry += 0.28 + Math.sin(rx * 0.05) * 0.2; }
+    world.river = { x0: WFX, y0: HOR + 2, x1: rx, y1: ry };
+    // lake (drawn live over this) banks
+    ellipse(LAKEX, LAKEY + 1, LAKERX + 3, LAKERY + 2, '#8a7a50');
+    // mid trees
+    trees.length = 0;
+    for (const [fx, kind, hgt] of [[0.33, 'arau', 0.46], [0.93, 'arau', 0.5], [0.44, 'fern', 0.13], [0.72, 'fern', 0.15], [0.05, 'fern', 0.14], [0.62, 'cycad', 0], [0.27, 'cycad', 0], [0.85, 'fern', 0.12]]) {
+      const x = Math.round(W * fx), base = HOR + 8 + (kind === 'arau' ? 4 : 0);
+      trees.push({ x, base, kind, h: Math.round(H * hgt), top: base - Math.round(H * hgt) });
+      if (kind === 'arau') araucaria(x, base, Math.round(H * hgt));
+      else if (kind === 'fern') treeFern(x, base, Math.round(H * hgt));
+      else cycad(x, base, 1.1);
+    }
+    for (let i = 0; i < W / 40; i++) { const x = LAKEX + rand(-LAKERX * 1.1, LAKERX * 1.1); horsetails(x, LAKEY + rand(-LAKERY - 2, LAKERY + 4)); }
+    for (let i = 0; i < W / 30; i++) cycad(rand(0, W), rand(HOR + 10, H * 0.78), rand(0.5, 0.8));
+    for (let i = 0; i < W / 16; i++) { const x = rand(0, W), y = rand(HOR + 10, H * 0.9); ellipse(x, y, rand(2, 4), rand(1, 2), '#8a8478'); px(x - 1, y - 1, '#b0aa9c'); }
+  });
+  // lake surface
+  lakeCanvas = mk(LAKERX * 2 + 2, LAKERY * 2 + 2);
+  withCtx(lakeCanvas, () => { for (let y = -LAKERY; y <= LAKERY; y++) { const w = Math.round(LAKERX * Math.sqrt(1 - (y * y) / (LAKERY * LAKERY))); rect(LAKERX + 1 - w, LAKERY + 1 + y, w * 2 + 1, 1, mixHex('#5a9ac0', '#3a78a0', (y + LAKERY) / (2 * LAKERY))); } });
+  // foreground ferns (drawn over everything at the edges)
+  frontCanvas = mk(W, H);
+  withCtx(frontCanvas, () => {
+    const clump = (x, y, n, s) => { for (let i = 0; i < n; i++) { const a = -Math.PI / 2 + (i - n / 2) * 0.35, len = (18 + hash(i * 5 + x) * 12) * s; for (let k = 0; k < len; k++) { const t = k / len, xx = x + Math.cos(a) * k, yy = y + Math.sin(a) * k + t * t * 16 * s; px(xx, yy, '#2e6a2a'); if (k % 2 === 0) { px(xx + 1.5, yy + 1, '#4a9a3a'); px(xx - 1.5, yy + 1, '#3a8034'); } } } };
+    clump(-4, H + 6, 9, 1.2); clump(W * 0.04, H + 8, 7, 1); clump(W + 4, H + 6, 9, 1.2); clump(W * 0.96, H + 8, 7, 1);
+  });
+}
+function drawVolcanoSmoke() {
+  // lazy plume from the crater, bigger during rumbles
+  const n = 14;
+  for (let i = 0; i < n; i++) {
+    const k = ((world.t * 0.04 + i / n) % 1), r = 2 + k * 14 * (1 + world.lava * 0.6), x = VX + Math.sin(k * 5 + i) * 3 + k * 40 * (0.6 + Math.sin(world.t * 0.02) * 0.3), y = world.craterY - k * H * 0.28;
+    ctx.globalAlpha = (1 - k) * 0.55; disc(x, y, r, world.night > 0.5 ? '#4a4050' : mixHex('#9a9098', '#c8c0c0', k)); ctx.globalAlpha = 1;
+  }
+}
+
+// ---------------------------------------------------------------- creatures
+class Dino {
+  constructor(sp, o = {}) {
+    Object.assign(this, { sp, x: 0, y: LANES()[1], f: 1, pose: 'stand', anim: rand(0, 5), emotes: [], brain: null, dead: false, walking: false, running: false, alpha: 1, hop: 0, layer: 'ground', busy: false }, o);
+    this.spd = this.spd || SPECIES[sp].spd;
+  }
+  emote(n, d = 2) { this.emotes.push({ name: n, t: 0, dur: d }); }
+  update(dt) {
+    this.anim += dt; for (const m of this.emotes) m.t += dt; this.emotes = this.emotes.filter(m => m.t < m.dur);
+    if (this.brain) { let r; try { r = this.brain.next(dt); } catch (e) { console.error(this.sp, e); r = { done: true }; } if (r.done) this.brain = null; }
+  }
+  sprite() {
+    let p = this.pose; const S = SPECIES[this.sp];
+    if (this.walking && S.walk) { const rate = this.running ? 10 : Math.max(3, this.spd * 0.9); const n = this.running && S.walk === 4 ? 2 : S.walk; p = (this.running && S.walk === 4 ? 'run' : 'walk') + (Math.floor(this.anim * rate) % n + 1); }
+    if (this.sp === 'ptero' && !this.perched) p = this.pose === 'glide' ? 'glide' : (Math.floor(this.anim * 5) % 2 ? 'flap1' : 'flap2');
+    return spr(this.sp + p, () => S.fn(p));
+  }
+  draw() {
+    const s = this.sprite();
+    if (this.layer === 'ground' && this.sp !== 'ptero') ellipse(this.x, this.y, s.w * 0.33, 1.4, 'rgba(20,30,10,0.25)');
+    drawSpr(s, this.x, this.y - this.hop, this.f, this.alpha);
+  }
+  drawEmotes() { const s = this.sprite(), up = this.pose === 'sleep' ? 0.45 : this.pose === 'drink' || this.pose === 'eat' ? 0.7 : 0.9; for (const m of this.emotes) { const k = m.t / m.dur; if (k > 0.75 && Math.floor(world.t * 12) % 2) continue; drawSpr(ICONS[m.name], this.x + this.f * s.w * 0.2, this.y - this.hop - s.ay * up - Math.min(1, k * 3) * 4, 1); } }
+}
+function* walkTo(a, tx, ty, spd, run) {
+  a.walking = true; a.running = !!run;
+  const sp = spd || a.spd;
+  while (true) {
+    const dt = yield, dx = tx - a.x, dy = (ty == null ? a.y : ty) - a.y, d = Math.hypot(dx, dy);
+    if (d < 0.6) break;
+    if (Math.abs(dx) > 0.5) a.f = Math.sign(dx);
+    const s = Math.min(d, sp * dt); a.x += dx / d * s; a.y += dy / d * s;
+  }
+  a.walking = false; a.running = false;
+}
+function* flyTo(a, tx, ty, spd) { while (Math.hypot(tx - a.x, ty - a.y) > 1) { const dt = yield, dx = tx - a.x, dy = ty - a.y, d = Math.hypot(dx, dy), s = Math.min(d, spd * dt); if (Math.abs(dx) > 0.3) a.f = Math.sign(dx); a.x += dx / d * s; a.y += dy / d * s; a.pose = dy > 2 && d > 20 ? 'glide' : 'flap'; } }
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+function* all(...gens) { const gs = gens.map(g => ({ g, done: false })); while (gs.some(x => !x.done)) { const dt = yield; for (const x of gs) if (!x.done) x.done = x.g.next(dt).done; } }
+function* hopArc(a, h, dur) { let t = 0; while (t < dur) { t += yield; a.hop = Math.sin(Math.PI * clamp(t / dur, 0, 1)) * h; } a.hop = 0; }
+
+// resident herd: brachios, triceratops family, compys, pterosaurs
+const res = { brachios: [], trikes: [], compys: [], pteros: [] };
+function residentBrain(a) {
+  return (function* () {
+    while (true) {
+      if (world.night > 0.6 && a.sp !== 'compy') { a.walking = false; a.pose = 'sleep'; while (world.night > 0.55) { yield; if (chance(0.004)) a.emote('z', 2.5); } a.pose = 'stand'; }
+      const r = Math.random();
+      if (a.sp === 'brachio') {
+        if (r < 0.45) { const t = pick(trees.filter(t => t.kind === 'arau')); if (t) { yield* walkTo(a, t.x + (a.x < t.x ? -30 : 30), a.y); a.f = t.x > a.x ? 1 : -1; for (let i = 0; i < randi(3, 6); i++) { a.pose = 'eat'; yield* wait(1.2); a.pose = 'eat2'; yield* wait(0.9); if (chance(0.3)) addLeafBurst(t.x, t.top + 8); } a.pose = 'stand'; } }
+        else if (r < 0.6) { a.pose = 'call'; a.emote('note', 2); yield* wait(2); a.pose = 'stand'; }
+        else yield* walkTo(a, clamp(a.x + rand(-80, 80), W * 0.08, W * 0.92), a.y);
+        yield* wait(rand(3, 8));
+      } else if (a.sp === 'trike' || a.sp === 'babytrike') {
+        if (a.follow) { const m = a.follow; if (Math.abs(a.x - (m.x - m.f * 18)) > 6) yield* walkTo(a, m.x - m.f * 18 + rand(-4, 4), m.y + 6); a.pose = chance(0.5) ? 'eat' : 'stand'; yield* wait(rand(1, 3)); if (chance(0.08)) { a.emote('heart', 2); } continue; }
+        if (r < 0.6) { a.pose = 'eat'; yield* wait(rand(3, 7)); a.pose = 'stand'; yield* wait(rand(1, 3)); }
+        else yield* walkTo(a, clamp(a.x + rand(-50, 50), W * 0.05, W * 0.95), a.y);
+      } else if (a.sp === 'compy') {
+        yield* walkTo(a, clamp(a.x + rand(-40, 40), 4, W - 4), clamp(a.y + rand(-8, 8), HOR + 20, H - 6), 20);
+        a.pose = 'stand'; yield* wait(rand(0.3, 2));
+        if (chance(0.1)) { a.hop = 0; yield* hopArc(a, 3, 0.3); }
+      } else yield* wait(1);
+    }
+  })();
+}
+function makeResidents() {
+  world.ents = [];
+  const L = LANES();
+  const nB = HERD === 'few' ? 1 : HERD === 'many' ? 3 : 2;
+  res.brachios = Array.from({ length: nB }, (_, i) => new Dino('brachio', { x: W * (0.3 + i * 0.35), y: L[0] + i * 3, f: chance(0.5) ? 1 : -1 }));
+  const mom = new Dino('trike', { x: W * 0.62, y: L[2], f: -1 });
+  res.trikes = [mom, new Dino('babytrike', { x: W * 0.68, y: L[2] + 6, f: -1, follow: mom })];
+  if (HERD === 'many') res.trikes.push(new Dino('trike', { x: W * 0.25, y: L[1], f: 1 }));
+  res.compys = Array.from({ length: HERD === 'few' ? 2 : 4 }, () => new Dino('compy', { x: rand(0, W), y: rand(L[1], H - 8) }));
+  res.pteros = Array.from({ length: HERD === 'few' ? 1 : 2 }, (_, i) => new Dino('ptero', { x: rand(0, W), y: rand(H * 0.1, H * 0.35), layer: 'sky', circ: { cx: rand(W * 0.3, W * 0.7), cy: rand(H * 0.12, H * 0.3), r: rand(40, 80), a: rand(0, TAU), s: rand(0.15, 0.25) * (chance(0.5) ? 1 : -1) } }));
+  for (const a of [...res.brachios, ...res.trikes, ...res.compys]) { a.brain = residentBrain(a); world.ents.push(a); }
+  for (const p of res.pteros) world.ents.push(p);
+  // the nest
+  world.eggs = Array.from({ length: 4 }, (_, i) => ({ x: NESTX - 5 + i * 3.5, y: NESTY - 2 - (i % 2), crack: 0, hatched: false }));
+}
+function updatePteros(dt) {
+  for (const p of res.pteros) {
+    if (p.brain || p.scripted) continue;
+    if (world.night > 0.65) {   // roost on a monkey-puzzle tree for the night
+      const ar = trees.filter(t => t.kind === 'arau'), t = ar[res.pteros.indexOf(p) % Math.max(1, ar.length)];
+      if (t) { const tx = t.x + (res.pteros.indexOf(p) % 2 ? 4 : -4), ty = t.top + 3, d = Math.hypot(tx - p.x, ty - p.y);
+        if (d > 1) { const sp = Math.min(d, 24 * dt); p.x += (tx - p.x) / d * sp; p.y += (ty - p.y) / d * sp; p.f = Math.sign(tx - p.x) || p.f; p.perched = false; p.pose = 'flap'; }
+        else { p.perched = true; p.pose = 'perch'; if (chance(dt * 0.1)) p.emote('z', 2); }
+        continue; }
+    }
+    if (p.perched) { p.perched = false; p.circ.a = 0; p.circ.cx = p.x - p.circ.r; }
+    const c = p.circ; c.a += c.s * dt;
+    if (Math.hypot(c.cx + Math.cos(c.a) * c.r - p.x, c.cy + Math.sin(c.a * 2) * 10 - p.y) > 3) { const tx = c.cx + Math.cos(c.a) * c.r, ty = c.cy + Math.sin(c.a * 2) * 10, d = Math.hypot(tx - p.x, ty - p.y), sp = Math.min(d, 30 * dt); p.x += (tx - p.x) / d * sp; p.y += (ty - p.y) / d * sp; p.f = Math.sign(tx - p.x) || p.f; continue; }
+    const tx = c.cx + Math.cos(c.a) * c.r, ty = c.cy + Math.sin(c.a * 2) * 10;
+    p.f = Math.sign(-Math.sin(c.a) * c.s) || p.f; p.x = tx; p.y = ty;
+    p.pose = Math.sin(c.a * 3) > 0.3 ? 'glide' : 'flap';
+  }
+}
+function addLeafBurst(x, y) { for (let i = 0; i < 5; i++) addPart(x + rand(-6, 6), y + rand(-3, 3), rand(-6, 6), rand(4, 10), 2, pick(['#3e7040', '#5a9a4a']), { grav: 10 }); }
+
+// ---------------------------------------------------------------- particles
+function addPart(x, y, vx, vy, life, col, o = {}) { if (world.parts.length > 700) world.parts.splice(0, 80); world.parts.push(Object.assign({ x, y, vx, vy, life, max: life, col, grav: 0 }, o)); }
+function addPopup(str, x, y, col = '#fffbe8') { world.popups.push({ str, x, y, t: 0, col }); }
+const glowQ = [];
+function glowAt(x, y, r, col, a, always) { glowQ.push([x, y, r, col, a, always]); }
+function flushGlows() {
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const [x, y, r, col, a, always] of glowQ) { const k = always ? 1 : clamp(world.night * 1.3, 0, 1); if (a * k < 0.02) continue; const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, col); g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.globalAlpha = clamp(a * k, 0, 1); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2); }
+  ctx.restore(); glowQ.length = 0;
+}
+
+// ---------------------------------------------------------------- events
+const evActors = [];
+function spawn(a) { world.ents.push(a); evActors.push(a); return a; }
+const edgeX = (side, m = 40) => side < 0 ? -m : W + m;
+function* evHatch() {
+  const L = LANES();
+  const mom = spawn(new Dino('para', { x: -30, y: L[3] - 2 }));
+  yield* walkTo(mom, NESTX + 26, L[3] - 2);
+  mom.f = -1; mom.pose = 'eat'; yield* wait(1.5); mom.pose = 'stand'; mom.emote('heart', 2);
+  const babies = [];
+  for (const [i, e] of world.eggs.entries()) {
+    if (e.hatched) continue;
+    let t = 0; while (t < 1.4) { const dt = yield; t += dt; e.crack = t / 1.4; e.wob = Math.sin(t * 30) * (t > 0.6 ? 1 : 0); }
+    e.hatched = true; e.crack = 0;
+    for (let k = 0; k < 6; k++) addPart(e.x, e.y - 2, rand(-10, 10), rand(-20, -8), 0.6, '#f4ecd8', { grav: 60 });
+    const b = spawn(new Dino('babypara', { x: e.x, y: NESTY + 1, f: 1, pose: 'stand' }));
+    b.emote(i % 2 ? 'heart' : 'sparkle', 1.5); babies.push(b);
+    yield* wait(0.6);
+  }
+  mom.pose = 'call'; mom.emote('note', 2); addPopup('HONK', mom.x - 6, mom.y - 36, '#fff4c0'); yield* wait(2); mom.pose = 'stand';
+  mom.brain = walkTo(mom, W + 40, L[3] - 2, 6);
+  babies.forEach((b, i) => { b.brain = (function* () { yield* wait(0.4 + i * 0.3); yield* walkTo(b, W + 40 + i * 10, L[3] + 2 + (i % 2) * 3, 6.5); })(); });
+  yield* until(() => !mom.brain, 90);
+  yield* wait(3);
+  for (const e of world.eggs) { e.hatched = false; e.crack = 0; }
+}
+function* evRaptors() {
+  const L = LANES(), dir = chance(0.5) ? 1 : -1;
+  const herd = Array.from({ length: 5 }, (_, i) => spawn(new Dino('galli', { x: edgeX(-dir, 30 + i * 18), y: pick(L.slice(1)) + rand(-3, 3), f: dir })));
+  const pack = Array.from({ length: 3 }, (_, i) => spawn(new Dino('raptor', { x: edgeX(-dir, 170 + i * 16), y: pick(L.slice(1)) + rand(-2, 2), f: dir })));
+  for (const g of herd) g.brain = walkTo(g, edgeX(dir, 50), g.y, rand(26, 32), true);
+  for (const r of pack) r.brain = walkTo(r, edgeX(dir, 50), r.y, rand(30, 36), true);
+  // everyone else looks
+  for (const a of res.trikes) if (!a.follow) a.emote('bang', 1.5);
+  yield* until(() => pack.every(r => !r.brain), 40);
+  // one raptor comes back for a sniff and gets chased off by the triceratops mom
+  const r = pack[0]; r.x = edgeX(dir, 30); r.f = -dir;
+  const mom = res.trikes[0];
+  yield* walkTo(r, W / 2 + dir * 30, L[2], 18);
+  r.pose = 'stand'; r.emote('q', 1.5); yield* wait(1.5);
+  if (mom && !mom.busy) {
+    mom.busy = true; const oldBrain = mom.brain; mom.brain = null;
+    mom.emote('anger', 2); mom.f = Math.sign(r.x - mom.x) || 1; yield* wait(0.8);
+    r.emote('bang', 1); r.brain = walkTo(r, edgeX(-mom.f, 60), r.y, 36, true);
+    yield* walkTo(mom, clamp(r.x, 20, W - 20), mom.y, 18, true);
+    mom.pose = 'stand'; mom.emote('sparkle', 2); yield* wait(2);
+    mom.busy = false; mom.brain = residentBrain(mom);
+  } else { r.brain = walkTo(r, edgeX(dir, 60), r.y, 34, true); }
+  yield* until(() => !r.brain, 20);
+}
+function* evStampede() {
+  const L = LANES(), dir = chance(0.5) ? 1 : -1;
+  const herd = Array.from({ length: 6 }, (_, i) => spawn(new Dino('para', { x: edgeX(-dir, 40 + i * 26 + rand(0, 10)), y: L[1] + (i % 3) * 5 + rand(-2, 2), f: dir })));
+  for (const [i, p] of herd.entries()) p.brain = (function* () { yield* walkTo(p, W / 2 - dir * 20 + i * 12 * dir, p.y, 20, true); if (i === 1) { p.pose = 'call'; addPopup('HONK', p.x - 6, p.y - 36, '#fff4c0'); p.emote('note', 1.5); yield* wait(1.2); } yield* walkTo(p, edgeX(dir, 60), p.y, 20, true); })();
+  let t = 0; while (herd.some(p => p.brain) && t < 40) { const dt = yield; t += dt; world.shake = Math.max(world.shake, 0.12); if (chance(dt * 6)) { const p = pick(herd); addPart(p.x - p.f * 8, p.y, -p.f * rand(4, 10), rand(-6, -2), 0.8, '#b8a078', { dust: true }); } }
+}
+function* evDrink() {
+  const bs = res.brachios.filter(b => !b.busy); if (!bs.length) { yield* wait(1); return; }
+  for (const b of bs) { b.busy = true; b.brain = null; }
+  yield* all(...bs.map((b, i) => (function* () { const tx = LAKEX + (i - (bs.length - 1) / 2) * 50 - 30; yield* walkTo(b, tx, LANES()[0] + i * 3); b.f = 1; b.pose = 'drink'; for (let k = 0; k < 8; k++) { yield* wait(1.2); addRipple(b.x + 34, LAKEY); } b.pose = 'stand'; if (i === 0) { b.emote('heart', 2); } yield* wait(1); })()));
+  for (const b of bs) { b.busy = false; b.brain = residentBrain(b); }
+}
+const ripples = [];
+function addRipple(x, y) { ripples.push({ x, y, r: 1, max: rand(6, 10) }); }
+function* evFish() {
+  const p = res.pteros[0] || spawn(new Dino('ptero', { x: -30, y: H * 0.2, layer: 'sky' }));
+  p.scripted = true;
+  const fx = LAKEX + rand(-LAKERX * 0.6, LAKERX * 0.6), fy = LAKEY;
+  yield* flyTo(p, fx - 40 * (p.x < fx ? 1 : -1), H * 0.25, 30);
+  p.brain = null;
+  yield* flyTo(p, fx, fy - 4, 55);
+  for (let i = 0; i < 10; i++) addPart(fx, fy - 1, rand(-14, 14), rand(-30, -10), 0.6, '#c8e8f8', { grav: 90 }); addRipple(fx, fy);
+  p.fish = true;
+  yield* flyTo(p, fx + 40 * p.f, H * 0.3, 34);
+  yield* flyTo(p, clamp(p.x + 60 * p.f, 20, W - 20), H * 0.2, 28);
+  p.fish = false; p.emote('heart', 1.5);
+  if (p.circ) { p.circ.a = 0; p.circ.cx = p.x - p.circ.r; p.circ.cy = p.y; }
+  p.scripted = false;
+}
+function* evHeadbutt() {
+  const L = LANES(), y = L[2] - 2;
+  const a = spawn(new Dino('pachy', { x: -20, y, f: 1 })), b = spawn(new Dino('pachy', { x: W + 20, y, f: -1 }));
+  yield* all(walkTo(a, W / 2 - 24, y), walkTo(b, W / 2 + 24, y));
+  a.f = 1; b.f = -1;
+  a.emote('anger', 1.5); b.emote('anger', 1.5); yield* wait(1.5);
+  for (let i = 0; i < 3; i++) {
+    a.pose = b.pose = 'charge';
+    yield* all(walkTo(a, W / 2 - 6, y, 26, true), walkTo(b, W / 2 + 6, y, 26, true));
+    a.f = 1; b.f = -1; a.pose = b.pose = 'charge';
+    addPopup('BONK', W / 2 - 8, y - 26, '#ffffff'); world.shake = 0.3;
+    for (let k = 0; k < 6; k++) addPart(W / 2, y - 12, rand(-20, 20), rand(-20, -5), 0.4, '#ffe080');
+    yield* all(hopArc(a, 3, 0.3), hopArc(b, 3, 0.3));
+    a.x -= 3; b.x += 3; yield* wait(0.3);
+    yield* all(walkTo(a, W / 2 - 24, y, 12), walkTo(b, W / 2 + 24, y, 12)); a.f = 1; b.f = -1; a.pose = b.pose = 'stand';
+    yield* wait(0.7);
+  }
+  const loser = chance(0.5) ? a : b, win = loser === a ? b : a;
+  loser.emote('swirl', 2); win.emote('sparkle', 2); yield* wait(2);
+  loser.brain = walkTo(loser, edgeX(loser === a ? -1 : 1, 40), y, 14);
+  yield* wait(1.5);
+  win.brain = walkTo(win, edgeX(win === a ? -1 : 1, 40), y, 9);
+  yield* until(() => !loser.brain && !win.brain, 40);
+}
+function* evThief() {
+  const L = LANES();
+  const ov = spawn(new Dino('ovi', { x: -20, y: L[3] + 2, f: 1 }));
+  const e = world.eggs.find(q => !q.hatched && !q.stolen);
+  if (!e) { ov.dead = true; yield* wait(1); return; }
+  yield* walkTo(ov, e.x - 6, L[3] + 2, 8);
+  ov.pose = 'stand'; ov.emote('sparkle', 1.2); yield* wait(1);
+  e.stolen = true; ov.pose = 'carry';
+  const mom = spawn(new Dino('para', { x: W + 30, y: L[3] - 2, f: -1 }));
+  yield* wait(0.5);
+  mom.emote('bang', 1.5); addPopup('HONK!', W - 50, L[3] - 40, '#fff4c0');
+  ov.emote('bang', 1); ov.f = 1;
+  ov.brain = walkTo(ov, W * 0.45, L[3] + 2, 22, true); mom.brain = walkTo(mom, W * 0.55, L[3] - 2, 24, true);
+  yield* until(() => !ov.brain, 15);
+  // cornered: drops the egg (it rolls back into the nest) and flees
+  ov.pose = 'stand'; ov.f = -1; ov.emote('sweat', 1.5); yield* wait(0.8);
+  e.stolen = false; e.rolling = { x: ov.x, t: 0 };
+  ov.brain = walkTo(ov, -40, L[3] + 4, 26, true);
+  yield* until(() => !mom.brain, 10);
+  mom.pose = 'call'; mom.emote('anger', 1.5); yield* wait(1.5); mom.pose = 'stand';
+  yield* walkTo(mom, NESTX + 24, L[3] - 2, 12); mom.f = -1; mom.pose = 'eat'; yield* wait(2); mom.pose = 'stand'; mom.emote('heart', 2); yield* wait(2);
+  mom.brain = walkTo(mom, W + 40, L[3] - 2, 9);
+  yield* until(() => !mom.brain && !ov.brain, 40);
+}
+function* evRain() {
+  let t = 0; const dur = rand(40, 60);
+  while (t < dur) {
+    const dt = yield; t += dt;
+    const k = smooth(0, 6, t) * (1 - smooth(dur - 6, dur, t));
+    world.cloud = k; world.rain = k;
+    if (k > 0.6 && chance(dt / 7)) { world.lightning = 1; world.boltX = rand(W * 0.1, W * 0.9); world.boltT = 0.25; world.thunder = 1.2; }
+    if (world.thunder > 0) { world.thunder -= dt; if (world.thunder < 0.6 && world.thunder + dt >= 0.6) { addPopup('RUMBLE', W / 2 - 12, H * 0.2, '#e0e8ff'); for (const a of world.ents) if (a.layer === 'ground' && chance(0.4)) a.emote('bang', 1); } }
+  }
+  world.cloud = 0; world.rain = 0;
+  if (world.night < 0.5) world.rainbow = 1;
+}
+function* evRumble() {
+  let t = 0;
+  addPopup('RUMBLE', VX - 12, VTOP - 12, '#ffd0a0');
+  while (t < 10) { const dt = yield; t += dt; world.lava = 0.2 + smooth(0, 2, t) * (1 - smooth(7, 10, t)) * 0.8; world.shake = Math.max(world.shake, 0.15 * world.lava); if (chance(dt * 3)) addPart(VX + rand(-3, 3), world.craterY, rand(-8, 8), rand(-30, -14), 1.5, '#ffb050', { grav: 20 }); }
+  for (const a of world.ents) if (a.layer === 'ground' && chance(0.5)) { a.emote('q', 1.5); a.f = VX > a.x ? 1 : -1; }
+  world.lava = 0.2; yield* wait(2);
+}
+function* evStego() {
+  const L = LANES(), dir = chance(0.5) ? 1 : -1;
+  const s = spawn(new Dino('stego', { x: edgeX(-dir, 40), y: L[1] + 4, f: dir }));
+  const t = trees.filter(q => q.kind === 'fern' || q.kind === 'cycad').sort((a, b) => Math.abs(a.x - W / 2) - Math.abs(b.x - W / 2))[0];
+  yield* walkTo(s, t ? t.x - dir * 14 : W / 2, s.y);
+  // scratches its back on the tree
+  for (let i = 0; i < 6; i++) { s.hop = i % 2 ? 1 : 0; yield* wait(0.3); if (i % 2) addLeafBurst(t ? t.x : W / 2, t ? t.top : H * 0.5); }
+  s.hop = 0; s.emote('heart', 2); yield* wait(1.5);
+  s.pose = 'eat'; yield* wait(3); s.pose = 'stand';
+  yield* walkTo(s, edgeX(dir, 50), s.y);
+}
+function* evAnky() {
+  const L = LANES(), dir = chance(0.5) ? 1 : -1;
+  const a = spawn(new Dino('anky', { x: edgeX(-dir, 40), y: L[2] + 4, f: dir }));
+  yield* walkTo(a, W / 2, a.y);
+  a.pose = 'stand'; yield* wait(1);
+  const r = spawn(new Dino('raptor', { x: edgeX(-dir, 20), y: a.y - 1, f: dir }));
+  yield* walkTo(r, a.x - dir * 30, r.y, 30, true);
+  r.pose = 'stand'; r.emote('q', 1); yield* wait(1);
+  yield* walkTo(r, a.x - dir * 22, r.y, 12);
+  a.emote('anger', 1.2); yield* wait(0.5);
+  for (let i = 0; i < 3; i++) { a.pose = 'swing'; yield* wait(0.2); a.pose = 'swing2'; yield* wait(0.2); }
+  addPopup('THWACK', r.x - 10, r.y - 24, '#ffffff'); world.shake = 0.3;
+  r.emote('swirl', 1.5);
+  r.brain = (function* () { yield* hopArc(r, 10, 0.6); yield* walkTo(r, edgeX(-dir, 60), r.y, 36, true); })();
+  a.pose = 'stand'; yield* wait(1.5); a.emote('dots', 2); yield* wait(2);
+  yield* walkTo(a, edgeX(dir, 50), a.y);
+}
+function* evTrex() {
+  const L = LANES(), dir = chance(0.5) ? 1 : -1;
+  let t = 0;
+  // footsteps first
+  for (let i = 0; i < 4; i++) { world.shake = 0.35; addPopup('BOOM', edgeX(-dir, -30), H * 0.72, '#ffd0a0'); yield* wait(1.1); }
+  const tx = spawn(new Dino('trex', { x: edgeX(-dir, 50), y: L[2], f: dir }));
+  tx.brain = (function* () { while (true) { yield* wait(0.9); if (tx.walking) world.shake = Math.max(world.shake, 0.2); } })();
+  const step = walkTo(tx, W * 0.5 - dir * W * 0.12, L[2], 17);
+  let r, noticed = false, tt = 0; do { const dt = yield; tt += dt; r = step.next(dt); if (tx.walking && Math.floor(tx.anim * 2) !== tx.lastStep) { tx.lastStep = Math.floor(tx.anim * 2); world.shake = Math.max(world.shake, 0.2); }
+    if (!noticed && tt > 2) { noticed = true; for (const a of world.ents) if (a !== tx && a.layer === 'ground' && !a.dead) { a.emote('q', 1.5); a.f = Math.sign(tx.x - a.x) || 1; } } } while (!r.done);
+  tx.pose = 'roar'; addPopup('ROAAAR', tx.x - 12, tx.y - 52, '#ffffff'); world.shake = 0.8;
+  for (const a of world.ents) if (a !== tx && a.layer === 'ground') { a.emote('bang', 1.5); }
+  // everyone flees
+  const fleeing = world.ents.filter(a => a !== tx && a.layer === 'ground' && !a.dead);
+  for (const a of fleeing) { a.busy = true; a.brain = (function* () { yield* wait(rand(0.2, 0.8)); const side = a.x < tx.x ? -1 : 1; yield* walkTo(a, side < 0 ? -60 : W + 60, a.y, Math.max(a.spd * 2.5, 20), true); a.hidden = true; })(); }
+  yield* wait(2.5);
+  tx.pose = 'stand'; yield* wait(1);
+  // it spots something tasty... a tiny compy on a rock, just out of reach of those arms
+  tx.pose = 'sniff'; tx.emote('q', 2); yield* wait(2.5);
+  tx.pose = 'stand';
+  if (chance(0.5)) {
+    // trips over its own tail while turning around
+    tx.emote('sweat', 1); yield* wait(0.6); tx.pose = 'trip'; world.shake = 0.6; addPopup('THUD', tx.x - 8, tx.y - 20, '#ffffff'); yield* wait(2.5); tx.emote('dots', 2); yield* wait(2); tx.pose = 'stand';
+  } else { tx.pose = 'roar'; addPopup('rawr', tx.x - 8, tx.y - 52, '#ffffff'); yield* wait(1.5); tx.pose = 'stand'; }
+  tx.brain = null;
+  yield* walkTo(tx, edgeX(dir, 70), L[2], 10);
+  tx.dead = true;
+  // the herd drifts back
+  for (const a of fleeing) { a.hidden = false; a.x = a.x < W / 2 ? -40 : W + 40; a.brain = (function* () { yield* walkTo(a, clamp(rand(W * 0.1, W * 0.9), 10, W - 10), a.y, a.spd); a.busy = false; a.brain = null; })(); }
+  yield* wait(4);
+}
+function* evEruption() {
+  let t = 0;
+  addPopup('KABOOM', VX - 12, VTOP - 20, '#ffe0a0');
+  while (t < 26) {
+    const dt = yield; t += dt;
+    world.lava = 0.2 + smooth(0, 1.5, t) * (1 - smooth(20, 26, t)) * 1.6;
+    world.shake = Math.max(world.shake, t < 3 ? 0.6 : 0.12);
+    if (t < 20) for (let i = 0; i < dt * 30; i++) addPart(VX + rand(-3, 3), world.craterY, rand(-30, 30), rand(-90, -40), rand(1.5, 3), pick(['#ffd060', '#ff8030', '#ff5020', '#ffe0a0']), { grav: 50, lava: true });
+    if (t < 20 && chance(dt * 0.8)) addPart(VX, world.craterY, rand(-50, 50), rand(-110, -70), 3, '#ff6a30', { grav: 50, bomb: true, trail: true });
+    world.ash = smooth(2, 8, t) * (1 - smooth(20, 26, t));
+  }
+  for (const a of world.ents) if (a.layer === 'ground' && chance(0.6)) a.emote('sweat', 1.5);
+  world.lava = 0.2; world.ash = 0;
+}
+function* evMeteor() {
+  world.meteor = { x: -30, y: H * 0.05, vx: W / 7, vy: H * 0.04, t: 0 };
+  for (const a of world.ents) if (a.layer === 'ground') a.pose = a.pose === 'sleep' ? 'sleep' : 'stand';
+  let t = 0;
+  while (t < 9) { const dt = yield; t += dt; const m = world.meteor; m.x += m.vx * dt; m.y += m.vy * dt; m.t = t; for (let i = 0; i < 4; i++) addPart(m.x - rand(0, 4), m.y + rand(-1, 1), rand(-10, 0), rand(-2, 2), rand(0.6, 1.4), pick(['#ffe0a0', '#ffa050', '#ffffff']), { glow: true }); if (t > 1.5 && t < 1.6) for (const a of world.ents) if (a.layer === 'ground' && a.pose !== 'sleep') { a.emote('q', 2.5); if (a.sp === 'brachio' || a.sp === 'para') a.pose = 'call'; } }
+  world.meteor = null;
+  for (const a of world.ents) if (a.layer === 'ground' && a.pose === 'call') a.pose = 'stand';
+  yield* wait(2);
+}
+function* evTraveler() {
+  const L = LANES(), y = L[3];
+  world.portal = { x: W * 0.72, y: y - 10, r: 0 };
+  let t = 0; while (t < 1.5) { const dt = yield; t += dt; world.portal.r = smooth(0, 1.5, t) * 11; }
+  const h = spawn(new Dino('human', { x: world.portal.x, y, f: -1 }));
+  h.alpha = 0; t = 0; while (t < 0.6) { const dt = yield; t += dt; h.alpha = t / 0.6; }
+  h.alpha = 1; h.emote('sparkle', 1.5);
+  yield* walkTo(h, W * 0.55, y, 10);
+  h.pose = 'stand'; h.emote('bang', 1.5); yield* wait(1.5);
+  // photographs whoever is nearest
+  const subj = world.ents.filter(a => a.layer === 'ground' && a !== h && !a.dead && !a.hidden).sort((a, b) => Math.abs(a.x - h.x) - Math.abs(b.x - h.x))[0];
+  if (subj) h.f = subj.x > h.x ? 1 : -1;
+  for (let i = 0; i < 3; i++) { h.pose = 'photo'; yield* wait(0.5); world.flash = 1; addPopup('CLICK', h.x - 8, h.y - 26, '#ffffff'); yield* wait(0.8); }
+  h.pose = 'wave'; if (subj) subj.emote('q', 2); yield* wait(1.5);
+  // a raptor notices
+  const r = spawn(new Dino('raptor', { x: edgeX(h.f, 20), y: y + 1, f: -h.f }));
+  yield* walkTo(r, h.x + h.f * 50, y + 1, 30, true);
+  r.pose = 'stand'; r.emote('heart', 1.2); h.pose = 'stand'; h.emote('bang', 1.5); yield* wait(0.8);
+  h.brain = walkTo(h, world.portal.x, y, 26, true); r.brain = walkTo(r, world.portal.x + 8, y + 1, 22, true);
+  yield* until(() => !h.brain, 10);
+  t = 0; while (t < 0.5) { const dt = yield; t += dt; h.alpha = 1 - t / 0.5; }
+  h.dead = true; r.pose = 'stand'; r.emote('q', 2);
+  t = 0; while (t < 1.2) { const dt = yield; t += dt; world.portal.r = 11 * (1 - smooth(0, 1.2, t)); }
+  world.portal = null;
+  yield* wait(1.5);
+  r.brain = walkTo(r, edgeX(chance(0.5) ? 1 : -1, 40), y + 1, 16);
+  yield* until(() => !r.brain, 20);
+}
+function* evPlesio() {
+  const p = spawn(new Dino('plesio', { x: LAKEX + rand(-LAKERX * 0.5, LAKERX * 0.5), y: LAKEY + 26, f: chance(0.5) ? 1 : -1, pose: 'rise', layer: 'lake' }));
+  let t = 0;
+  while (t < 3) { const dt = yield; t += dt; p.rise = smooth(0, 3, t); if (chance(dt * 4)) addRipple(p.x + rand(-4, 4), LAKEY); }
+  p.pose = 'look'; yield* wait(2);
+  for (let i = 0; i < 3; i++) { p.f = -p.f; yield* wait(1.5); }
+  for (const a of world.ents) if (a.layer === 'ground' && Math.abs(a.x - p.x) < 120 && chance(0.6)) a.emote('q', 2);
+  p.emote('heart', 1.5); yield* wait(2);
+  p.pose = 'rise'; t = 0; while (t < 3) { const dt = yield; t += dt; p.rise = 1 - smooth(0, 3, t); }
+  addRipple(p.x, LAKEY); p.dead = true;
+}
+const COMMON = { hatch: 1, raptors: 1.1, stampede: 1, drink: 1, fish: 1, headbutt: 1, thief: 0.9, rain: 0.8, rumble: 0.8, stego: 1, anky: 0.9 };
+const RARE = { trex: 1.3, eruption: 1, meteor: 1, traveler: 1, plesio: 1 };
+const FITS = { fish: () => world.night < 0.5, traveler: () => world.night < 0.6, headbutt: () => world.night < 0.6, stampede: () => world.night < 0.7, drink: () => world.night < 0.6, meteor: () => world.night > 0.3 || chance(0.3) };
+const EVENTS = { hatch: evHatch, raptors: evRaptors, stampede: evStampede, drink: evDrink, fish: evFish, headbutt: evHeadbutt, thief: evThief, rain: evRain, rumble: evRumble, stego: evStego, anky: evAnky, trex: evTrex, eruption: evEruption, meteor: evMeteor, traveler: evTraveler, plesio: evPlesio };
+const director = { cur: null, name: '', cool: 6, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 4 : rand(10, 22); cleanupEvent(); }
+  } else if ((director.cool -= dt) <= 0) {
+    const allEv = Object.keys(EVENTS);
+    let name;
+    if (FORCE) name = FORCE === 'all' ? allEv[director.idx++ % allEv.length] : FORCE;
+    else {
+      const fit = tbl => Object.fromEntries(Object.entries(tbl).map(([k, w]) => [k, (FITS[k] && !FITS[k]()) || k === director.last ? 0 : w]));
+      name = chance(0.14) ? weighted(fit(RARE)) : null;
+      if (!name) name = weighted(fit(COMMON));
+    }
+    if (!EVENTS[name]) { director.cool = 5; return; }
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; cleanupEvent(); }
+  }
+}
+function cleanupEvent() {
+  for (const a of evActors) a.dead = true;
+  evActors.length = 0;
+  world.ents = world.ents.filter(a => !a.dead);
+  world.rain = 0; world.cloud = 0; world.lava = 0.2; world.ash = 0; world.meteor = null; world.portal = null;
+  for (const e of world.eggs) { e.stolen = false; e.rolling = null; e.wob = 0; }
+  const L = LANES();
+  for (const a of [...res.brachios, ...res.trikes, ...res.compys]) {
+    if (!world.ents.includes(a)) world.ents.push(a);
+    a.hidden = false; a.alpha = 1; a.hop = 0;
+    if (a.x < -20 || a.x > W + 20) a.x = a.x < 0 ? -30 : W + 30;
+    if (a.busy || !a.brain) { a.busy = false; a.brain = residentBrain(a); }
+  }
+  for (const p of res.pteros) { if (!world.ents.includes(p)) world.ents.push(p); p.brain = null; p.fish = false; if (p.scripted) { p.scripted = false; if (p.circ) { p.circ.a = 0; p.circ.cx = p.x - p.circ.r; p.circ.cy = clamp(p.y, H * 0.1, H * 0.3); } } }
+}
+
+// ---------------------------------------------------------------- update + render
+const scene = { stars: [], clouds: [] };
+function update(dt) {
+  world.t += dt;
+  updateLight();
+  runDirector(dt);
+  for (const a of world.ents) if (!a.dead) a.update(dt);
+  world.ents = world.ents.filter(a => !a.dead);
+  updatePteros(dt);
+  for (const p of world.parts) {
+    p.life -= dt; p.vy += p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.lava && p.y > HOR - 2 && p.vy > 0) { p.life = Math.min(p.life, 0.3); p.vy = 0; p.vx *= 0.3; }
+    if (p.bomb) { if (chance(0.6)) addPart(p.x, p.y, rand(-3, 3), rand(-3, 3), 0.8, '#6a5a5a', { smoke: true }); if (p.y > H * 0.7) { p.life = 0; for (let i = 0; i < 8; i++) addPart(p.x, p.y, rand(-20, 20), rand(-20, -5), 0.6, '#ffb050', { grav: 60 }); } }
+  }
+  world.parts = world.parts.filter(p => p.life > 0);
+  if (world.rain > 0) for (let i = 0; i < world.rain * dt * 150 * (W / 320); i++) addPart(rand(-10, W + 20), -3, -18, rand(160, 200), 1.6, '#b8c8dc', { rain: true, land: rand(HOR, H) });
+  for (const p of world.parts) if (p.rain && p.y > p.land) { p.life = 0; if (onLake(p.x, p.y)) addRipple(p.x, p.y); }
+  if (world.ash > 0) for (let i = 0; i < world.ash * dt * 40; i++) addPart(rand(0, W), -2, rand(-4, 4), rand(8, 14), 12, '#8a8488', { ash: true });
+  for (const p of world.popups) p.t += dt; world.popups = world.popups.filter(p => p.t < 1.6);
+  for (const r of ripples) r.r += dt * 6; for (let i = ripples.length - 1; i >= 0; i--) if (ripples[i].r > ripples[i].max) ripples.splice(i, 1);
+  for (const c of scene.clouds) { c.x += dt * (2 + world.cloud * 4); if (c.x > W + 50) { c.x = -50; c.y = rand(H * 0.05, H * 0.3); } }
+  for (const e of world.eggs) if (e.rolling) { e.rolling.t += dt; if (e.rolling.t > 2.5) e.rolling = null; }
+  world.shake = Math.max(0, world.shake - dt * 1.5);
+  world.lightning = Math.max(0, world.lightning - dt * 3);
+  world.flash = Math.max(0, world.flash - dt * 3);
+  if (world.boltT > 0) world.boltT -= dt;
+  if (world.rainbow > 0) world.rainbow = Math.max(0, world.rainbow - dt / 30);
+  // fireflies/dragonflies
+  for (const f of scene.flies) { f.ph += dt; f.x += (Math.sin(f.ph * 0.7 + f.s) * 10 + Math.sin(f.ph * 2.3) * 4) * dt; f.y += Math.cos(f.ph * 0.9 + f.s) * 6 * dt; if (f.x < 0) f.x = W; if (f.x > W) f.x = 0; f.y = clamp(f.y, HOR - 10, H - 10); }
+}
+function drawSky() {
+  const n = world.night, d = world.dusk, g = world.cloud;
+  let top = mixRgb([96, 168, 226], [10, 12, 36], n), bot = mixRgb([214, 236, 222], [40, 38, 78], n);
+  top = mixRgb(top, [120, 80, 140], d * 0.4); bot = mixRgb(bot, [250, 160, 110], d * 0.85);
+  top = mixRgb(top, mixRgb([110, 116, 126], [22, 24, 34], n), g * 0.75); bot = mixRgb(bot, mixRgb([150, 150, 150], [36, 36, 48], n), g * 0.75);
+  if (world.ash > 0) { top = mixRgb(top, [110, 90, 90], world.ash * 0.5); bot = mixRgb(bot, [200, 120, 80], world.ash * 0.5); }
+  for (let y = 0; y < HOR; y++) { const k = clamp(y / (HOR * 0.95) + (bayer(y, y * 3) - 0.5) * 0.05, 0, 1); ctx.fillStyle = rgbStr(mixRgb(top, bot, k)); ctx.fillRect(0, y, W, 1); }
+  if (n > 0.3) { const a = (n - 0.3) / 0.7 * (1 - g); for (const s of scene.stars) { const tw = 0.5 + 0.5 * Math.sin(world.t * 1.3 + s.ph); if (tw * a > 0.35) px(s.x, s.y, tw * a > 0.7 ? '#ffffff' : '#a0a8d8'); } }
+  const sp = world.sunP; if (sp > -0.1 && sp < 1.1 && g < 0.8) { const x = W * (0.06 + 0.88 * sp), y = HOR - 10 - Math.sin(Math.PI * clamp(sp, 0, 1)) * HOR * 0.8; ctx.globalAlpha = 1 - g; disc(x, y, 8, d > 0.3 ? '#ffc890' : '#fff0c8'); disc(x, y, 6, d > 0.3 ? '#ffb070' : '#fffbe8'); ctx.globalAlpha = 1; }
+  const mp = world.moonP; if (mp > -0.1 && mp < 1.1 && n > 0.3) { const x = W * (0.06 + 0.88 * mp), y = HOR - 10 - Math.sin(Math.PI * clamp(mp, 0, 1)) * HOR * 0.75; ctx.globalAlpha = clamp((n - 0.3) * 2, 0, 1) * (1 - g * 0.8); disc(x, y, 6, '#f4f0dc'); px(x - 2, y - 1, '#d8d4c0'); px(x + 1, y + 2, '#d8d4c0'); px(x + 2, y - 2, '#e0dcc8'); ctx.globalAlpha = 1; }
+  if (world.meteor) { const m = world.meteor; disc(m.x, m.y, 3, '#ffffff'); disc(m.x, m.y, 2, '#fff8d0'); glowAt(m.x, m.y, 30, '#ffc070', 0.9, true); }
+  for (const c of scene.clouds) {
+    const col = rgbStr(mixRgb(mixRgb([255, 255, 255], [60, 64, 96], n), [150, 150, 158], g * 0.7)), sh = rgbStr(mixRgb(mixRgb([220, 226, 240], [44, 46, 72], n), [118, 118, 128], g * 0.7));
+    for (const [dx, dy, r] of c.puffs) ellipse(c.x + dx, c.y + dy + 2, r * 1.7, r * 0.8, sh);
+    for (const [dx, dy, r] of c.puffs) ellipse(c.x + dx, c.y + dy, r * 1.6, r * 0.75, col);
+  }
+  if (world.rainbow > 0) { const a = Math.min(1, world.rainbow * 3) * 0.35, cx = W * 0.45, cy = HOR + 10, R = HOR * 0.9; ctx.globalAlpha = a; ['#ff5a5a', '#ffa040', '#ffe060', '#6ad06a', '#5aa0ff', '#8a6aff'].forEach((c, i) => { ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, cy, R - i * 2, Math.PI, TAU); ctx.stroke(); }); ctx.globalAlpha = 1; }
+}
+function drawLakeAndFalls() {
+  // waterfall
+  const top = Math.round(world.wfTop), bot = HOR + 3;
+  for (let y = top; y < bot; y++) for (let x = WFX - 3; x <= WFX + 3; x++) {
+    const streak = hash(x * 13.1) * 40, s = ((y - world.t * 46 + streak) % 9 + 9) % 9, edge = Math.abs(x - WFX) === 3;
+    px(x, y, edge ? '#6a9ac0' : s < 1.5 ? '#f4fbff' : s < 4 ? '#b8dcf0' : x < WFX ? '#8ac0e0' : '#76acd4');
+  }
+  for (let x = WFX - 3; x <= WFX + 3; x++) px(x, top, '#e8f6ff');
+  // foam pool + drifting mist at the foot of the falls
+  ellipse(WFX, bot, 7, 2, '#d8eef8');
+  for (let i = 0; i < 7; i++) { const a = world.t * 3 + i * 0.9, r = 4 + Math.sin(a) * 2; px(WFX + Math.cos(a * 1.3) * (r + 2), bot - 1 + Math.sin(a) * 1.2, '#ffffff'); }
+  ctx.globalAlpha = 0.35; for (let i = 0; i < 4; i++) { const k = ((world.t * 0.2 + i / 4) % 1); disc(WFX + (i - 1.5) * 4 + k * 6, bot - 2 - k * 10, 2 + k * 3, '#f0f8ff'); } ctx.globalAlpha = 1;
+  // river sparkle
+  const rv = world.river; for (let i = 0; i < 6; i++) { const k = ((world.t * 0.15 + i / 6) % 1); px(lerp(rv.x0, rv.x1, k), lerp(rv.y0, rv.y1, k) + Math.sin(k * 20), '#c8e8f8'); }
+  ctx.drawImage(lakeCanvas, LAKEX - LAKERX - 1, LAKEY - LAKERY - 1);
+  // reflections of the sky glow + shimmer
+  for (let i = 0; i < 12; i++) { const x = LAKEX - LAKERX + ((i * 41 + world.t * 3) % (LAKERX * 2)), y = LAKEY - LAKERY + 1 + ((i * 17) % (LAKERY * 2 - 1)); if (onLake(x, y)) { ctx.globalAlpha = 0.35; rect(x, y, 3, 1, '#d0ecf8'); ctx.globalAlpha = 1; } }
+  if (world.lava > 0.3 || world.night > 0.5) { const k = Math.max(world.lava - 0.2, world.night * 0.25); const rx = LAKEX + (VX - LAKEX) * 0.55; for (let y = LAKEY - LAKERY + 1; y < LAKEY + LAKERY; y += 1) { if (!onLake(rx, y) || hash2(y, Math.floor(world.t * 6)) < 0.35) continue; ctx.globalAlpha = clamp(k * 0.8, 0, 0.7); rect(rx - 2 + Math.sin(y * 1.7 + world.t * 3) * 1.5, y, 3 + (y % 2), 1, '#ff9050'); } ctx.globalAlpha = 1; }
+  for (const r of ripples) { ctx.globalAlpha = 0.6 * (1 - r.r / r.max); ctx.strokeStyle = '#e0f4ff'; for (let a = 0; a < TAU; a += 0.5) px(r.x + Math.cos(a) * r.r, r.y + Math.sin(a) * r.r * 0.35, '#e0f4ff'); ctx.globalAlpha = 1; }
+}
+function drawNest() {
+  const x = NESTX, y = NESTY;
+  ellipse(x, y + 1, 12, 3, '#6a4a2a'); ellipse(x, y, 11, 2.4, '#9a7040');
+  for (let i = 0; i < 16; i++) { const a = (i / 16) * TAU; line(x + Math.cos(a) * 9, y + Math.sin(a) * 2, x + Math.cos(a + 0.4) * 12, y + Math.sin(a + 0.4) * 3, '#b88a50'); }
+  for (const e of world.eggs) {
+    if (e.hatched) { px(e.x - 1, e.y + 1, '#f4ecd8'); px(e.x + 1, e.y + 1, '#e8dcc0'); continue; }
+    if (e.stolen) continue;
+    let ex = e.x, ey = e.y;
+    if (e.rolling) { const k = smooth(0, 2.5, e.rolling.t); ex = lerp(e.rolling.x, e.x, k); ey = e.y + Math.abs(Math.sin(k * 12)) * -2; }
+    ex += e.wob || 0;
+    ellipse(ex, ey - 2, 2, 2.6, '#6a5a44'); ellipse(ex, ey - 2, 1.6, 2.2, '#f4ecd8'); px(ex - 0.5, ey - 3.5, '#ffffff'); px(ex + 0.5, ey - 1, '#b8a888');
+    if (e.crack > 0.3) { px(ex - 1, ey - 2, INK); px(ex, ey - 2.5, INK); px(ex + 1, ey - 2, INK); }
+  }
+}
+function render() {
+  ctx = mainCtx;
+  ctx.save();
+  if (world.shake > 0.01) ctx.translate(Math.round(rand(-1, 1) * world.shake * 3), Math.round(rand(-1, 1) * world.shake * 2));
+  drawSky();
+  drawVolcanoSmoke();
+  ctx.drawImage(bgCanvas, 0, 0);
+  // crater glow
+  const lv = world.lava;
+  ellipse(VX, world.craterY, 3 + lv * 2, 1.2, lv > 0.5 ? '#ffd060' : '#e0602a');
+  glowAt(VX, world.craterY, 14 + lv * 30, '#ff7030', 0.35 + lv * 0.5, lv > 0.5);
+  drawLakeAndFalls();
+  // skyfliers first, then ground y-sorted
+  for (const a of world.ents) if (a.layer === 'sky' && !a.dead) { a.draw(); if (a.fish) { px(a.x + a.f * 12, a.y + 2, '#c0d8e0'); px(a.x + a.f * 13, a.y + 2, '#a8c0c8'); } }
+  for (const a of world.ents) if (a.layer === 'lake' && !a.dead) drawPlesio(a);
+  const list = world.ents.filter(a => a.layer === 'ground' && !a.dead && !a.hidden);
+  list.push({ y: NESTY, draw: drawNest });
+  list.sort((a, b) => a.y - b.y);
+  for (const a of list) a.draw();
+  if (world.portal) { const p = world.portal; for (let k = 0; k < 4; k++) { ctx.globalAlpha = 0.5 - k * 0.1; ellipse(p.x, p.y, p.r * 0.55 - k, p.r - k * 1.5, ['#8a5aff', '#5ab0ff', '#b8f0ff', '#ffffff'][k]); } ctx.globalAlpha = 1; glowAt(p.x, p.y, p.r * 2.5, '#8ab0ff', 0.7, true); }
+  ctx.drawImage(frontCanvas, 0, 0);
+  // particles
+  for (const p of world.parts) {
+    if (p.rain) { ctx.fillStyle = p.col; ctx.fillRect(Math.round(p.x), Math.round(p.y), 1, 3); continue; }
+    if (p.dust || p.smoke) { ctx.globalAlpha = clamp(p.life / p.max, 0, 0.7); disc(p.x, p.y, 1.5 + (1 - p.life / p.max) * 2, p.col); ctx.globalAlpha = 1; continue; }
+    if (p.lava || p.bomb) { px(p.x, p.y, p.col); if (p.bomb) { disc(p.x, p.y, 1.5, '#ff8a40'); glowAt(p.x, p.y, 8, '#ff6020', 0.6, true); } continue; }
+    if (p.glow) { ctx.globalAlpha = clamp(p.life / p.max, 0, 1); px(p.x, p.y, p.col); ctx.globalAlpha = 1; continue; }
+    px(p.x, p.y, p.col);
+  }
+  // lightning bolt
+  if (world.boltT > 0) { let x = world.boltX, y = 0; ctx.fillStyle = '#f8f8ff'; while (y < HOR + 10) { const nx = x + rand(-5, 5), ny = y + rand(4, 9); line(x, y, nx, ny, '#f8f8ff'); x = nx; y = ny; } }
+  // night + lights
+  if (world.night > 0.02 || world.cloud > 0.05) {
+    ctx.globalCompositeOperation = 'multiply';
+    const k = Math.max(world.night * 0.86, world.cloud * 0.3);
+    ctx.fillStyle = rgbStr(mixRgb([255, 255, 255], [56, 64, 124], k));
+    ctx.fillRect(-4, -4, W + 8, H + 8);
+    ctx.globalCompositeOperation = 'source-over';
+    for (const f of scene.flies) { const b = Math.max(0, Math.sin(world.t * 2 + f.s * 3)); if (world.night > 0.5 && b > 0.3) { px(f.x, f.y, '#e8ff90'); glowAt(f.x, f.y, 4, '#c8ff60', b * 0.6); } }
+    // crater + lava glow cut through the dark
+    ellipse(VX, world.craterY, 3 + lv * 2, 1.2, '#ffb050');
+    glowAt(VX, world.craterY + 6, 26 + lv * 30, '#ff6020', 0.5 + lv * 0.4, true);
+  }
+  flushGlows();
+  if (world.dusk > 0.05 && world.night < 0.95) { ctx.globalCompositeOperation = 'soft-light'; ctx.globalAlpha = world.dusk * 0.4; rect(-4, -4, W + 8, H + 8, '#ff9a5a'); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+  if (world.lightning > 0.02) { ctx.globalAlpha = world.lightning * 0.45; rect(-4, -4, W + 8, H + 8, '#e8ecff'); ctx.globalAlpha = 1; }
+  if (world.flash > 0.02) { ctx.globalAlpha = world.flash * 0.6; rect(-4, -4, W + 8, H + 8, '#ffffff'); ctx.globalAlpha = 1; }
+  for (const p of world.parts) if (p.ash) { ctx.globalAlpha = 0.6; px(p.x, p.y, p.col); ctx.globalAlpha = 1; }
+  for (const a of world.ents) if (!a.dead && !a.hidden) a.drawEmotes();
+  for (const p of world.popups) { const k = p.t / 1.6; if (k > 0.7 && Math.floor(world.t * 10) % 2) continue; text(p.str, p.x - textW(p.str) / 2 + 6, p.y - k * 6, p.col, '#00000080'); }
+  ctx.restore();
+  if (DEBUG) { const h = localHour(); text(`${director.name || '-'} ${String(Math.floor(h)).padStart(2, '0')}:${String(Math.floor((h % 1) * 60)).padStart(2, '0')} N${world.ents.length}`, 3, 3, '#ffffff', '#000000'); }
+}
+function drawPlesio(a) {
+  const s = a.sprite(), rise = a.rise == null ? 1 : a.rise, sh = Math.round((1 - rise) * s.h);
+  const X = Math.round(a.x - (a.f > 0 ? s.ax : s.w - 1 - s.ax)), Y = Math.round(LAKEY + 1 - s.h + sh);
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, LAKEY + 1); ctx.clip();
+  ctx.drawImage(a.f > 0 ? s.r : s.l, X, Y);
+  ctx.restore();
+  ellipse(a.x, LAKEY + 1, 5, 1, '#8ac8e8');
+}
+
+// ---------------------------------------------------------------- setup + main loop
+function resize() {
+  H = ROWS; W = Math.max(120, Math.round((ROWS * innerWidth) / Math.max(1, innerHeight)));
+  canvas.width = W; canvas.height = H;
+  mainCtx.imageSmoothingEnabled = false;
+  layout();
+  bakeBackground();
+  scene.stars = Array.from({ length: Math.round(W * HOR / 60) }, () => ({ x: randi(0, W - 1), y: randi(0, HOR - 20), ph: rand(0, TAU) }));
+  scene.clouds = Array.from({ length: 5 }, () => ({ x: rand(-20, W + 20), y: rand(H * 0.05, H * 0.3), puffs: Array.from({ length: randi(3, 5) }, (_, i) => [i * 7 + rand(-2, 2), rand(-1.5, 1.5), rand(3, 5)]) }));
+  scene.flies = Array.from({ length: 14 }, () => ({ x: rand(0, W), y: rand(HOR, H), ph: rand(0, 10), s: rand(0, 10) }));
+  world.parts = []; world.popups = []; ripples.length = 0;
+  evActors.length = 0;
+  makeResidents();
+  director.cur = null; director.cool = FORCE ? 3 : 6;
+  for (let i = 0; i < 60; i++) update(1 / 30);
+}
+addEventListener('resize', resize);
+resize();
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  try { const steps = Math.ceil(dt / 0.05); for (let i = 0; i < steps; i++) update(dt / steps); render(); } catch (e) { console.error(e); }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,964 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel Pirate Voyage Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Pirate Voyage",
+ "description": "A pirate ship on an endless voyage: crew, parrot, dolphins, storms and sea monsters.",
+ "params": [
+  {"key": "pixels", "label": "Pixel size", "type": "range", "min": 100, "max": 400, "step": 10, "default": 200, "help": "Rows of big pixels on screen. Smaller = chunkier, bigger ship."},
+  {"key": "sails", "label": "Sail colour", "type": "select", "default": "", "options": [["", "Random"], ["canvas", "Canvas"], ["black", "Black"], ["red", "Red"], ["striped", "Striped"]]},
+  {"key": "sea", "label": "Sea", "type": "select", "default": "", "options": [["", "Changes by itself"], ["calm", "Calm"], ["rough", "Rough"]]},
+  {"key": "time", "label": "Pretend time", "type": "time", "default": "", "help": "Leave empty to follow your real clock."},
+  {"key": "event", "label": "Repeat one event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["dolphins", "dolphins"], ["whale", "whale"], ["island", "island"], ["storm", "storm"], ["navy", "navy"], ["treasure", "treasure"], ["shanty", "shanty"], ["bottle", "bottle"], ["overboard", "overboard"], ["gull", "gull"], ["fishing", "fishing"], ["kraken", "kraken"], ["ghost", "ghost"], ["serpent", "serpent"], ["mermaid", "mermaid"], ["glow", "glow"], ["all", "all"]], "help": "Test mode: keeps repeating one event. 'all' cycles through every event."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #3a7ab8; }
+  canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL PIRATE VOYAGE — a pirate ship on an endless voyage
+   The camera sails alongside a little galleon. The ship rides the swell (it pitches
+   pixel-perfectly), the crew works the deck, the captain holds the wheel with a parrot
+   on hand and the ship's monkey climbs the rigging. Day and night follow your clock.
+   Options (add to the end of the address, combine with &):
+     #pixels=200        vertical resolution in big pixels
+     #sails=black       sail colour: canvas black red striped
+     #sea=rough         calm or rough (default: changes by itself)
+     #time=21:00        pretend local time
+     #event=kraken      test mode: repeat one event (or "all")
+     #speed=3           run time faster (testing)
+     #debug             event name, time
+   Events: dolphins whale island storm navy treasure shanty bottle overboard gull fishing
+   Rare:   kraken  ghost (ghost ship)  serpent  mermaid  glow (glowing sea)
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const num = (k, d) => { const v = parseFloat(params.get(k)); return Number.isFinite(v) ? v : d; };
+const ROWS = Math.round(Math.min(600, Math.max(80, num('pixels', 200))));
+const FORCE = params.get('event');
+const TIME_SCALE = num('speed', 1);
+const DEBUG = params.has('debug');
+const TIME_FORCE = params.get('time');
+const SAILS = params.get('sails') || '';
+const SEA = params.get('sea') || '';
+const FPS = 30;
+
+const canvas = document.getElementById('c');
+const mainCtx = canvas.getContext('2d');
+let ctx = mainCtx;
+let W, H;
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const TAU = Math.PI * 2;
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  if (!e.length) return null;
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgbStr = c => `rgb(${c.map(v => Math.round(clamp(v, 0, 255))).join(',')})`;
+const mixRgb = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const mixHex = (a, b, t) => rgbStr(mixRgb(hexRgb(a), hexRgb(b), t));
+function px(x, y, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+function disc(cx, cy, r, c) { if (c) ctx.fillStyle = c; cx = Math.round(cx); cy = Math.round(cy); for (let dy = -Math.floor(r); dy <= r; dy++) { const w = Math.floor(Math.sqrt(Math.max(0, r * r - dy * dy))); ctx.fillRect(cx - w, cy + dy, w * 2 + 1, 1); } }
+function ellipse(cx, cy, rx, ry, c) { ctx.fillStyle = c; for (let dy = -Math.ceil(ry); dy <= ry; dy++) { const k = 1 - (dy * dy) / (ry * ry); if (k < 0) continue; const w = Math.round(rx * Math.sqrt(k)); ctx.fillRect(Math.round(cx - w), Math.round(cy + dy), w * 2 + 1, 1); } }
+function line(x0, y0, x1, y1, c, w = 1) { const n = Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))) || 1; ctx.fillStyle = c; for (let i = 0; i <= n; i++) ctx.fillRect(Math.round(lerp(x0, x1, i / n) - (w - 1) / 2), Math.round(lerp(y0, y1, i / n) - (w - 1) / 2), w, w); }
+const hash = n => { n = Math.sin(n * 127.1 + 311.7) * 43758.5453; return n - Math.floor(n); };
+const hash2 = (x, y) => hash(x * 57.3 + y * 131.7);
+function vnoise(x) { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return lerp(hash(i), hash(i + 1), u); }
+function mk(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+function withCtx(c, fn) { const old = ctx; ctx = c.getContext('2d'); ctx.imageSmoothingEnabled = false; try { fn(); } finally { ctx = old; } }
+const FONT = {
+  A: '.X.X.XXXXX.XX.X', B: 'XX.X.XXX.X.XXX.', C: '.XXX..X..X...XX', D: 'XX.X.XX.XX.XXX.', E: 'XXXX..XX.X..XXX', F: 'XXXX..XX.X..X..',
+  G: '.XXX..X.XX.X.XX', H: 'X.XX.XXXXX.XX.X', I: 'XXX.X..X..X.XXX', J: '..X..X..XX.X.X.', K: 'X.XX.XXX.X.XX.X', L: 'X..X..X..X..XXX',
+  M: 'X.XXXXXXXX.XX.X', N: 'XX.X.XX.XX.XX.X', O: '.X.X.XX.XX.X.X.', P: 'XX.X.XXX.X..X..', Q: '.X.X.XX.XXX..XX', R: 'XX.X.XXX.X.XX.X',
+  S: '.XXX...X...XXX.', T: 'XXX.X..X..X..X.', U: 'X.XX.XX.XX.XXXX', V: 'X.XX.XX.XX.X.X.', W: 'X.XX.XXXXXXXX.X', X: 'X.XX.X.X.X.XX.X',
+  Y: 'X.XX.X.X..X..X.', Z: 'XXX..X.X.X..XXX', ' ': '...............', '!': '.X..X..X.....X.', '-': '......XXX......', '.': '.............X.',
+  0: 'XXXX.XX.XX.XXXX', 1: '.X.XX..X..X.XXX', 2: 'XX...X.X.X..XXX', 3: 'XX...X.X...XXX.', 4: 'X.XX.XXXX..X..X', 5: 'XXXX..XX...XXX.',
+  6: '.XXX..XXXX.XXXX', 7: 'XXX..X.X..X..X.', 8: 'XXXX.XXXXX.XXXX', 9: 'XXXX.XXXX..XXX.', ':': '....X.....X....', '?': 'XX...X.X.....X.', "'": '.X..X..........',
+};
+const textW = s => String(s).length * 4 - 1;
+function text(str, x, y, col = '#ffffff', shadow = null) {
+  str = String(str).toUpperCase();
+  const draw = (ox, oy, c) => { ctx.fillStyle = c; for (let i = 0; i < str.length; i++) { const g = FONT[str[i]] || FONT['?']; for (let k = 0; k < 15; k++) if (g[k] === 'X') ctx.fillRect(Math.round(x + ox + i * 4 + (k % 3)), Math.round(y + oy + Math.floor(k / 3)), 1, 1); } };
+  if (shadow) draw(1, 1, shadow);
+  draw(0, 0, col);
+}
+
+// ---------------------------------------------------------------- sprite builder
+const INK = '#22181a';
+class SB {
+  constructor(w, h) { this.w = w; this.h = h; this.g = new Array(w * h).fill(null); }
+  set(x, y, c) { x = Math.round(x); y = Math.round(y); if (x >= 0 && y >= 0 && x < this.w && y < this.h) this.g[y * this.w + x] = c; return this; }
+  get(x, y) { return x >= 0 && y >= 0 && x < this.w && y < this.h ? this.g[y * this.w + x] : null; }
+  ell(cx, cy, rx, ry, c, shade) {
+    for (let y = Math.floor(cy - ry - 1); y <= Math.ceil(cy + ry + 1); y++)
+      for (let x = Math.floor(cx - rx - 1); x <= Math.ceil(cx + rx + 1); x++) {
+        const dx = (x - cx) / (rx + 0.35), dy = (y - cy) / (ry + 0.35);
+        if (dx * dx + dy * dy > 1) continue;
+        this.set(x, y, shade && dx * 0.35 + dy * 0.95 > 0.5 ? shade : c);
+      }
+    return this;
+  }
+  rect(x, y, w, h, c) { for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.set(x + i, y + j, c); return this; }
+  seg(x0, y0, x1, y1, r, c, shade) { const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) * 2) + 1; for (let i = 0; i <= n; i++) { const t = i / n; this.ell(lerp(x0, x1, t), lerp(y0, y1, t), r, r, c, shade); } return this; }
+  line(x0, y0, x1, y1, c) { const n = Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))) || 1; for (let i = 0; i <= n; i++) this.set(lerp(x0, x1, i / n), lerp(y0, y1, i / n), c); return this; }
+  outline(c = INK) {
+    const add = [];
+    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
+      if (this.get(x, y)) continue;
+      if (this.get(x - 1, y) || this.get(x + 1, y) || this.get(x, y - 1) || this.get(x, y + 1)) add.push([x, y]);
+    }
+    for (const [x, y] of add) this.set(x, y, c);
+    return this;
+  }
+}
+function bake(b, ax, ay) {
+  const r = mk(b.w, b.h), l = mk(b.w, b.h), rc = r.getContext('2d'), lc = l.getContext('2d');
+  for (let y = 0; y < b.h; y++) for (let x = 0; x < b.w; x++) {
+    const c = b.g[y * b.w + x]; if (!c) continue;
+    rc.fillStyle = c; rc.fillRect(x, y, 1, 1); lc.fillStyle = c; lc.fillRect(b.w - 1 - x, y, 1, 1);
+  }
+  return { r, l, w: b.w, h: b.h, ax, ay };
+}
+function drawSpr(s, x, y, facing = 1, alpha = 1) {
+  const X = Math.round(x - (facing > 0 ? s.ax : s.w - 1 - s.ax)), Y = Math.round(y - s.ay);
+  if (alpha < 1) ctx.globalAlpha = Math.max(0, alpha);
+  ctx.drawImage(facing > 0 ? s.r : s.l, X, Y);
+  if (alpha < 1) ctx.globalAlpha = 1;
+}
+const ICONS = {};
+function icon(name, rows, col) {
+  const b = new SB(rows[0].length + 2, rows.length + 2);
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== '.') b.set(x + 1, y + 1, ch === 'o' ? '#ffffff' : col); }));
+  ICONS[name] = bake(b.outline('#ffffff'), Math.floor(b.w / 2), b.h - 1);
+}
+icon('heart', ['.X.X.', 'XoXXX', 'XXXXX', '.XXX.', '..X..'], '#ff5a8a');
+icon('note', ['..XX', '..XX', '..X.', 'XXX.', 'XX..'], '#6a5aff');
+icon('bang', ['X', 'X', 'X', '.', 'X'], '#ff4a3a');
+icon('q', ['XXX', '..X', '.X.', '...', '.X.'], '#3a6aff');
+icon('sparkle', ['.X.', 'XoX', '.X.'], '#ffc83a');
+icon('dots', ['X.X.X'], '#6a6070');
+icon('sweat', ['.X', 'XX', 'XX'], '#5ab0ff');
+icon('anger', ['X.X', '...', 'X.X'], '#ff4a3a');
+icon('skull', ['XXX', 'oXo', 'XXX', 'X.X'], '#f4f0e8');
+icon('coin', ['.XX.', 'XoXX', 'XXXX', '.XX.'], '#ffd23a');
+
+// ---------------------------------------------------------------- world
+const world = { t: 0, night: 0, dusk: 0, dist: 0, v: 22, parts: [], popups: [], fx: [], swell: 1, swellT: 1, rain: 0, cloud: 0, lightning: 0, glow: 0, fog: 0, shake: 0 };
+let HOR, WL, SHIPX;     // horizon, waterline under the ship, ship anchor x
+const SAIL_SETS = { canvas: ['#f2e8cc', '#d8c8a4', '#bfae88'], black: ['#3a3438', '#2a2428', '#1c181a'], red: ['#c8443a', '#a8342c', '#882820'], striped: ['#f2e8cc', '#d8c8a4', '#c8443a'] };
+const SAIL = SAILS in SAIL_SETS ? SAILS : pick(['canvas', 'canvas', 'black', 'red', 'striped']);
+function layout() {
+  HOR = Math.round(H * 0.5);
+  WL = Math.round(H * 0.72);
+  SHIPX = Math.round(W * 0.42);
+}
+function localHour() {
+  if (TIME_FORCE) { const [h, m] = TIME_FORCE.split(':').map(Number); return ((((h || 0) + (m || 0) / 60 + world.t / 3600) % 24) + 24) % 24; }
+  const d = new Date(); return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+}
+function updateLight() {
+  const h = localHour();
+  const day = smooth(5.3, 7.3, h) * (1 - smooth(18, 20, h));
+  world.night = 1 - day;
+  world.dusk = Math.max(Math.exp(-(((h - 6.4) / 0.8) ** 2)), Math.exp(-(((h - 19) / 0.8) ** 2))) * (1 - world.cloud * 0.7);
+  world.sunP = (h - 6) / 12; world.moonP = (((h - 18) / 12) % 2 + 2) % 2;
+}
+// sea height at screen x for a row depth k (0 horizon .. 1 near)
+function wave(x, k) {
+  const X = x + world.dist * (0.3 + k * 1.0), s = world.swell * (0.3 + k * 1.2);
+  return (Math.sin(X * 0.045 + world.t * 1.1) * 2.2 + Math.sin(X * 0.083 - world.t * 1.7 + 1.3) * 1.3 + Math.sin(X * 0.021 + world.t * 0.6) * 2.4) * s;
+}
+
+// ---------------------------------------------------------------- the ship (faces right; bow on the right)
+let shipCanvas, sailFrames = [], hullW = 150, hullH = 110;
+const DECK = 72, CASTLE = 58, MAST = { mizzen: 30, main: 70, fore: 108 };
+function buildShip() {
+  const w = hullW, h = hullH;
+  shipCanvas = mk(w, h);
+  withCtx(shipCanvas, () => {
+    const WOOD = '#7a4a2c', WOODD = '#5a3420', WOODL = '#9a6238', GOLD = '#d8a840', RED = '#8a2e22';
+    // hull profile: stern (left) high, bow (right) sweeping up, keel curve
+    const top = x => x < 34 ? CASTLE : x > 118 ? lerp(DECK, DECK - 8, (x - 118) / 22) : DECK;
+    const keel = x => DECK + 22 - Math.pow(Math.abs(x - 72) / 70, 2.2) * 18;
+    for (let x = 6; x < 140; x++) {
+      const t0 = Math.round(top(x)), k = Math.round(keel(x));
+      for (let y = t0; y <= k; y++) {
+        let c = WOOD;
+        if ((y - t0) % 4 === 3) c = WOODD; else if ((y - t0) % 4 === 0) c = WOODL;
+        if (y > k - 4) c = y > k - 2 ? '#5a2418' : RED;                       // copper-red bottom
+        if (y >= DECK + 4 && y <= DECK + 6) c = y === DECK + 5 ? GOLD : '#a07a30';   // gold stripe
+        if (x < 34 && y >= CASTLE + 3 && y <= CASTLE + 4) c = GOLD;
+        ctx.fillStyle = c; ctx.fillRect(x, y, 1, 1);
+      }
+      ctx.fillStyle = INK; ctx.fillRect(x, t0 - 1, 1, 1); ctx.fillRect(x, k + 1, 1, 1);
+    }
+    for (const x of [6, 139]) rect(x - 1, top(x) - 1, 1, keel(x) - top(x) + 2, INK);
+    // bulwark rails
+    for (let x = 34; x < 118; x++) { px(x, DECK - 4, WOODD); if (x % 6 === 0) rect(x, DECK - 4, 1, 4, WOODD); }
+    for (let x = 6; x < 34; x++) { px(x, CASTLE - 4, WOODD); if (x % 5 === 0) rect(x, CASTLE - 4, 1, 4, WOODD); }
+    rect(33, CASTLE - 4, 2, DECK - CASTLE + 4, WOODD);
+    // gun ports with cannon muzzles
+    for (let x = 42; x < 118; x += 13) { rect(x, DECK + 9, 5, 4, '#2a1a14'); rect(x + 1, DECK + 10, 3, 2, '#1a1010'); px(x + 2, DECK + 11, '#5a5a66'); rect(x - 1, DECK + 8, 7, 1, WOODL); }
+    // stern windows (lit at night — drawn again later)
+    for (let i = 0; i < 3; i++) { rect(10 + i * 7, CASTLE + 7, 4, 5, '#2a1a14'); rect(11 + i * 7, CASTLE + 8, 2, 3, '#e8c878'); }
+    rect(6, CASTLE + 6, 28, 1, GOLD);
+    // stern lantern
+    rect(4, CASTLE - 12, 1, 8, WOODD); rect(2, CASTLE - 14, 5, 5, GOLD); rect(3, CASTLE - 13, 3, 3, '#fff0b0');
+    // figurehead + bowsprit
+    line(136, DECK - 10, 150, DECK - 20, WOODD, 2);
+    rect(138, DECK - 7, 3, 4, GOLD); px(141, DECK - 7, GOLD); px(139, DECK - 8, '#f0d070');
+    // anchor
+    line(126, DECK + 2, 126, DECK + 10, '#5a5a66'); line(123, DECK + 10, 129, DECK + 10, '#5a5a66'); px(123, DECK + 9, '#5a5a66'); px(129, DECK + 9, '#5a5a66');
+    // helm wheel on the castle deck
+    const wx = 26, wy = CASTLE - 7;
+    for (let a = 0; a < TAU; a += 0.35) px(wx + Math.cos(a) * 4, wy + Math.sin(a) * 4, WOODD);
+    for (let a = 0; a < TAU; a += Math.PI / 4) { line(wx, wy, wx + Math.cos(a) * 5.5, wy + Math.sin(a) * 5.5, WOODL); }
+    rect(wx - 1, wy, 2, CASTLE - wy, WOODD);
+    // masts
+    for (const [x, t] of [[MAST.mizzen, 26], [MAST.main, 4], [MAST.fore, 14]]) { rect(x - 1, t, 3, (x < 34 ? CASTLE : DECK) - t, '#6a4028'); rect(x - 1, t, 1, (x < 34 ? CASTLE : DECK) - t, '#8a5a34'); }
+    // crow's nest
+    rect(MAST.main - 5, 16, 11, 4, WOODD); rect(MAST.main - 5, 16, 11, 1, WOODL);
+    // rigging: shrouds from masts down to the rails, ratlines
+    for (const [x, t, base] of [[MAST.main, 8, DECK - 3], [MAST.fore, 18, DECK - 3], [MAST.mizzen, 28, CASTLE - 3]]) {
+      for (const s of [-1, 1]) { line(x, t, x + s * 12, base, '#3a2a20'); }
+      for (let k = 0.3; k < 1; k += 0.12) { const y = lerp(t, base, k); line(x - 12 * k, y, x + 12 * k, y, '#4a3a2a'); }
+    }
+    line(MAST.main, 4, MAST.fore, 14, '#3a2a20'); line(MAST.fore, 14, 150, DECK - 20, '#3a2a20'); line(MAST.main, 4, MAST.mizzen, 26, '#3a2a20');
+    // yards (sails drawn live so they billow)
+    for (const [x, y, hw] of [[MAST.main, 12, 20], [MAST.main, 36, 23], [MAST.fore, 20, 17], [MAST.fore, 42, 19]]) rect(x - hw, y, hw * 2 + 1, 2, '#5a3a24');
+  });
+  // sail frames (billow cycle)
+  sailFrames = [0, 1, 2].map(f => { const c = mk(w, h); withCtx(c, () => drawSails(f)); return c; });
+}
+function drawSails(f) {
+  const [S, SD, SS] = SAIL_SETS[SAIL], b = [2.5, 3.5, 3][f];
+  const square = (x, y0, y1, hw0, hw1) => {
+    for (let y = y0; y <= y1; y++) {
+      const k = (y - y0) / (y1 - y0), hw = lerp(hw0, hw1, k), bulge = Math.sin(k * Math.PI) * b;
+      for (let xx = -hw; xx <= hw; xx++) {
+        const t = xx / hw;
+        let c = t > 0.3 + Math.sin(k * Math.PI) * 0.2 ? SD : S;
+        if (SAIL === 'striped' && Math.floor((xx + hw) / 4) % 2) c = t > 0.35 ? '#a8342c' : SS;
+        if (Math.abs(xx - hw * 0.1) < 0.6 && k > 0.1 && k < 0.9) c = SD;
+        ctx.fillStyle = c; ctx.fillRect(Math.round(x + xx + bulge * (1 - Math.abs(t))), y, 1, 1);
+      }
+      ctx.fillStyle = INK; ctx.fillRect(Math.round(x - hw + bulge * 0), y, 1, 1); ctx.fillRect(Math.round(x + hw + bulge * 0), y, 1, 1);
+    }
+    for (let xx = -hw1; xx <= hw1; xx++) px(x + xx + Math.sin(Math.PI) * 0, y1 + 1, INK);
+  };
+  square(MAST.main, 14, 33, 19, 21); square(MAST.main, 38, 60, 22, 25);
+  square(MAST.fore, 22, 39, 16, 18); square(MAST.fore, 44, 62, 18, 20);
+  // skull on the main course
+  if (SAIL !== 'striped') { const c = SAIL === 'black' ? '#f0ece0' : '#2a2226'; const x = MAST.main + 2, y = 46; ellipse(x, y, 4, 3.5, c); rect(x - 2, y + 3, 5, 2, c); px(x - 2, y, SAIL === 'black' ? '#2a2428' : S); px(x + 2, y, SAIL === 'black' ? '#2a2428' : S); line(x - 7, y + 7, x + 7, y + 11, c); line(x + 7, y + 7, x - 7, y + 11, c); }
+  // mizzen gaff sail (trapezoid, fore-and-aft)
+  for (let y = 30; y < CASTLE - 4; y++) { const k = (y - 30) / (CASTLE - 34), x0 = MAST.mizzen + 1, x1 = MAST.mizzen - 3 - k * 20; for (let x = x1; x <= x0; x++) px(x + Math.sin(k * Math.PI) * b * 0.5, y, x < x1 + 2 ? SD : S); px(x1 - 1, y, INK); }
+  // jib (triangle from the bowsprit to the foremast)
+  for (let y = 20; y < DECK - 8; y++) { const k = (y - 20) / (DECK - 28), x0 = MAST.fore + 3 + k * 4, x1 = MAST.fore + 6 + k * 38; for (let x = x0; x <= x1; x++) px(x - Math.sin(k * Math.PI) * b * 0.3, y, x > x1 - 3 ? SD : S); px(x1 + 1, y, INK); }
+}
+
+// ---------------------------------------------------------------- crew
+const SKIN = ['#f0c8a0', '#d8a47c', '#b07a52', '#7a4e32'];
+function pirateSpr(L, pose) {
+  const b = new SB(14, 18), fx = 6, fy = 16;
+  const Sh = L.shirt, ShS = mixHex(Sh, '#000000', 0.25), P = L.pants, Sk = L.skin;
+  const walk = pose === 'walk1' ? 1 : pose === 'walk2' ? -1 : 0, sit = pose === 'sit', climb = pose.startsWith('climb');
+  if (climb) { const k = pose === 'climb1' ? 1 : -1; b.ell(fx + 0.5, 9, 2.4, 3.4, Sh, ShS); b.ell(fx + 0.5, 4, 2.2, 2.2, Sk); b.ell(fx + 0.5, 3, 2.3, 1.2, L.hat); b.line(fx - 2, 8, fx - 3, 5 + k, Sh); b.line(fx + 3, 8, fx + 4, 5 - k, Sh); b.line(fx - 1, 12, fx - 1.5, 15 - k, P); b.line(fx + 2, 12, fx + 2.5, 15 + k, P); return bake(b.outline(INK), fx, fy); }
+  // legs
+  if (sit) { b.seg(fx, 12, fx + 3, 12, 1, P); b.line(fx + 3, 12, fx + 3, fy, P); }
+  else { b.line(fx - 0.5, 12, fx - 0.5 - walk, fy, P); if (L.peg) b.line(fx + 1, 12, fx + 1 + walk, fy, '#8a6038'); else b.line(fx + 1, 12, fx + 1 + walk, fy, P); b.set(fx - 1 - walk, fy, '#2a1a14'); }
+  // body: striped shirt or coat
+  b.ell(fx + 0.3, sit ? 10 : 9.5, 2.5, 3.2, Sh, ShS);
+  if (L.stripes) for (let y = 7; y <= 12; y += 2) for (let x = fx - 2; x <= fx + 3; x++) if (b.get(x, y) === Sh || b.get(x, y) === ShS) b.set(x, y, '#f4f0e8');
+  if (L.coat) { b.line(fx - 2, 8, fx - 2.5, 14, ShS); b.line(fx + 3, 8, fx + 3.4, 13, ShS); b.set(fx + 1, 9, '#e8c060'); b.set(fx + 1, 11, '#e8c060'); }
+  b.rect(fx - 2, 12, 5, 1, L.belt || '#2a1a14');
+  // head
+  const hy = sit ? 5 : 4.5;
+  b.ell(fx + 0.8, hy, 2.2, 2.1, Sk);
+  if (L.beard) { b.ell(fx + 1.2, hy + 1.8, 1.8, 1.2, L.beard); }
+  b.set(fx + 2, hy - 0.3, INK);
+  if (L.patch) { b.set(fx + 2, hy - 0.3, '#1a1a1a'); b.line(fx - 1, hy - 1.5, fx + 3, hy - 0.5, '#1a1a1a'); }
+  if (L.tricorn) { b.rect(fx - 2.5, hy - 2.5, 7, 1, '#2a2226'); b.ell(fx + 0.8, hy - 3.2, 2.4, 1.2, '#2a2226'); b.set(fx - 3, hy - 3, '#2a2226'); b.set(fx + 4.5, hy - 3, '#2a2226'); b.set(fx + 0.8, hy - 3.5, '#e8c060'); }
+  else { b.ell(fx + 0.6, hy - 1.4, 2.3, 1.1, L.hat); b.set(fx - 2, hy - 0.5, L.hat); b.set(fx - 2.6, hy + 0.2, L.hat); }
+  // arms by pose
+  const ax = fx + 1.5, ay = 7.5;
+  switch (pose) {
+    case 'helm': b.line(ax, ay, ax + 3.5, ay + 1, Sh); b.set(ax + 3.5, ay + 1, Sk); break;
+    case 'point': b.line(ax, ay, ax + 5, ay - 2, Sh); b.set(ax + 5, ay - 2, Sk); break;
+    case 'cheer': b.line(ax, ay, ax + 2, ay - 4, Sh); b.set(ax + 2, ay - 5, Sk); b.line(fx - 1, ay, fx - 3, ay - 4, Sh); break;
+    case 'pull1': case 'pull2': { const k = pose === 'pull1' ? 0 : 2; b.line(ax, ay, ax + 3, ay - 2 + k, Sh); b.set(ax + 3, ay - 2 + k, Sk); break; }
+    case 'mop1': case 'mop2': { const k = pose === 'mop1' ? -1 : 1; b.line(ax, ay, ax + 2, ay + 2, Sh); b.line(ax + 2, ay - 2, ax + 3 + k, fy, '#a8845a'); b.rect(ax + 2 + k, fy - 1, 3, 2, '#d8d0b8'); break; }
+    case 'spy': b.line(ax, ay, ax + 2, ay - 2, Sh); b.line(ax + 2, hy - 0.5, ax + 6, hy - 1, '#c8a040'); b.set(ax + 6, hy - 1, '#8ac8e8'); break;
+    case 'fiddle': b.line(ax, ay, ax + 2, ay - 1, Sh); b.ell(ax + 1, ay - 0.5, 1.5, 1, '#a0602a'); b.line(ax - 2, ay - 3, ax + 4, ay + 1, '#e8e0d0'); break;
+    case 'drink': b.line(ax, ay, ax + 1.5, hy + 1, Sh); b.rect(ax + 1, hy, 2, 2, '#b08a5a'); break;
+    case 'rod': b.line(ax, ay, ax + 2, ay, Sh); b.line(ax + 2, ay, ax + 8, ay - 7, '#8a6038'); break;
+    case 'dance1': b.line(ax, ay, ax + 2, ay - 3, Sh); b.line(fx - 1, ay, fx - 3, ay + 1, Sh); break;
+    case 'dance2': b.line(ax, ay, ax + 3, ay + 1, Sh); b.line(fx - 1, ay, fx - 2, ay - 3, Sh); break;
+    default: b.line(ax, ay, ax + 0.5 + walk * 0.5, ay + 3.5, Sh);
+  }
+  b.outline(INK);
+  return bake(b, fx, fy);
+}
+function parrotSpr(pose) {
+  const b = new SB(12, 10), R = '#e03a2a', RS = '#b02a1e', fy = 8;
+  if (pose === 'fly1' || pose === 'fly2') {
+    b.ell(6, 5, 2.6, 1.6, R, RS); b.line(3.5, 5.5, 0, 6.5, '#3a7ae8'); b.ell(8.5, 4, 1.6, 1.4, R); b.set(10, 4.6, '#f0e0a0'); b.set(9, 3.6, INK);
+    if (pose === 'fly1') { b.line(5, 4, 3, 0, '#f0c030'); b.line(6, 4, 5, 0, '#3ab86a'); } else { b.line(5, 6, 3, 9, '#f0c030'); b.line(6, 6, 5, 9, '#3ab86a'); }
+    return bake(b.outline(INK), 6, 7);
+  }
+  b.ell(5.5, 5, 1.8, 2.4, R, RS); b.line(4.5, 7, 3, 9, '#3a7ae8'); b.set(4.5, 5, '#f0c030'); b.set(4.5, 6, '#3ab86a');
+  b.ell(6.5, 2.4, 1.6, 1.5, R); b.set(8, 2.8, '#f0e0a0'); b.set(8, 3.4, '#f0e0a0'); b.set(7, 2, INK); b.set(6, 3, '#f4f4f0');
+  return bake(b.outline(INK), 5, fy);
+}
+function monkeySpr(pose) {
+  const b = new SB(12, 12), C = '#8a5a34', CS = '#6a4024', F = '#e0b890', fy = 10;
+  const k = pose === 'climb1' ? 1 : pose === 'climb2' ? -1 : 0;
+  b.ell(6, 6, 2.4, 2.8, C, CS); b.ell(6, 2.6, 2, 1.8, C); b.ell(6.6, 3, 1.3, 1, F); b.set(6.2, 2.4, INK); b.set(7.2, 2.4, INK); b.set(4, 2, F); b.set(8, 2, F);
+  b.line(4, 5, 2, 2 + k, C); b.line(8, 5, 10, 2 - k, C); b.line(5, 8.5, 4, 10 - k, C); b.line(7, 8.5, 8, 10 + k, C);
+  b.line(4, 8, 1, 9, C); b.set(0, 8, C);
+  if (pose === 'banana') { b.line(8, 5, 10, 4, C); b.line(9, 2, 11, 4, '#f0d040'); }
+  return bake(b.outline(INK), 6, fy);
+}
+const sprCache = new Map();
+function spr(key, fn) { let s = sprCache.get(key); if (!s) { s = fn(); sprCache.set(key, s); } return s; }
+
+// crew members stand on the deck (x in ship space); drawn with the ship's shear
+class Pirate {
+  constructor(o) { Object.assign(this, { sx: 60, deck: DECK, f: 1, pose: 'stand', anim: rand(0, 3), emotes: [], brain: null, busy: false, walking: false, hop: 0, alpha: 1, L: null, onShip: true }, o); }
+  emote(n, d = 2) { this.emotes.push({ name: n, t: 0, dur: d }); }
+  update(dt) {
+    this.anim += dt; for (const m of this.emotes) m.t += dt; this.emotes = this.emotes.filter(m => m.t < m.dur);
+    if (this.brain) { let r; try { r = this.brain.next(dt); } catch (e) { console.error('crew', e); r = { done: true }; } if (r.done) this.brain = null; }
+  }
+  sprite() { let p = this.pose; if (this.walking) p = Math.floor(this.anim * 6) % 2 ? 'walk1' : 'walk2'; if (this.kind === 'monkey') return spr('monkey' + p, () => monkeySpr(p)); return spr(this.L.id + p, () => pirateSpr(this.L, p)); }
+}
+function deckAt(sx) { return sx < 34 ? CASTLE - 1 : DECK - 1; }
+function* walkDeck(a, tx, spd = 12) {
+  a.walking = true;
+  while (Math.abs(a.sx - tx) > 0.5) { const dt = yield, d = tx - a.sx; a.f = Math.sign(d); a.sx += Math.sign(d) * Math.min(Math.abs(d), spd * dt); if ((a.sx < 34) !== (a.deck === CASTLE - 1)) { a.deck = deckAt(a.sx); } a.deck = deckAt(a.sx); }
+  a.walking = false;
+}
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+function* all(...gens) { const gs = gens.map(g => ({ g, done: false })); while (gs.some(x => !x.done)) { const dt = yield; for (const x of gs) if (!x.done) x.done = x.g.next(dt).done; } }
+let crew = [], captain, monkey, parrot;
+function makeCrew() {
+  const looks = [
+    { id: 'cap', shirt: '#b0302a', pants: '#2a2226', skin: pick(SKIN), coat: true, tricorn: true, beard: '#3a2a22', belt: '#e8c060' },
+    { id: 'a', shirt: '#c83a3a', pants: '#3a3a5a', skin: pick(SKIN), stripes: true, hat: '#c83a3a' },
+    { id: 'b', shirt: '#3a5aa8', pants: '#5a4a3a', skin: pick(SKIN), stripes: true, hat: '#2a2226', patch: true },
+    { id: 'c', shirt: '#e8dcc0', pants: '#6a3a2a', skin: pick(SKIN), hat: '#3a8a4a', peg: true, beard: '#8a4a2a' },
+    { id: 'd', shirt: '#6a4a8a', pants: '#2a2a3a', skin: pick(SKIN), hat: '#f0c030', stripes: false },
+  ];
+  captain = new Pirate({ L: looks[0], sx: 22, deck: CASTLE - 1, pose: 'helm', f: 1, role: 'captain' });
+  crew = [captain, ...looks.slice(1).map((L, i) => new Pirate({ L, sx: 44 + i * 18, deck: DECK - 1, f: chance(0.5) ? 1 : -1 }))];
+  monkey = new Pirate({ kind: 'monkey', sx: MAST.main, deck: DECK - 1, pose: 'stand', climbY: 0 });
+  parrot = { sx: 24, sy: CASTLE - 22, state: 'perch', t: 0, f: 1, anim: 0 };
+}
+function* crewAmbient(p) {
+  if (p.role === 'captain') {
+    while (true) { p.pose = 'helm'; p.f = 1; yield* wait(rand(8, 20)); const r = Math.random(); if (r < 0.4) { p.pose = 'spy'; yield* wait(rand(3, 5)); if (chance(0.3)) p.emote('q', 1.5); } else if (r < 0.6) { p.pose = 'point'; addPopup(pick(['ARR!', 'YO HO', 'HEAVE HO']), shipXY(p.sx, p.deck - 20)[0], shipXY(p.sx, p.deck - 20)[1], '#ffffff'); yield* wait(1.5); } }
+  }
+  while (true) {
+    const r = Math.random();
+    if (r < 0.35) { yield* walkDeck(p, rand(38, 116)); p.pose = 'stand'; yield* wait(rand(2, 6)); }
+    else if (r < 0.55) { yield* walkDeck(p, rand(40, 110)); for (let i = 0; i < randi(6, 12); i++) { p.pose = i % 2 ? 'mop1' : 'mop2'; yield* wait(0.4); } p.pose = 'stand'; }
+    else if (r < 0.7) { yield* walkDeck(p, MAST.main + (p.sx < MAST.main ? -5 : 5)); p.f = p.sx < MAST.main ? 1 : -1; for (let i = 0; i < 8; i++) { p.pose = i % 2 ? 'pull1' : 'pull2'; yield* wait(0.35); } p.pose = 'stand'; }
+    else if (r < 0.82) { yield* walkDeck(p, rand(112, 124)); p.f = 1; p.pose = 'spy'; yield* wait(rand(3, 6)); p.pose = 'stand'; }
+    else { p.pose = 'drink'; yield* wait(2); p.pose = 'stand'; if (chance(0.4)) p.emote('note', 1.5); yield* wait(rand(1, 3)); }
+  }
+}
+function* monkeyAmbient() {
+  const m = monkey;
+  while (true) {
+    yield* walkDeck(m, rand(40, 110), 18);
+    m.pose = 'stand'; yield* wait(rand(2, 5));
+    if (chance(0.5)) {   // climb up to the crow's nest and back
+      yield* walkDeck(m, MAST.main + 1, 18);
+      m.climbing = true; let y = 0;
+      while (y < DECK - 22) { const dt = yield; y += dt * 14; m.climbY = y; m.pose = Math.floor(y / 3) % 2 ? 'climb1' : 'climb2'; }
+      m.pose = 'banana'; yield* wait(rand(4, 8)); if (chance(0.5)) m.emote('heart', 1.5);
+      while (y > 0) { const dt = yield; y -= dt * 20; m.climbY = Math.max(0, y); m.pose = Math.floor(y / 3) % 2 ? 'climb1' : 'climb2'; }
+      m.climbing = false; m.climbY = 0; m.pose = 'stand';
+    }
+  }
+}
+function updateParrot(dt) {
+  const p = parrot; p.t += dt; p.anim += dt;
+  if (p.state === 'perch') { p.sx = captain.sx + 1; p.sy = captain.deck - 16; if (p.t > rand(12, 30) && !p.hold) { p.state = 'fly'; p.t = 0; p.path = rand(0, TAU); } }
+  else if (p.state === 'fly') { p.path += dt * 0.8; p.sx = 70 + Math.cos(p.path) * 55; p.sy = 30 + Math.sin(p.path * 2) * 14; p.f = -Math.sin(p.path) >= 0 ? 1 : -1; if (p.t > 12 && Math.abs(p.sx - captain.sx) < 12) { p.state = 'perch'; p.t = 0; if (chance(0.5)) addPopup(pick(['SQUAWK', "PIECES O' EIGHT", 'POLLY']), shipXY(p.sx, p.sy)[0], shipXY(p.sx, p.sy - 8)[1], '#8aff8a'); } }
+}
+
+// ---------------------------------------------------------------- ship pose on the waves
+const ship = { y: 0, slope: 0, heel: 0 };
+function updateShip(dt) {
+  const bow = wave(SHIPX + 50, 0.78), stern = wave(SHIPX - 50, 0.78), mid = wave(SHIPX, 0.78);
+  const tgtY = (bow + stern + mid * 2) / 4, tgtS = (bow - stern) / 100;
+  ship.y = lerp(ship.y, tgtY, 1 - Math.exp(-dt * 3));
+  ship.slope = lerp(ship.slope, clamp(tgtS, -0.12, 0.12), 1 - Math.exp(-dt * 2.5));
+}
+// ship-space (sx, sy) -> screen, including pitch shear
+const SHIP_W = () => hullW;
+function shipXY(sx, sy) { const x0 = SHIPX - 72; return [x0 + sx, WL - DECK - 14 + sy + ship.y - (sx - 72) * ship.slope]; }
+function drawShip() {
+  const x0 = SHIPX - 72, y0 = WL - DECK - 14 + ship.y, strip = 2;
+  const sails = sailFrames[Math.floor(world.t * 1.5) % 3];
+  for (let sx = 0; sx < hullW; sx += strip) {
+    const dy = Math.round(y0 - (sx - 72) * ship.slope);
+    ctx.drawImage(sails, sx, 0, strip, hullH, x0 + sx, dy, strip, hullH);
+    ctx.drawImage(shipCanvas, sx, 0, strip, hullH, x0 + sx, dy, strip, hullH);
+  }
+  // Jolly Roger flying from the main mast
+  const [fx, fy] = shipXY(MAST.main, 2);
+  for (let i = 0; i < 12; i++) { const wv = Math.sin(world.t * 6 - i * 0.6) * (i / 12) * 1.5; for (let j = 0; j < 7; j++) px(fx - 1 - i, fy - 8 + j + wv, '#1e1a1c'); }
+  px(fx - 6, fy - 6 + Math.sin(world.t * 6 - 3) * 0.7, '#f0ece0'); px(fx - 7, fy - 6 + Math.sin(world.t * 6 - 3.6) * 0.7, '#f0ece0'); px(fx - 6.5, fy - 5 + Math.sin(world.t * 6 - 3.3) * 0.7, '#f0ece0');
+  px(fx - 5, fy - 3 + Math.sin(world.t * 6 - 3) * 0.7, '#f0ece0'); px(fx - 8, fy - 3 + Math.sin(world.t * 6 - 4.2) * 0.7, '#f0ece0');
+}
+function drawCrew() {
+  for (const p of [...crew, monkey]) {
+    if (p.hidden) continue;
+    let [x, y] = shipXY(p.sx, p.deck);
+    if (p.kind === 'monkey' && p.climbY) { y -= p.climbY; x += 1; }
+    if (p.overboard) { x = p.ox; y = p.oy; }
+    drawSpr(p.sprite(), x, y - p.hop, p.f, p.alpha);
+  }
+  const pr = parrot, [x, y] = shipXY(pr.sx, pr.sy);
+  const ps = pr.state === 'perch' ? 'perch' : (Math.floor(pr.anim * 8) % 2 ? 'fly1' : 'fly2');
+  drawSpr(spr('parrot' + ps, () => parrotSpr(ps)), x, y, pr.state === 'perch' ? 1 : pr.f);
+}
+
+// ---------------------------------------------------------------- sea + sky
+const scene = { stars: [], clouds: [], gulls: [], far: [] };
+function drawSky() {
+  const n = world.night, d = world.dusk, g = world.cloud;
+  let top = mixRgb([70, 150, 230], [8, 12, 36], n), bot = mixRgb([190, 226, 246], [30, 44, 90], n);
+  top = mixRgb(top, [110, 80, 150], d * 0.45); bot = mixRgb(bot, [252, 168, 110], d * 0.85);
+  top = mixRgb(top, mixRgb([90, 96, 110], [20, 22, 32], n), g * 0.85); bot = mixRgb(bot, mixRgb([130, 136, 146], [32, 36, 48], n), g * 0.85);
+  for (let y = 0; y < HOR; y++) { const k = clamp(y / HOR + (bayer(y, y * 3) - 0.5) * 0.05, 0, 1); ctx.fillStyle = rgbStr(mixRgb(top, bot, k)); ctx.fillRect(0, y, W, 1); }
+  world.skyBot = bot; world.skyTop = top;
+  if (n > 0.3) { const a = (n - 0.3) / 0.7 * (1 - g); for (const s of scene.stars) { const tw = 0.5 + 0.5 * Math.sin(world.t * 1.3 + s.ph); if (tw * a > 0.35) px(s.x, s.y, tw * a > 0.7 ? '#ffffff' : '#a0a8d8'); } }
+  const sp = world.sunP; if (sp > -0.1 && sp < 1.1 && g < 0.8) { const x = W * (0.08 + 0.84 * sp), y = HOR - 6 - Math.sin(Math.PI * clamp(sp, 0, 1)) * HOR * 0.8; ctx.globalAlpha = 1 - g; disc(x, y, 9, d > 0.3 ? '#ffc890' : '#fff0c8'); disc(x, y, 7, d > 0.3 ? '#ffb070' : '#fffbe8'); ctx.globalAlpha = 1; world.sunXY = [x, y]; } else world.sunXY = null;
+  const mp = world.moonP; if (mp > -0.1 && mp < 1.1 && n > 0.3) { const x = W * (0.08 + 0.84 * mp), y = HOR - 6 - Math.sin(Math.PI * clamp(mp, 0, 1)) * HOR * 0.75; ctx.globalAlpha = clamp((n - 0.3) * 2, 0, 1) * (1 - g * 0.8); disc(x, y, 6, '#f4f0dc'); px(x - 2, y - 1, '#d8d4c0'); px(x + 1, y + 2, '#d8d4c0'); ctx.globalAlpha = 1; world.moonXY = [x, y]; } else world.moonXY = null;
+  for (const c of scene.clouds) {
+    const col = rgbStr(mixRgb(mixRgb([255, 255, 255], [60, 66, 96], n), [120, 124, 136], g * 0.8)), sh = rgbStr(mixRgb(mixRgb([214, 222, 238], [44, 48, 74], n), [90, 94, 106], g * 0.8));
+    for (const [dx, dy, r] of c.puffs) ellipse(c.x + dx, c.y + dy + 2, r * 1.7, r * 0.8, sh);
+    for (const [dx, dy, r] of c.puffs) ellipse(c.x + dx, c.y + dy, r * 1.6, r * 0.75, col);
+  }
+}
+function drawSea(front) {
+  // rows from the horizon to the bottom; the rows in front of the hull are drawn after the ship
+  const n = world.night, g = world.cloud, glow = world.glow;
+  const deep = mixRgb(mixRgb([34, 98, 156], [8, 22, 48], n), [44, 64, 74], g * 0.6), near = mixRgb(mixRgb([30, 110, 160], [10, 28, 58], n), [44, 66, 76], g * 0.6);
+  const skyB = world.skyBot || [180, 210, 230];
+  const y0 = front ? WL + 2 : HOR, y1 = front ? H : WL + 2;
+  for (let y = y0; y < y1; y++) {
+    const k = (y - HOR) / (H - HOR);
+    const base = mixRgb(mixRgb(skyB, deep, clamp(k * 5, 0, 1)), near, k * k);
+    ctx.fillStyle = rgbStr(base); ctx.fillRect(0, y, W, 1);
+    // glints: short horizontal crests that drift; each row has its own phase so they never line up
+    const f = lerp(0.3, 0.05, Math.sqrt(k)), P = TAU / f, ph = hash(y * 3.7) * TAU;
+    const shift = (world.dist * (0.25 + k * 1.1) + world.t * (3 + hash(y) * 5)) % P;
+    const thr = 0.86 - world.swell * 0.05 + (hash(y * 1.3) - 0.5) * 0.12, len = Math.max(1, 2 * Math.acos(clamp(thr, -1, 1)) / f);
+    const hi = rgbStr(mixRgb(base, glow > 0 ? [90, 255, 210] : [236, 246, 255], (0.22 + k * 0.4) * (glow > 0 ? 1.6 : 1)));
+    const lo = rgbStr(mixRgb(base, [0, 12, 34], 0.18 + k * 0.1));
+    let x = ((Math.PI / 2 - ph) / f - shift) % P; if (x > 0) x -= P;
+    for (; x < W; x += P) { ctx.fillStyle = hi; ctx.fillRect(Math.round(x - len / 2), y, Math.round(len), 1); ctx.fillStyle = lo; ctx.fillRect(Math.round(x - len * 0.2 + P * 0.5), y, Math.round(len * 1.4), 1); }
+  }
+  if (!front) {
+    // sun/moon glitter path
+    const src = world.night > 0.5 ? world.moonXY : world.sunXY;
+    if (src) for (let y = HOR + 1; y < WL; y += 1) { if (hash2(y, Math.floor(world.t * 5)) < 0.55) continue; const k = (y - HOR) / (WL - HOR), w = 1 + k * 8; ctx.globalAlpha = 0.5 * (1 - k * 0.5); rect(src[0] - w / 2 + Math.sin(y * 1.3 + world.t * 2) * (1 + k * 4), y, w * rand(0.3, 1), 1, world.night > 0.5 ? '#f0ecd0' : '#fff4d0'); ctx.globalAlpha = 1; }
+  } else {
+    // the waterline in front of the hull: a wavy edge with foam
+    const foam = glow > 0 ? '#80ffd0' : '#f0f8ff';
+    for (let sx = 4; sx < 142; sx++) {
+      const [x] = shipXY(sx, DECK + 22), y = WL + 1 + wave(x, 0.9) * 0.3 + Math.sin(sx * 0.5 + world.t * 4) * 0.6;
+      ctx.fillStyle = rgbStr(mixRgb(skyB, near, 0.85)); ctx.fillRect(Math.round(x), Math.round(y), 1, Math.max(0, WL + 3 - Math.round(y)));
+      if (hash2(sx, Math.floor(world.t * 7)) < 0.55) px(x, y, foam);
+    }
+  }
+}
+// bow spray + wake
+function shipSpray(dt) {
+  const [bx, by] = shipXY(136, DECK + 8);
+  if (chance(dt * (4 + world.swell * 6))) for (let i = 0; i < 4; i++) addPart(bx + rand(-2, 4), by + rand(0, 4), rand(4, 20), rand(-30, -10), 0.6, world.glow > 0 ? '#80ffd0' : '#f0f8ff', { grav: 90 });
+  const [sx, sy] = shipXY(8, DECK + 18);
+  if (chance(dt * 6)) addPart(sx, sy + rand(-1, 2), -world.v * 0.6 - rand(0, 8), 0, rand(1, 2), world.glow > 0 ? '#60e0c0' : '#e0f0ff', { wake: true });
+}
+
+// ---------------------------------------------------------------- particles, popups
+function addPart(x, y, vx, vy, life, col, o = {}) { if (world.parts.length > 800) world.parts.splice(0, 80); world.parts.push(Object.assign({ x, y, vx, vy, life, max: life, col, grav: 0 }, o)); }
+function addPopup(str, x, y, col = '#fffbe8') { world.popups.push({ str, x, y, t: 0, col }); }
+function addFx(f) { f.t = 0; world.fx.push(f); return f; }
+const glowQ = [];
+function glowAt(x, y, r, col, a, always) { glowQ.push([x, y, r, col, a, always]); }
+function flushGlows() {
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const [x, y, r, col, a, always] of glowQ) { const k = always ? Math.max(0.4, world.night) : clamp(world.night * 1.3, 0, 1); if (a * k < 0.02) continue; const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, col); g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.globalAlpha = clamp(a * k, 0, 1); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2); }
+  ctx.restore(); glowQ.length = 0;
+}
+function splash(x, y, n = 10, big = 1) { for (let i = 0; i < n; i++) addPart(x + rand(-3, 3), y, rand(-20, 20) * big, rand(-50, -20) * big, rand(0.5, 1), '#e8f6ff', { grav: 110 }); }
+
+// ---------------------------------------------------------------- events
+function crewFree() { return crew.filter(p => p.role !== 'captain' && !p.busy); }
+function takeCrew(n) { const f = crewFree(); const out = []; while (out.length < n && f.length) { const p = f.splice(randi(0, f.length - 1), 1)[0]; p.busy = true; p.brain = null; p.walking = false; out.push(p); } return out; }
+function releaseCrew() { for (const p of crew) { if (p.role === 'captain') { if (!p.brain) p.brain = crewAmbient(p); continue; } if (p.busy) { p.busy = false; p.brain = crewAmbient(p); p.overboard = false; p.hidden = false; } } }
+function lookout(txt) { const f = crewFree()[0] || crew[1]; if (!f) return; const [x, y] = shipXY(f.sx, f.deck - 22); addPopup(txt, x, y, '#ffffff'); f.emote('bang', 1.5); }
+function* evDolphins() {
+  const pod = Array.from({ length: 4 }, (_, i) => ({ x: -20 - i * 22, t: rand(0, 2), row: rand(0.62, 0.9), ph: rand(0, TAU), v: rand(9, 13) }));
+  world.dolphins = pod;
+  lookout('DOLPHINS!');
+  for (const p of takeCrew(2)) p.brain = (function* () { yield* walkDeck(p, rand(100, 124)); p.f = -1; p.pose = 'cheer'; })();
+  let t = 0;
+  while (t < 45 && pod.some(d => d.x < W + 20)) { const dt = yield; t += dt; for (const d of pod) { d.x += d.v * dt; d.t += dt; } }
+  world.dolphins = null;
+}
+function* evWhale() {
+  const w = { x: W + 40, row: 0.3, t: 0, spout: 0, dive: 0 };
+  world.whale = w;
+  lookout('THAR SHE BLOWS!');
+  let t = 0;
+  while (w.x > -80) { const dt = yield; t += dt; w.x -= world.v * 0.5 * dt; w.t = t; w.up = smooth(0, 3, t) * (1 - smooth(20, 26, t)); if (Math.floor(t / 5) !== Math.floor((t - dt) / 5) && t < 20) w.spout = 1.5; w.spout = Math.max(0, w.spout - dt); if (t > 30) break; }
+  world.whale = null;
+}
+function* evIsland() {
+  const isl = { x: W + 80, palms: randi(2, 4), hut: chance(0.5), treasure: chance(0.4) };
+  world.island = isl;
+  yield* wait(2);
+  lookout('LAND HO!');
+  captain.pose = 'spy';
+  while (isl.x > -120) { const dt = yield; isl.x -= world.v * 0.35 * dt; }
+  world.island = null;
+}
+function* evStorm() {
+  let t = 0; const dur = rand(40, 55);
+  for (const p of takeCrew(2)) p.brain = (function* () { yield* walkDeck(p, MAST.main + (chance(0.5) ? -6 : 6)); p.f = p.sx < MAST.main ? 1 : -1; while (true) { p.pose = Math.floor(world.t * 3) % 2 ? 'pull1' : 'pull2'; yield; } })();
+  while (t < dur) {
+    const dt = yield; t += dt;
+    const k = smooth(0, 6, t) * (1 - smooth(dur - 6, dur, t));
+    world.cloud = k; world.rain = k; world.swellT = lerp(world.baseSwell, 2.6, k);
+    if (k > 0.6 && chance(dt / 6)) { world.lightning = 1; world.bolt = { x: rand(W * 0.1, W * 0.9), t: 0.25 }; world.thunder = 1.2; }
+    if (world.thunder > 0) { world.thunder -= dt; if (world.thunder < 0.6 && world.thunder + dt >= 0.6) { addPopup('KRAKOOM', W * 0.5 - 14, H * 0.2, '#e0e8ff'); for (const p of crew) if (chance(0.4)) p.emote('bang', 1); } }
+  }
+  world.cloud = 0; world.rain = 0; world.swellT = world.baseSwell;
+  if (world.night < 0.5) { world.rainbow = 1; }
+}
+function* evNavy() {
+  const nv = { x: W + 60, t: 0, shots: 0 };
+  world.navy = nv;
+  lookout('NAVY!');
+  captain.emote('anger', 2);
+  const gunners = takeCrew(2);
+  for (const [i, p] of gunners.entries()) p.brain = walkDeck(p, 60 + i * 26);
+  let t = 0;
+  while (nv.x > -80) {
+    const dt = yield; t += dt; nv.x -= (world.v * 0.5 + 6) * dt;
+    // exchange of cannon fire; everyone misses
+    if (nv.x < W * 0.9 && nv.x > W * 0.15 && chance(dt * 0.9)) {
+      if (chance(0.5)) { addPart(nv.x - 8, HOR + 2, 0, -6, 1.2, '#e8e8e8', { smoke: true }); world.shots.push({ x0: nv.x - 8, y0: HOR + 2, x1: SHIPX + rand(-60, 60), y1: WL + rand(-2, 10), t: 0, dur: 1.2, hit: 'sea' }); }
+      else { const g = pick(gunners); if (g) { const [x, y] = shipXY(g.sx + 2, DECK + 11); addPopup('BOOM', x, y - 10, '#ffe0a0'); for (let i = 0; i < 6; i++) addPart(x, y, rand(-10, 10), rand(-10, -2), 1.4, '#dcdcdc', { smoke: true }); world.shots.push({ x0: x, y0: y, x1: nv.x + rand(-20, 20), y1: HOR + rand(1, 5), t: 0, dur: 1.4, hit: 'sea' }); g.emote('bang', 0.8); } }
+    }
+    if (t > 60) break;
+  }
+  world.navy = null;
+  captain.emote('sparkle', 2); for (const p of gunners) { p.pose = 'cheer'; p.emote('note', 2); }
+  yield* wait(2.5);
+}
+function* evTreasure() {
+  const [a, b] = takeCrew(2);
+  if (!a || !b) { yield* wait(1); return; }
+  yield* all(walkDeck(a, 118), walkDeck(b, 108));
+  a.f = b.f = 1;
+  world.net = { y: 0, full: false };
+  for (let i = 0; i < 16; i++) { a.pose = i % 2 ? 'pull1' : 'pull2'; b.pose = i % 2 ? 'pull2' : 'pull1'; world.net.y = Math.min(1, i / 12); yield* wait(0.4); }
+  world.net.full = true; addPopup('TREASURE!', shipXY(120, DECK - 26)[0], shipXY(120, DECK - 26)[1], '#ffe070');
+  for (const p of crew) { p.emote(p.role === 'captain' ? 'coin' : pick(['coin', 'heart']), 2); }
+  a.pose = b.pose = 'cheer';
+  for (let i = 0; i < 20; i++) { const [x, y] = shipXY(126, DECK - 6); addPart(x + rand(-4, 4), y, rand(-10, 10), rand(-30, -10), 1.2, pick(['#ffd23a', '#fff0a0', '#e8b020']), { grav: 50, coin: true }); }
+  yield* wait(3);
+  world.net = null; world.chest = 40;
+}
+function* evShanty() {
+  const band = takeCrew(4);
+  const fid = band[0];
+  if (fid) { fid.pose = 'fiddle'; }
+  let t = 0;
+  while (t < 20) {
+    const dt = yield; t += dt;
+    if (fid) fid.pose = 'fiddle';
+    for (const [i, p] of band.entries()) if (p !== fid) { p.pose = Math.floor(t * 3 + i) % 2 ? 'dance1' : 'dance2'; p.hop = Math.abs(Math.sin(t * 5 + i)) * 2; if (chance(dt * 0.3)) p.f = -p.f; }
+    if (chance(dt * 2)) { const p = pick(band); if (p) { const [x, y] = shipXY(p.sx, p.deck - 20); addPopupIcon('note', x, y); } }
+    if (Math.floor(t / 5) !== Math.floor((t - dt) / 5)) { const [x, y] = shipXY(70, DECK - 36); addPopup(pick(['YO HO YO HO', 'WHAT SHALL WE DO', 'HEAVE AWAY', 'A PIRATES LIFE']), x, y, '#fff4c0'); }
+  }
+  for (const p of band) { p.hop = 0; }
+}
+function* evBottle() {
+  const bt = { x: W + 10, row: 0.85 };
+  world.bottle = bt;
+  const [p] = takeCrew(1);
+  while (bt.x > SHIPX + 70) { const dt = yield; bt.x -= world.v * 0.9 * dt; }
+  if (p) { yield* walkDeck(p, 124); p.f = 1; p.pose = 'rod'; yield* wait(1); world.bottle = null; p.pose = 'stand'; p.emote('q', 1.5); yield* wait(1.5); p.pose = 'point'; const [x, y] = shipXY(p.sx, p.deck - 24); addPopup(pick(['A MAP!', 'X MARKS THE SPOT', 'HELP I AM A BOTTLE']), x, y, '#fff4c0'); captain.emote('sparkle', 2); yield* wait(2.5); }
+  else { while (bt.x > -20) { const dt = yield; bt.x -= world.v * 0.9 * dt; } world.bottle = null; }
+}
+function* evOverboard() {
+  const [p] = takeCrew(1); if (!p) { yield* wait(1); return; }
+  yield* walkDeck(p, 96);
+  p.f = 1; p.pose = 'stand'; p.emote('sweat', 1);
+  yield* wait(1);
+  // a big wave!
+  world.shake = 0.4; addPopup('WHOOPS', shipXY(96, DECK - 30)[0], shipXY(96, DECK - 30)[1], '#ffffff');
+  let [x, y] = shipXY(p.sx, p.deck); p.overboard = true; p.ox = x; p.oy = y;
+  let vx = 18, vy = -40;
+  while (p.oy < WL + 6) { const dt = yield; vy += 120 * dt; p.ox += vx * dt; p.oy += vy * dt; }
+  splash(p.ox, WL + 4, 14); p.pose = 'cheer'; p.oy = WL + 8;
+  const [r] = takeCrew(1);
+  if (r) { yield* walkDeck(r, 112); r.f = 1; r.pose = 'point'; const ring = { x: shipXY(r.sx, r.deck - 8)[0], y: shipXY(r.sx, r.deck - 8)[1] }; world.ring = ring; let t = 0; while (t < 0.8) { const dt = yield; t += dt; ring.x = lerp(ring.x, p.ox, dt * 4); ring.y = lerp(ring.y, p.oy - 4, dt * 4); } }
+  let t = 0; while (t < 3) { const dt = yield; t += dt; p.ox -= world.v * 0.2 * dt; p.oy = WL + 8 + Math.sin(t * 4) * 1.5; if (world.ring) { world.ring.x = p.ox; world.ring.y = p.oy - 4; } }
+  // hauled back aboard
+  const [tx, ty] = shipXY(112, DECK - 1);
+  t = 0; while (t < 2) { const dt = yield; t += dt; p.ox = lerp(p.ox, tx, dt * 2); p.oy = lerp(p.oy, ty, dt * 2); if (world.ring) { world.ring.x = p.ox; world.ring.y = p.oy - 4; } }
+  world.ring = null; p.overboard = false; p.sx = 112; p.deck = DECK - 1; p.pose = 'stand';
+  p.emote('heart', 2); if (r) { r.emote('sparkle', 2); r.pose = 'cheer'; }
+  for (let i = 0; i < 8; i++) { const [xx, yy] = shipXY(112, DECK - 6); addPart(xx + rand(-3, 3), yy, rand(-8, 8), rand(-10, 0), 0.5, '#bfe4f0', { grav: 60 }); }
+  yield* wait(2.5);
+}
+function* evGull() {
+  const g = { x: W + 20, y: H * 0.2, state: 'in', t: 0, hat: false };
+  world.thief = g;
+  const [hx, hy] = shipXY(captain.sx, captain.deck - 15);
+  while (Math.hypot(g.x - hx, g.y - hy) > 2) { const dt = yield; g.t += dt; const [tx, ty] = shipXY(captain.sx, captain.deck - 15); const dx = tx - g.x, dy = ty - g.y, d = Math.hypot(dx, dy); g.x += dx / d * Math.min(d, 60 * dt); g.y += dy / d * Math.min(d, 60 * dt); }
+  g.hat = true; captain.hatless = true; captain.L = Object.assign({}, captain.L, { tricorn: false, hat: captain.L.skin, id: 'caphatless' }); captain.emote('anger', 2);
+  addPopup('MY HAT!', shipXY(captain.sx, captain.deck - 26)[0], shipXY(captain.sx, captain.deck - 26)[1], '#ffffff');
+  parrot.state = 'chase'; parrot.hold = true;
+  let t = 0;
+  while (t < 10) {
+    const dt = yield; t += dt; g.t += dt;
+    g.x += Math.sin(g.t * 1.3) * 40 * dt + 6 * dt; g.y = H * 0.18 + Math.sin(g.t * 2) * 12;
+    const [px0, py0] = shipXY(parrot.sx, parrot.sy); const dx = g.x - px0, dy = g.y - py0;
+    parrot.sx += dx * dt * 1.8; parrot.sy += dy * dt * 1.8; parrot.f = dx > 0 ? 1 : -1; parrot.anim += dt;
+    if (t > 6 && Math.hypot(dx, dy) < 6) break;
+  }
+  addPopup('SQUAWK!', g.x - 10, g.y - 10, '#8aff8a');
+  g.hat = false; world.hatFly = { x: g.x, y: g.y };
+  // the parrot brings it back
+  let hb = world.hatFly;
+  while (true) { const dt = yield; const [tx, ty] = shipXY(captain.sx, captain.deck - 16); const [px0, py0] = shipXY(parrot.sx, parrot.sy); const dx = tx - px0, dy = ty - py0, d = Math.hypot(dx, dy); if (d < 2) break; parrot.sx += dx / d * Math.min(d, 40 * dt); parrot.sy += dy / d * Math.min(d, 40 * dt); hb.x = shipXY(parrot.sx, parrot.sy)[0]; hb.y = shipXY(parrot.sx, parrot.sy)[1] + 4; g.x += 50 * dt; g.y -= 10 * dt; }
+  world.hatFly = null; world.thief = null;
+  captain.L = crew[0].L.id === 'caphatless' ? Object.assign({}, captain.L, { tricorn: true, id: 'cap' }) : captain.L; captain.hatless = false;
+  captain.emote('heart', 2); parrot.state = 'perch'; parrot.hold = false; parrot.t = 0;
+  yield* wait(2);
+}
+function* evFishing() {
+  const m = monkey; m.busy = true; m.brain = null; m.climbing = false; m.climbY = 0;
+  yield* walkDeck(m, 124, 18);
+  m.f = 1; m.pose = 'stand'; world.rod = { t: 0, catch: null };
+  let t = 0; while (t < 8) { const dt = yield; t += dt; world.rod.t = t; }
+  const c = pick(['boot', 'fish', 'fish', 'crab']);
+  world.rod.catch = c; splash(shipXY(140, DECK + 30)[0], WL + 2, 8);
+  const [x, y] = shipXY(m.sx, m.deck - 20);
+  addPopup(c === 'boot' ? 'A BOOT?' : c === 'crab' ? 'OUCH' : 'FISH!', x, y, '#ffffff');
+  m.emote(c === 'boot' ? 'q' : c === 'crab' ? 'sweat' : 'heart', 2);
+  yield* wait(3);
+  world.rod = null; m.busy = false; m.brain = monkeyAmbient();
+}
+function* evKraken() {
+  const kr = { t: 0, arms: [0, 1, 2, 3, 4].map(i => ({ sx: [8, 40, 76, 104, 138][i], side: i % 2 ? 1 : -1, h: 0, ph: rand(0, TAU), front: i % 2 === 0 })) };
+  world.kraken = kr;
+  world.shake = 0.6; addPopup('KRAKEN!', W / 2 - 14, H * 0.25, '#ff8a8a');
+  const fighters = takeCrew(4);
+  for (const [i, p] of fighters.entries()) p.brain = (function* () { yield* walkDeck(p, [30, 60, 90, 116][i]); while (true) { p.pose = Math.floor(world.t * 4 + i) % 2 ? 'mop1' : 'mop2'; yield; } })();
+  captain.emote('anger', 2);
+  let t = 0;
+  while (t < 22) {
+    const dt = yield; t += dt; kr.t = t;
+    for (const [i, a] of kr.arms.entries()) { a.h = smooth(i * 0.6, i * 0.6 + 2, t) * (1 - smooth(16 + i * 0.4, 19 + i * 0.4, t)) * (26 + i * 3); a.ph += dt * 2; }
+    world.shake = Math.max(world.shake, 0.08);
+    if (chance(dt * 1.5) && t > 3 && t < 15) { const g = pick(fighters); if (g) { const [x, y] = shipXY(g.sx, g.deck - 18); addPopup(pick(['BONK', 'TAKE THAT', 'ARR']), x, y, '#ffffff'); } }
+    if (Math.abs(t - 15) < dt) { addPopup('BLUB', W / 2, WL, '#c8e0ff'); }
+  }
+  world.kraken = null;
+  for (const p of crew) { p.emote('sparkle', 2); }
+  yield* wait(2);
+}
+function* evGhost() {
+  const gs = { x: W + 100, t: 0 };
+  world.ghostShip = gs;
+  world.fogT = 1;
+  let t = 0;
+  while (gs.x > -150) { const dt = yield; t += dt; gs.t = t; gs.x -= (world.v * 0.4 + 4) * dt; if (Math.abs(gs.x - SHIPX) < 2) for (const p of crew) p.emote('sweat', 2); if (t > 50) break; }
+  world.ghostShip = null; world.fogT = 0;
+}
+function* evSerpent() {
+  const sp = { x: W + 20, t: 0 };
+  world.serpent = sp;
+  lookout('SEA SERPENT!');
+  let t = 0;
+  while (sp.x > -100) { const dt = yield; t += dt; sp.t = t; sp.x -= world.v * 0.7 * dt + 10 * dt; if (t > 40) break; }
+  world.serpent = null;
+}
+function* evMermaid() {
+  const mm = { x: W + 30, t: 0, wave: 0 };
+  world.mermaid = mm;
+  let t = 0, waved = false;
+  while (mm.x > -40) {
+    const dt = yield; t += dt; mm.t = t; mm.x -= world.v * 0.8 * dt;
+    if (!waved && mm.x < SHIPX + 60) { waved = true; for (const p of crew) { p.emote('heart', 2.5); } addPopup('HELLO SAILORS', mm.x - 20, WL - 30, '#ffd0f0'); }
+  }
+  world.mermaid = null;
+}
+function* evGlow() {
+  let t = 0;
+  while (t < 40) { const dt = yield; t += dt; world.glow = smooth(0, 4, t) * (1 - smooth(34, 40, t)); if (Math.abs(t - 5) < dt) for (const p of crew) p.emote('sparkle', 2); }
+  world.glow = 0;
+}
+function addPopupIcon(name, x, y) { world.popups.push({ icon: name, x, y, t: 0 }); }
+const COMMON = { dolphins: 1.2, whale: 1, island: 1, storm: 0.7, navy: 0.9, treasure: 1, shanty: 1, bottle: 0.9, overboard: 0.8, gull: 1, fishing: 1 };
+const RARE = { kraken: 1.2, ghost: 1, serpent: 1, mermaid: 0.9, glow: 1 };
+const FITS = { ghost: () => world.night > 0.5, glow: () => world.night > 0.5, mermaid: () => world.night < 0.8, navy: () => world.night < 0.7, island: () => true };
+const EVENTS = { dolphins: evDolphins, whale: evWhale, island: evIsland, storm: evStorm, navy: evNavy, treasure: evTreasure, shanty: evShanty, bottle: evBottle, overboard: evOverboard, gull: evGull, fishing: evFishing, kraken: evKraken, ghost: evGhost, serpent: evSerpent, mermaid: evMermaid, glow: evGlow };
+const director = { cur: null, name: '', cool: 6, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 4 : rand(10, 22); cleanupEvent(); }
+  } else if ((director.cool -= dt) <= 0) {
+    const allEv = Object.keys(EVENTS);
+    let name;
+    if (FORCE) name = FORCE === 'all' ? allEv[director.idx++ % allEv.length] : FORCE;
+    else {
+      const fit = tbl => Object.fromEntries(Object.entries(tbl).map(([k, w]) => [k, (FITS[k] && !FITS[k]()) || k === director.last ? 0 : w]));
+      name = chance(0.14) ? weighted(fit(RARE)) : null;
+      if (!name) name = weighted(fit(COMMON));
+    }
+    if (!EVENTS[name]) { director.cool = 5; return; }
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; cleanupEvent(); }
+  }
+}
+function cleanupEvent() {
+  world.dolphins = world.whale = world.island = world.navy = world.net = world.bottle = world.ring = world.thief = world.hatFly = world.rod = world.kraken = world.ghostShip = world.serpent = world.mermaid = null;
+  world.rain = 0; world.cloud = 0; world.glow = 0; world.fogT = 0; world.swellT = world.baseSwell;
+  if (captain) { if (captain.L.id === 'caphatless') captain.L = Object.assign({}, captain.L, { tricorn: true, id: 'cap' }); captain.pose = 'helm'; }
+  if (parrot) { parrot.hold = false; if (parrot.state === 'chase') parrot.state = 'fly'; }
+  for (const p of crew) { p.hop = 0; p.overboard = false; p.hidden = false; }
+  releaseCrew();
+  if (monkey && monkey.busy) { monkey.busy = false; monkey.brain = monkeyAmbient(); }
+}
+
+// ---------------------------------------------------------------- update + render
+function update(dt) {
+  world.t += dt;
+  updateLight();
+  world.dist += world.v * dt;
+  if (!SEA) { world.swellClock = (world.swellClock || 0) + dt; if (world.swellClock > 180) { world.swellClock = 0; world.baseSwell = rand(0.6, 1.5); if (director.name !== 'storm') world.swellT = world.baseSwell; } }
+  world.swell = lerp(world.swell, world.swellT, 1 - Math.exp(-dt * 0.4));
+  world.fog = lerp(world.fog, world.fogT || 0, 1 - Math.exp(-dt * 0.5));
+  runDirector(dt);
+  for (const p of crew) { if (!p.busy && !p.brain) p.brain = crewAmbient(p); p.update(dt); }
+  if (!monkey.busy && !monkey.brain) monkey.brain = monkeyAmbient();
+  monkey.update(dt);
+  if (!parrot.hold) updateParrot(dt);
+  updateShip(dt);
+  shipSpray(dt);
+  for (const p of world.parts) { p.life -= dt; if (p.wake) { p.x += p.vx * dt; p.y = p.y; continue; } p.vy += p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt; if (p.smoke) { p.vx -= world.v * 0.3 * dt; } if (p.grav && p.y > WL + 10 && !p.coin) p.life = 0; }
+  world.parts = world.parts.filter(p => p.life > 0 && p.x > -20 && p.x < W + 20);
+  if (world.rain > 0) for (let i = 0; i < world.rain * dt * 160 * (W / 320); i++) addPart(rand(-10, W + 30), -3, -30, rand(170, 210), 1.6, '#b8c8dc', { rain: true });
+  for (const p of world.parts) if (p.rain && p.y > HOR + (p.x % 40)) { p.life = 0; }
+  for (const p of world.popups) p.t += dt; world.popups = world.popups.filter(p => p.t < 1.8);
+  for (const c of scene.clouds) { c.x -= dt * (world.v * 0.12 + 1); if (c.x < -60) { c.x = W + 60; c.y = rand(H * 0.05, H * 0.3); } }
+  for (const g of scene.gulls) { g.ph += dt; g.x += (g.vx - world.v * 0.15) * dt; g.y += Math.sin(g.ph * 0.7) * 3 * dt; if (g.x < -20) g.x = W + 20; if (g.x > W + 20) g.x = -20; }
+  for (const f of scene.far) { f.x -= world.v * 0.08 * dt; if (f.x < -f.w - 10) { f.x = W + rand(10, 200); f.w = rand(20, 60); f.h = rand(3, 8); } }
+  world.lightning = Math.max(0, world.lightning - dt * 3); if (world.bolt) { world.bolt.t -= dt; if (world.bolt.t <= 0) world.bolt = null; }
+  world.shake = Math.max(0, world.shake - dt);
+  if (world.rainbow > 0) world.rainbow = Math.max(0, world.rainbow - dt / 30);
+  if (world.chest > 0) world.chest -= dt;
+  for (const s of world.shots) s.t += dt; for (const s of world.shots) if (s.t >= s.dur && !s.done) { s.done = true; splash(s.x1, s.y1, s.y1 > WL - 5 ? 12 : 6, s.y1 > WL - 5 ? 1 : 0.4); }
+  world.shots = world.shots.filter(s => !s.done);
+}
+function drawFarThings() {
+  // distant islands on the horizon
+  for (const f of scene.far) { const x = Math.round(f.x), c = mixHex('#6a8aa8', '#1a2238', world.night); for (let i = 0; i < f.w; i++) { const h = Math.sin(i / f.w * Math.PI) * f.h; rect(x + i, HOR - h, 1, h + 1, c); } }
+  if (world.island) drawIsland(world.island);
+  if (world.whale) drawWhale(world.whale);
+  if (world.navy) drawNavy(world.navy);
+  if (world.ghostShip) drawGhost(world.ghostShip);
+}
+function drawIsland(isl) {
+  const x = Math.round(isl.x), y = HOR + 6;
+  ellipse(x, y + 2, 46, 5, '#e8d8a0'); ellipse(x, y - 2, 38, 8, '#4a9a4a'); ellipse(x - 10, y - 8, 20, 7, '#3a8a44'); ellipse(x + 12, y - 5, 18, 6, '#5aa84a');
+  ellipse(x, y + 5, 50, 2, '#a8e0e0');
+  for (let i = 0; i < isl.palms; i++) { const px0 = x - 24 + i * 18, h = 18 + (i % 2) * 4; for (let k = 0; k < h; k++) px(px0 + Math.sin(k * 0.12) * 3, y - 6 - k, '#8a6a3a'); const tx = px0 + Math.sin(h * 0.12) * 3, ty = y - 6 - h; for (let a = 0; a < 6; a++) { const ang = -Math.PI / 2 + (a - 2.5) * 0.55 + Math.sin(world.t + a) * 0.08; for (let k = 0; k < 8; k++) px(tx + Math.cos(ang) * k, ty + Math.sin(ang) * k + k * k * 0.08, '#3a8a3a'); } px(tx, ty + 1, '#6a4a2a'); px(tx + 1, ty + 2, '#6a4a2a'); }
+  if (isl.hut) { rect(x + 14, y - 12, 8, 6, '#b08a5a'); for (let k = 0; k < 5; k++) rect(x + 12 + k, y - 13 - k, 12 - k * 2, 1, '#d8c070'); }
+  if (isl.treasure) { rect(x - 4, y - 5, 5, 3, '#8a5a2a'); rect(x - 4, y - 6, 5, 1, '#e8c060'); if (Math.floor(world.t * 3) % 2) px(x - 2, y - 7, '#fff4a0'); }
+}
+function drawWhale(w) {
+  const x = Math.round(w.x), y = HOR + 8, up = w.up || 0;
+  if (up <= 0.01) return;
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, y + 1); ctx.clip();
+  ellipse(x, y + 5 - up * 6, 26, 6, '#3a4a6a'); ellipse(x - 4, y + 3 - up * 6, 20, 3, '#4e5e80');
+  ctx.restore();
+  if (w.t > 18) { const k = smooth(18, 24, w.t); for (let i = 0; i < 6; i++) px(x - 30 - i, y - k * 8 + i * 0.4, '#3a4a6a'); rect(x - 38, y - k * 10, 4, 2, '#3a4a6a'); rect(x - 32, y - k * 10, 4, 2, '#3a4a6a'); }
+  if (w.spout > 0) for (let i = 0; i < 10; i++) { const k = i / 10; px(x + 10 + Math.sin(i) * k * 4, y - 2 - up * 6 - k * 14 * Math.min(1, w.spout * 1.5), '#e8f4ff'); }
+  for (let i = -24; i < 24; i += 3) if (hash2(i, Math.floor(world.t * 4)) < 0.4) px(x + i, y + 2, '#e8f4ff');
+}
+function drawNavy(nv) {
+  const x = Math.round(nv.x), y = HOR + 4;
+  rect(x - 16, y - 4, 32, 5, '#3a3a4a'); rect(x - 14, y - 2, 28, 1, '#e8e8e8');
+  for (const [mx, h] of [[x - 8, 18], [x + 4, 22]]) { rect(mx, y - 4 - h, 1, h, '#4a3a2a'); rect(mx - 5, y - 4 - h + 3, 11, 7, '#f0ece0'); rect(mx - 4, y - 4 - h + 11, 9, 5, '#f0ece0'); }
+  rect(x + 4, y - 30, 5, 3, '#c83a3a'); rect(x + 4, y - 29, 5, 1, '#ffffff');
+}
+function drawGhost(gs) {
+  const x = Math.round(gs.x), y = HOR + 10;
+  ctx.globalAlpha = 0.45 + Math.sin(gs.t * 2) * 0.1;
+  rect(x - 30, y - 8, 60, 8, '#4a8a6a'); for (let i = 0; i < 60; i += 4) px(x - 30 + i, y - 4, '#8affc0');
+  for (const [mx, h] of [[x - 14, 34], [x + 4, 40], [x + 20, 28]]) { rect(mx, y - 8 - h, 1, h, '#4a8a6a'); for (let yy = 0; yy < h - 6; yy++) { const w = 7 + Math.sin(yy * 0.9 + gs.t) * 2; if (hash2(mx, yy) < 0.75) rect(mx - w, y - 8 - h + 4 + yy, w * 2, 1, '#a8f0c8'); } }
+  ctx.globalAlpha = 1;
+  glowAt(x, y - 20, 60, '#60ffb0', 0.4, true);
+}
+function drawSeaCreatures(front) {
+  const inFront = y => (y > WL + 1) === !!front;
+  if (world.dolphins) for (const d of world.dolphins) {
+    const k = ((d.t * 0.6 + d.ph) % 1), jump = Math.sin(k * Math.PI), y0 = lerp(HOR, H, d.row) - 2;
+    if (k > 0.55 || !inFront(y0)) continue;
+    const kk = k / 0.55, x = d.x, y = y0 - Math.sin(kk * Math.PI) * 14;
+    const ang = Math.cos(kk * Math.PI) * 0.9;
+    for (let i = -7; i <= 7; i++) { const th = i > 4 ? 1 : i < -5 ? 1 : 2, xx = x + i * Math.cos(ang), yy = y - i * Math.sin(ang); ctx.fillStyle = '#2a3a5a'; ctx.fillRect(Math.round(xx), Math.round(yy - th - 1), 1, th * 2 + 3); ctx.fillStyle = '#6a8ab8'; ctx.fillRect(Math.round(xx), Math.round(yy - th), 1, th * 2 + 1); ctx.fillStyle = '#d8e4f0'; ctx.fillRect(Math.round(xx), Math.round(yy + th - 1), 1, 1); }
+    const nx = x + 8 * Math.cos(ang), ny = y - 8 * Math.sin(ang); px(nx, ny, '#6a8ab8'); px(nx + Math.cos(ang), ny - Math.sin(ang), '#4a6a98');
+    for (let k = 0; k < 3; k++) px(x - 1 + k * 0.5, y - 3 - k, '#4a6a98');
+    const tx = x - 8 * Math.cos(ang), ty = y + 8 * Math.sin(ang); px(tx - 1, ty - 2, '#4a6a98'); px(tx - 1, ty + 2, '#4a6a98'); px(tx - 2, ty - 3, '#4a6a98'); px(tx - 2, ty + 3, '#4a6a98');
+    px(x + 5 * Math.cos(ang), y - 5 * Math.sin(ang) - 1, INK);
+    if (kk < 0.1 || kk > 0.9) splash(x, y0, 2, 0.4);
+  }
+  if (world.bottle && inFront(lerp(HOR, H, world.bottle.row))) { const b = world.bottle, y = lerp(HOR, H, b.row) + Math.sin(world.t * 3) * 1.5; rect(b.x - 2, y - 1, 5, 2, '#5ab07a'); px(b.x + 3, y - 1, '#8a6a3a'); px(b.x - 1, y - 1, '#e8e0c0'); }
+  if (world.serpent && inFront(lerp(HOR, H, 0.45))) { const s = world.serpent, y = lerp(HOR, H, 0.45); for (let h = 0; h < 4; h++) { const x = s.x + h * 18, up = Math.max(0, Math.sin(s.t * 2 - h * 0.9)) * 6; ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, y + 1); ctx.clip(); ellipse(x, y + 3 - up, 7, 5, '#3a8a5a'); ellipse(x, y + 1 - up, 5, 2, '#5aaa6a'); ctx.restore(); } const hx = s.x - 10, hy = y - 8 - Math.sin(s.t * 1.5) * 3; ellipse(hx, hy, 5, 3, '#3a8a5a'); rect(hx - 1, hy, 2, y - hy, '#3a8a5a'); px(hx - 3, hy - 1, '#ffe040'); px(hx - 6, hy + 1, '#e04040'); px(hx - 7, hy + 2, '#e04040'); for (let i = 0; i < 4; i++) px(hx + 2 + i * 2, hy - 3, '#e07a3a'); }
+  if (world.mermaid && inFront(lerp(HOR, H, 0.62))) { const m = world.mermaid, y = lerp(HOR, H, 0.62), x = Math.round(m.x); ellipse(x, y + 2, 7, 3, '#7a7a86'); ellipse(x, y, 6, 2, '#9a9aa8'); ellipse(x + 2, y - 3, 3, 1.5, '#3ab8a8'); px(x + 5, y - 2, '#3ab8a8'); px(x + 6, y - 3, '#3ab8a8'); rect(x - 2, y - 9, 3, 5, '#f4c8a8'); rect(x - 2, y - 6, 3, 1, '#e84a8a'); disc(x - 1, y - 11, 1.6, '#f4c8a8'); rect(x - 3, y - 12, 1, 7, '#f07a3a'); rect(x - 2, y - 13, 3, 1, '#f07a3a'); if (Math.floor(world.t * 3) % 2) { px(x + 2, y - 11, '#f4c8a8'); px(x + 3, y - 12, '#f4c8a8'); } else { px(x + 2, y - 9, '#f4c8a8'); px(x + 3, y - 9, '#f4c8a8'); } }
+}
+function drawKraken(front) {
+  const kr = world.kraken; if (!kr) return;
+  for (const a of kr.arms) {
+    if (a.front !== front || a.h < 1) continue;
+    const [bx] = shipXY(a.sx, 0), base = WL + (front ? 10 : 2);
+    for (let i = 0; i < a.h; i++) {
+      const k = i / Math.max(1, a.h), x = bx + a.side * (4 + Math.sin(a.ph + k * 4) * 5 * k) + (front ? 0 : 0), y = base - i;
+      const r = Math.max(1, 3.5 - k * 2.5);
+      ctx.fillStyle = '#4a2a4a'; ctx.fillRect(Math.round(x - r - 1), Math.round(y), Math.round(r * 2 + 2), 1);
+      ctx.fillStyle = k > 0.85 ? '#b85a8a' : '#8a3a7a'; ctx.fillRect(Math.round(x - r), Math.round(y), Math.round(r * 2), 1);
+      if (i % 3 === 0) px(x + a.side * r * 0.5, y, '#f0b8d8');
+    }
+  }
+}
+function render() {
+  ctx = mainCtx;
+  ctx.save();
+  if (world.shake > 0.01) ctx.translate(Math.round(rand(-1, 1) * world.shake * 3), Math.round(rand(-1, 1) * world.shake * 2));
+  drawSky();
+  if (world.rainbow > 0) { const a = Math.min(1, world.rainbow * 3) * 0.35, cx = W * 0.7, cy = HOR + 10, R = HOR * 0.8; ctx.globalAlpha = a; ['#ff5a5a', '#ffa040', '#ffe060', '#6ad06a', '#5aa0ff', '#8a6aff'].forEach((c, i) => { ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, cy, R - i * 2, Math.PI, TAU); ctx.stroke(); }); ctx.globalAlpha = 1; }
+  drawSea(false);
+  drawFarThings();
+  for (const g of scene.gulls) { const up = Math.floor(world.t * 6 + g.ph) % 2; const c = world.night > 0.5 ? '#6a6a80' : '#f4f4f0'; px(g.x, g.y, c); px(g.x - 1, g.y - up, c); px(g.x + 1, g.y - up, c); px(g.x - 2, g.y - up * 2 + 1, c); px(g.x + 2, g.y - up * 2 + 1, c); }
+  drawSeaCreatures(false);
+  for (const p of world.parts) if (p.wake) { ctx.globalAlpha = clamp(p.life / p.max, 0, 0.8); rect(p.x, p.y, 3, 1, p.col); ctx.globalAlpha = 1; }
+  drawKraken(false);
+  drawShip();
+  drawCrew();
+  // treasure net, rod, ring, hat, chest
+  if (world.net) { const [x, y] = shipXY(126, DECK + 30 - world.net.y * 40); line(shipXY(124, DECK - 16)[0], shipXY(124, DECK - 16)[1], x, y, '#6a5a4a'); rect(x - 4, y, 8, 6, '#8a7a5a'); if (world.net.full || world.net.y > 0.5) { rect(x - 3, y + 1, 6, 4, '#8a5a2a'); rect(x - 3, y + 1, 6, 1, '#e8c060'); } for (let i = -4; i < 4; i += 2) line(x + i, y, x + i + 2, y + 6, '#a8987a'); }
+  if (world.chest > 0) { const [x, y] = shipXY(100, DECK - 1); rect(x - 4, y - 5, 8, 5, '#8a5a2a'); rect(x - 4, y - 6, 8, 2, '#a8702e'); rect(x - 1, y - 4, 2, 2, '#e8c060'); if (Math.floor(world.t * 4) % 3 === 0) px(x + rand(-4, 4), y - 7, '#fff4a0'); }
+  if (world.rod) { const [x, y] = shipXY(monkey.sx + 2, monkey.deck - 8); const tx = x + 16, ty = y - 8; line(x, y, tx, ty, '#8a6038'); const bob = Math.sin(world.t * 3) * 1.5; line(tx, ty, tx + 6, WL + 4 + bob, '#d8d8d8'); if (world.rod.catch) { const c = world.rod.catch; if (c === 'boot') rect(tx + 4, ty + 6, 3, 4, '#5a3a24'); else if (c === 'crab') { rect(tx + 4, ty + 6, 4, 2, '#e05a3a'); px(tx + 3, ty + 5, '#e05a3a'); px(tx + 8, ty + 5, '#e05a3a'); } else { rect(tx + 4, ty + 6, 2, 5, '#8ab0c8'); px(tx + 3, ty + 11, '#8ab0c8'); px(tx + 6, ty + 11, '#8ab0c8'); } } }
+  if (world.ring) { const r = world.ring; ring2(r.x, r.y, 3, 2, '#e84a3a'); }
+  if (world.hatFly) { rect(world.hatFly.x - 3, world.hatFly.y, 6, 1, '#2a2226'); rect(world.hatFly.x - 2, world.hatFly.y - 1, 4, 1, '#2a2226'); }
+  if (world.thief) { const g = world.thief, up = Math.floor(world.t * 8) % 2; px(g.x, g.y, '#f4f4f0'); px(g.x - 1, g.y - up, '#f4f4f0'); px(g.x + 1, g.y - up, '#f4f4f0'); px(g.x - 2, g.y - up * 2 + 1, '#b8b8c0'); px(g.x + 2, g.y - up * 2 + 1, '#b8b8c0'); px(g.x + 1, g.y + 1, '#f0a030'); if (g.hat) { rect(g.x - 3, g.y + 2, 6, 1, '#2a2226'); rect(g.x - 2, g.y + 1, 4, 1, '#2a2226'); } }
+  for (const s of world.shots) { const k = clamp(s.t / s.dur, 0, 1); disc(lerp(s.x0, s.x1, k), lerp(s.y0, s.y1, k) - Math.sin(Math.PI * k) * 16, 1, '#2a2a2a'); }
+  drawSea(true);
+  drawSeaCreatures(true);
+  drawKraken(true);
+  // particles
+  for (const p of world.parts) {
+    if (p.wake) continue;
+    if (p.rain) { ctx.fillStyle = p.col; ctx.fillRect(Math.round(p.x), Math.round(p.y), 1, 3); continue; }
+    if (p.smoke) { ctx.globalAlpha = clamp(p.life / p.max, 0, 0.7); disc(p.x, p.y, 1.5 + (1 - p.life / p.max) * 3, p.col); ctx.globalAlpha = 1; continue; }
+    px(p.x, p.y, p.col);
+  }
+  if (world.bolt) { let x = world.bolt.x, y = 0; while (y < HOR) { const nx = x + rand(-6, 6), ny = y + rand(5, 10); line(x, y, nx, ny, '#f8f8ff'); x = nx; y = ny; } }
+  if (world.fog > 0.02) { for (let y = HOR - 10; y < H; y += 2) { ctx.globalAlpha = world.fog * 0.2 * (0.5 + 0.5 * Math.sin(y * 0.3 + world.t)); rect(0, y, W, 2, '#9ac8b8'); } ctx.globalAlpha = 1; }
+  // night
+  if (world.night > 0.02 || world.cloud > 0.05) {
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = rgbStr(mixRgb([255, 255, 255], world.night > 0.3 ? [56, 66, 128] : [120, 128, 150], Math.max(world.night * 0.85, world.cloud * 0.4)));
+    ctx.fillRect(-4, -4, W + 8, H + 8);
+    ctx.globalCompositeOperation = 'source-over';
+    // lit stern windows + lanterns
+    for (let i = 0; i < 3; i++) { const [x, y] = shipXY(11 + i * 7, CASTLE + 8); rect(x, y, 2, 3, '#ffd890'); glowAt(x + 1, y + 1, 6, '#ffb860', 0.5); }
+    const [lx, ly] = shipXY(4, CASTLE - 12); rect(lx - 1, ly - 1, 3, 3, '#fff0b0'); glowAt(lx, ly, 18, '#ffb050', 0.8);
+    const [nx, ny] = shipXY(MAST.main, 17); glowAt(nx, ny, 10, '#ffb050', 0.4);
+  }
+  if (world.glow > 0) for (let i = 0; i < 40; i++) { const x = hash(i * 3.1 + Math.floor(world.t)) * W, y = lerp(HOR + 4, H, hash(i * 7.7)); if (Math.sin(world.t * 3 + i) > 0.2) { px(x, y, '#80ffd0'); glowAt(x, y, 5, '#40ffc0', world.glow * 0.6, true); } }
+  flushGlows();
+  if (world.dusk > 0.05 && world.night < 0.95) { ctx.globalCompositeOperation = 'soft-light'; ctx.globalAlpha = world.dusk * 0.4; rect(-4, -4, W + 8, H + 8, '#ff9a5a'); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+  if (world.lightning > 0.02) { ctx.globalAlpha = world.lightning * 0.45; rect(-4, -4, W + 8, H + 8, '#e8ecff'); ctx.globalAlpha = 1; }
+  // emotes + popups
+  for (const p of [...crew, monkey]) { if (p.hidden) continue; let [x, y] = shipXY(p.sx, p.deck); if (p.overboard) { x = p.ox; y = p.oy; } if (p.climbY) y -= p.climbY; for (const m of p.emotes) { const k = m.t / m.dur; if (k > 0.75 && Math.floor(world.t * 12) % 2) continue; drawSpr(ICONS[m.name], x, y - 17 - Math.min(1, k * 3) * 4, 1); } }
+  for (const p of world.popups) { const k = p.t / 1.8; if (k > 0.7 && Math.floor(world.t * 10) % 2) continue; if (p.icon) { drawSpr(ICONS[p.icon], p.x, p.y - k * 10, 1); continue; } text(p.str, clamp(p.x - textW(p.str) / 2, 2, W - textW(p.str) - 2), p.y - k * 6, p.col, '#00000080'); }
+  ctx.restore();
+  if (DEBUG) { const h = localHour(); text(`${director.name || '-'} ${String(Math.floor(h)).padStart(2, '0')}:${String(Math.floor((h % 1) * 60)).padStart(2, '0')} ${SAIL}`, 3, 3, '#ffffff', '#000000'); }
+}
+function ring2(cx, cy, rx, ry, c) { for (let a = 0; a < TAU; a += 0.3) px(cx + Math.cos(a) * rx, cy + Math.sin(a) * ry, c); }
+
+// ---------------------------------------------------------------- setup + main loop
+function resize() {
+  H = ROWS; W = Math.max(120, Math.round((ROWS * innerWidth) / Math.max(1, innerHeight)));
+  canvas.width = W; canvas.height = H;
+  mainCtx.imageSmoothingEnabled = false;
+  layout();
+  buildShip();
+  scene.stars = Array.from({ length: Math.round(W * HOR / 60) }, () => ({ x: randi(0, W - 1), y: randi(0, HOR - 10), ph: rand(0, TAU) }));
+  scene.clouds = Array.from({ length: 6 }, () => ({ x: rand(-20, W + 20), y: rand(H * 0.05, H * 0.3), puffs: Array.from({ length: randi(3, 5) }, (_, i) => [i * 7 + rand(-2, 2), rand(-1.5, 1.5), rand(3, 5)]) }));
+  scene.gulls = Array.from({ length: 4 }, () => ({ x: rand(0, W), y: rand(H * 0.1, H * 0.35), vx: rand(-8, 8), ph: rand(0, 10) }));
+  scene.far = Array.from({ length: 2 }, (_, i) => ({ x: rand(0, W) + i * W * 0.6, w: rand(20, 60), h: rand(3, 8) }));
+  world.parts = []; world.popups = []; world.shots = []; world.fx = [];
+  world.baseSwell = SEA === 'calm' ? 0.5 : SEA === 'rough' ? 1.9 : rand(0.7, 1.4);
+  world.swell = world.swellT = world.baseSwell;
+  makeCrew();
+  director.cur = null; director.cool = FORCE ? 3 : 6;
+  for (let i = 0; i < 90; i++) update(1 / 30);
+}
+addEventListener('resize', resize);
+resize();
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  try { const steps = Math.ceil(dt / 0.05); for (let i = 0; i < steps; i++) update(dt / steps); render(); } catch (e) { console.error(e); }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

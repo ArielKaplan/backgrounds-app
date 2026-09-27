@@ -1,0 +1,1278 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pixel Marble Machine Wallpaper</title>
+<script type="application/json" id="wallpaper-settings">
+{
+ "about": "Settings panel for the Backgrounds app. Each param is one #key=value option of this page.",
+ "name": "Marble Machine",
+ "description": "A hamster-powered marble run in an inventor mouse's workshop.",
+ "params": [
+  {"key": "pixels", "label": "Pixel size", "type": "range", "min": 100, "max": 400, "step": 10, "default": 200, "help": "Rows of big pixels on screen. Smaller = chunkier, bigger machine."},
+  {"key": "marbles", "label": "Marbles", "type": "range", "min": 6, "max": 40, "step": 1, "default": 28},
+  {"key": "time", "label": "Pretend time", "type": "time", "default": "", "help": "Leave empty to follow your real clock (the window and the wall clock)."},
+  {"key": "reset", "label": "Reset the lap counter", "type": "action", "help": "The counter on the machine remembers every lap, across days."},
+  {"key": "event", "label": "Repeat one event", "type": "select", "group": "testing", "default": "", "options": [["", "Off (normal)"], ["golden", "golden"], ["jam", "jam"], ["flood", "flood"], ["race", "race"], ["cat", "cat"], ["oil", "oil"], ["snack", "snack"], ["snail", "snail"], ["tea", "tea"], ["domino", "domino"], ["glow", "glow"], ["ride", "ride"], ["duck", "duck"], ["party", "party"], ["ghost", "ghost"], ["giant", "giant"], ["all", "all"]], "help": "Test mode: keeps repeating one event. 'all' cycles through every event."},
+  {"key": "speed", "label": "Time speed", "type": "range", "min": 0.25, "max": 10, "step": 0.25, "default": 1, "group": "testing", "help": "Runs time faster (for testing)."},
+  {"key": "debug", "label": "Debug overlay", "type": "toggle", "default": false, "group": "testing"}
+ ]
+}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #3a2a22; }
+  canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =====================================================================
+   PIXEL MARBLE MACHINE — a hamster-powered marble run in an inventor mouse's workshop
+   A hamster in a wheel drives the bucket lift. Marbles ride up, roll down the top rail,
+   swirl around the copper funnel, get split left or right by a flip-flop: left down the
+   brass helix and across the chimes, right around the loop, into the water-wheel and the
+   see-saw; then back along the bottom rail to the lift. The counter remembers every lap.
+   The window and the wall clock follow your real time.
+   Options (add to the end of the address, combine with &):
+     #pixels=200        vertical resolution in big pixels
+     #marbles=28        marbles in the machine
+     #time=21:00        pretend local time
+     #reset             reset the lap counter
+     #event=jam         test mode: repeat one event (or "all")
+     #speed=3           run time faster (testing)
+     #debug             event name, marble count
+   Events: golden jam flood race cat oil snack snail tea domino glow
+   Rare:   ride (the mouse rides the machine)  duck  party  ghost  giant
+   ===================================================================== */
+const params = new URLSearchParams(location.hash.slice(1));
+const num = (k, d) => { const v = parseFloat(params.get(k)); return Number.isFinite(v) ? v : d; };
+const ROWS = Math.round(Math.min(600, Math.max(80, num('pixels', 200))));
+const FORCE = params.get('event');
+const TIME_SCALE = num('speed', 1);
+const DEBUG = params.has('debug');
+const TIME_FORCE = params.get('time');
+const N_MARBLES = Math.round(Math.min(40, Math.max(6, num('marbles', 28))));
+const FPS = 30;
+const STORE_KEY = 'backgrounds.marbleMachine.laps';
+if (params.has('reset')) { try { localStorage.removeItem(STORE_KEY); } catch (e) {} }
+
+const canvas = document.getElementById('c');
+const mainCtx = canvas.getContext('2d');
+let ctx = mainCtx;
+let W, H;
+
+// ---------------------------------------------------------------- utils
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const chance = p => Math.random() < p;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const TAU = Math.PI * 2;
+function weighted(obj) {
+  const e = Object.entries(obj).filter(([, w]) => w > 0);
+  if (!e.length) return null;
+  let r = Math.random() * e.reduce((a, [, w]) => a + w, 0);
+  for (const [k, w] of e) if ((r -= w) < 0) return k;
+  return e[0][0];
+}
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[((y & 3) * 4) + (x & 3)];
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const rgbStr = c => `rgb(${c.map(v => Math.round(clamp(v, 0, 255))).join(',')})`;
+const mixRgb = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const mixHex = (a, b, t) => rgbStr(mixRgb(hexRgb(a), hexRgb(b), t));
+function px(x, y, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+function disc(cx, cy, r, c) { if (c) ctx.fillStyle = c; cx = Math.round(cx); cy = Math.round(cy); for (let dy = -Math.floor(r); dy <= r; dy++) { const w = Math.floor(Math.sqrt(Math.max(0, r * r - dy * dy))); ctx.fillRect(cx - w, cy + dy, w * 2 + 1, 1); } }
+function ellipse(cx, cy, rx, ry, c) { ctx.fillStyle = c; for (let dy = -Math.ceil(ry); dy <= ry; dy++) { const k = 1 - (dy * dy) / (ry * ry); if (k < 0) continue; const w = Math.round(rx * Math.sqrt(k)); ctx.fillRect(Math.round(cx - w), Math.round(cy + dy), w * 2 + 1, 1); } }
+function ring(cx, cy, rx, ry, c, a0 = 0, a1 = TAU) { const n = Math.max(10, Math.round((rx + ry) * 2.4 * (a1 - a0) / TAU)); ctx.fillStyle = c; for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; ctx.fillRect(Math.round(cx + Math.cos(a) * rx), Math.round(cy + Math.sin(a) * ry), 1, 1); } }
+function line(x0, y0, x1, y1, c, w = 1) { const n = Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))) || 1; ctx.fillStyle = c; for (let i = 0; i <= n; i++) ctx.fillRect(Math.round(lerp(x0, x1, i / n) - (w - 1) / 2), Math.round(lerp(y0, y1, i / n) - (w - 1) / 2), w, w); }
+const hash = n => { n = Math.sin(n * 127.1 + 311.7) * 43758.5453; return n - Math.floor(n); };
+const hash2 = (x, y) => hash(x * 57.3 + y * 131.7);
+function vnoise(x) { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return lerp(hash(i), hash(i + 1), u); }
+function mk(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+function withCtx(c, fn) { const old = ctx; ctx = c.getContext('2d'); ctx.imageSmoothingEnabled = false; try { fn(); } finally { ctx = old; } }
+const FONT = {
+  A: '.X.X.XXXXX.XX.X', B: 'XX.X.XXX.X.XXX.', C: '.XXX..X..X...XX', D: 'XX.X.XX.XX.XXX.', E: 'XXXX..XX.X..XXX', F: 'XXXX..XX.X..X..',
+  G: '.XXX..X.XX.X.XX', H: 'X.XX.XXXXX.XX.X', I: 'XXX.X..X..X.XXX', J: '..X..X..XX.X.X.', K: 'X.XX.XXX.X.XX.X', L: 'X..X..X..X..XXX',
+  M: 'X.XXXXXXXX.XX.X', N: 'XX.X.XX.XX.XX.X', O: '.X.X.XX.XX.X.X.', P: 'XX.X.XXX.X..X..', Q: '.X.X.XX.XXX..XX', R: 'XX.X.XXX.X.XX.X',
+  S: '.XXX...X...XXX.', T: 'XXX.X..X..X..X.', U: 'X.XX.XX.XX.XXXX', V: 'X.XX.XX.XX.X.X.', W: 'X.XX.XXXXXXXX.X', X: 'X.XX.X.X.X.XX.X',
+  Y: 'X.XX.X.X..X..X.', Z: 'XXX..X.X.X..XXX', ' ': '...............', '!': '.X..X..X.....X.', '-': '......XXX......', '.': '.............X.',
+  0: 'XXXX.XX.XX.XXXX', 1: '.X.XX..X..X.XXX', 2: 'XX...X.X.X..XXX', 3: 'XX...X.X...XXX.', 4: 'X.XX.XXXX..X..X', 5: 'XXXX..XX...XXX.',
+  6: '.XXX..XXXX.XXXX', 7: 'XXX..X.X..X..X.', 8: 'XXXX.XXXXX.XXXX', 9: 'XXXX.XXXX..XXX.', ':': '....X.....X....', '?': 'XX...X.X.....X.', '#': 'X.XXXXX.XXXXX.X',
+};
+const textW = s => String(s).length * 4 - 1;
+function text(str, x, y, col = '#ffffff', shadow = null) {
+  str = String(str).toUpperCase();
+  const draw = (ox, oy, c) => { ctx.fillStyle = c; for (let i = 0; i < str.length; i++) { const g = FONT[str[i]] || FONT['?']; for (let k = 0; k < 15; k++) if (g[k] === 'X') ctx.fillRect(Math.round(x + ox + i * 4 + (k % 3)), Math.round(y + oy + Math.floor(k / 3)), 1, 1); } };
+  if (shadow) draw(1, 1, shadow);
+  draw(0, 0, col);
+}
+
+// ---------------------------------------------------------------- sprite builder
+const INK = '#261c1a';
+class SB {
+  constructor(w, h) { this.w = w; this.h = h; this.g = new Array(w * h).fill(null); }
+  set(x, y, c) { x = Math.round(x); y = Math.round(y); if (x >= 0 && y >= 0 && x < this.w && y < this.h) this.g[y * this.w + x] = c; return this; }
+  get(x, y) { return x >= 0 && y >= 0 && x < this.w && y < this.h ? this.g[y * this.w + x] : null; }
+  ell(cx, cy, rx, ry, c, shade) {
+    for (let y = Math.floor(cy - ry - 1); y <= Math.ceil(cy + ry + 1); y++)
+      for (let x = Math.floor(cx - rx - 1); x <= Math.ceil(cx + rx + 1); x++) {
+        const dx = (x - cx) / (rx + 0.35), dy = (y - cy) / (ry + 0.35);
+        if (dx * dx + dy * dy > 1) continue;
+        this.set(x, y, shade && dx * 0.35 + dy * 0.95 > 0.5 ? shade : c);
+      }
+    return this;
+  }
+  rect(x, y, w, h, c) { for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.set(x + i, y + j, c); return this; }
+  seg(x0, y0, x1, y1, r, c, shade) { const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) * 2) + 1; for (let i = 0; i <= n; i++) { const t = i / n; this.ell(lerp(x0, x1, t), lerp(y0, y1, t), r, r, c, shade); } return this; }
+  line(x0, y0, x1, y1, c) { const n = Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))) || 1; for (let i = 0; i <= n; i++) this.set(lerp(x0, x1, i / n), lerp(y0, y1, i / n), c); return this; }
+  outline(c = INK) {
+    const add = [];
+    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
+      if (this.get(x, y)) continue;
+      if (this.get(x - 1, y) || this.get(x + 1, y) || this.get(x, y - 1) || this.get(x, y + 1)) add.push([x, y]);
+    }
+    for (const [x, y] of add) this.set(x, y, c);
+    return this;
+  }
+}
+function bake(b, ax, ay) {
+  const r = mk(b.w, b.h), l = mk(b.w, b.h), rc = r.getContext('2d'), lc = l.getContext('2d');
+  for (let y = 0; y < b.h; y++) for (let x = 0; x < b.w; x++) {
+    const c = b.g[y * b.w + x]; if (!c) continue;
+    rc.fillStyle = c; rc.fillRect(x, y, 1, 1); lc.fillStyle = c; lc.fillRect(b.w - 1 - x, y, 1, 1);
+  }
+  return { r, l, w: b.w, h: b.h, ax, ay };
+}
+function drawSpr(s, x, y, facing = 1, alpha = 1) {
+  const X = Math.round(x - (facing > 0 ? s.ax : s.w - 1 - s.ax)), Y = Math.round(y - s.ay);
+  if (alpha < 1) ctx.globalAlpha = Math.max(0, alpha);
+  ctx.drawImage(facing > 0 ? s.r : s.l, X, Y);
+  if (alpha < 1) ctx.globalAlpha = 1;
+}
+const ICONS = {};
+function icon(name, rows, col) {
+  const b = new SB(rows[0].length + 2, rows.length + 2);
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== '.') b.set(x + 1, y + 1, ch === 'o' ? '#ffffff' : col); }));
+  ICONS[name] = bake(b.outline('#ffffff'), Math.floor(b.w / 2), b.h - 1);
+}
+icon('heart', ['.X.X.', 'XoXXX', 'XXXXX', '.XXX.', '..X..'], '#ff5a8a');
+icon('note', ['..XX', '..XX', '..X.', 'XXX.', 'XX..'], '#6a5aff');
+icon('bang', ['X', 'X', 'X', '.', 'X'], '#ff4a3a');
+icon('q', ['XXX', '..X', '.X.', '...', '.X.'], '#3a6aff');
+icon('z', ['XXX', '..X', '.X.', 'XXX'], '#7a8aff');
+icon('sparkle', ['.X.', 'XoX', '.X.'], '#ffc83a');
+icon('dots', ['X.X.X'], '#6a6070');
+icon('sweat', ['.X', 'XX', 'XX'], '#5ab0ff');
+icon('anger', ['X.X', '...', 'X.X'], '#ff4a3a');
+icon('swirl', ['XXX', 'X.X', 'X.X', '..X'], '#b85aff');
+icon('bulb', ['.X.', 'XoX', 'XXX', '.X.'], '#ffe040');
+
+// ---------------------------------------------------------------- layout (machine drawn in a 320x200 reference space)
+let SC, AX, OX;
+const X = x => OX + x * SC * AX, Y = y => y * SC;
+const P = (x, y) => [X(x), Y(y)];
+let BENCH, G;
+function layout() {
+  SC = H / 200;
+  AX = clamp((W / H) / 1.6, 0.86, 1.3);
+  OX = (W - 320 * SC * AX) / 2;
+  BENCH = Math.round(Y(190));
+  G = 150 * SC;
+}
+
+// ---------------------------------------------------------------- world
+const world = { t: 0, night: 0, dusk: 0, parts: [], popups: [], ents: [], laps: 0, shake: 0, glowMode: 0, party: 0, lampOff: 0, bellT: 0, confetti: [], flashBar: [0, 0, 0, 0, 0], dominoes: null, jarFill: 0, duckOnBench: false };
+try { world.laps = parseInt(localStorage.getItem(STORE_KEY), 10) || 0; } catch (e) {}
+function saveLaps() { try { localStorage.setItem(STORE_KEY, String(world.laps)); } catch (e) {} }
+function localHour() {
+  if (TIME_FORCE) { const [h, m] = TIME_FORCE.split(':').map(Number); return ((((h || 0) + (m || 0) / 60 + world.t / 3600) % 24) + 24) % 24; }
+  const d = new Date(); return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+}
+
+// ---------------------------------------------------------------- track pieces
+class Rail {
+  constructor(name, pts, o = {}) {
+    this.name = name; this.type = 'rail'; this.ref = pts; this.o = o;
+    this.fric = o.fric ?? 1.1; this.vmin = o.vmin ?? 12; this.vmax = o.vmax ?? 70; this.gap = o.gap ?? 5.2;
+  }
+  build() {
+    this.pts = this.ref.map(([x, y]) => P(x, y));
+    this.cum = [0];
+    for (let i = 1; i < this.pts.length; i++) this.cum.push(this.cum[i - 1] + Math.hypot(this.pts[i][0] - this.pts[i - 1][0], this.pts[i][1] - this.pts[i - 1][1]));
+    this.len = this.cum[this.cum.length - 1];
+  }
+  at(s) {
+    s = clamp(s, 0, this.len);
+    let i = 1; while (i < this.cum.length - 1 && this.cum[i] < s) i++;
+    const a = this.pts[i - 1], b = this.pts[i], seg = this.cum[i] - this.cum[i - 1] || 1, k = (s - this.cum[i - 1]) / seg;
+    return { x: lerp(a[0], b[0], k), y: lerp(a[1], b[1], k), dx: (b[0] - a[0]) / seg, dy: (b[1] - a[1]) / seg };
+  }
+}
+function loopPts(cx, cy, r, n = 28) { const out = []; for (let i = 0; i <= n; i++) { const a = Math.PI / 2 - (i / n) * TAU; out.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); } return out; }
+const RAILS = {
+  top: new Rail('top', [[33, 11], [60, 15], [112, 24]], { vmax: 45 }),
+  left: new Rail('left', [[136, 61], [106, 71], [104, 72]], { vmax: 40 }),
+  right: new Rail('right', [[144, 61], [172, 69], [196, 83], [205, 88]], { vmin: 30, vmax: 60, fric: 0.4 }),
+  loop: new Rail('loop', loopPts(205, 78, 10), { vmin: 34, vmax: 60, fric: 0.2, gap: 4 }),
+  right2: new Rail('right2', [[206, 88.5], [220, 93], [247, 100]], { vmax: 45 }),
+  exitH: new Rail('exitH', [[104, 126], [117, 129]], { vmax: 30 }),
+  bottom: new Rail('bottom', [[303, 172], [120, 179], [33, 183]], { vmin: 22, vmax: 40, fric: 1.2 }),
+};
+const FUN = { cx: 140, rim: 30, rx: 22, ry: 6, depth: 18 };
+const HEL = { cx: 92, top: 74, bot: 124, r: 12, turns: 3 };
+const CHIMES = [[125, 135], [113, 143], [125, 151], [113, 159], [125, 167]];
+const CHIME_COLS = ['#ff5a5a', '#ffa040', '#ffe060', '#6ad06a', '#5aa0ff'];
+const WHEEL = { cx: 262, cy: 113, r: 14, n: 8, a: 0, entry: -2.18, release: 0.96 };
+const SAW = { px: 262, py: 153, half: 26, a: -0.2, st: 'rest', t: 0, cup: [] };
+const LIFT = { upX: 26, downX: 14, cx: 20, top: 18, bot: 180, r: 6, spacing: 12, off: 0, speed: 1 };
+const HAM = { cx: 58, cy: 158, r: 13, a: 0, speed: 1, want: 1, state: 'run', t: 0 };
+const SPLIT = { x: 140, y: 58, dir: 1, flip: 0, force: null };
+const BELL = { x: 300, y: 26, swing: 0 };
+
+// ---------------------------------------------------------------- marbles
+const MCOLS = [['#e8404a', '#ff9aa0'], ['#3a7ae8', '#9ac4ff'], ['#3ab85a', '#9ae8a8'], ['#f0c030', '#fff0a0'], ['#9a4ad8', '#d4a8ff'], ['#2ab8c8', '#a8f0f8'], ['#f07a2a', '#ffc49a'], ['#e8e8f0', '#ffffff'], ['#d84aa8', '#ffa8e0']];
+let marbles = [];
+class Marble {
+  constructor(o) { Object.assign(this, { seg: null, s: 0, v: 20, x: 0, y: 0, hidden: false, r: 2, kind: 'glass', front: 1, col: pick(MCOLS), spin: rand(0, TAU), trail: [] }, o); }
+}
+function railMarbles(rail) { return marbles.filter(m => m.seg === rail); }
+function enterRail(m, rail, s = 0, v) { m.seg = rail; m.s = s; if (v != null) m.v = v; const p = rail.at(s); m.x = p.x; m.y = p.y; m.hidden = false; }
+function drop(m, x1, y1, then, o = {}) {
+  m.seg = { type: 'drop', x0: m.x, y0: m.y, x1, y1, t: 0, T: o.T || Math.max(0.16, Math.sqrt(2 * Math.max(1, y1 - m.y + (o.h || 0) * 2) / G)), h: o.h || 0, arc: !!o.arc || y1 <= m.y + 1, then, onHit: o.onHit };
+}
+function enterFunnel(m) { m.seg = { type: 'funnel' }; m.fa = Math.PI; m.fr = 1; }
+function enterHelix(m) { m.seg = { type: 'helix' }; m.ha = 0; }
+function toSplitter(m) {
+  let d = SPLIT.force != null ? SPLIT.force : SPLIT.dir;
+  if (m.route) d = m.route;
+  SPLIT.dir = -SPLIT.dir; SPLIT.flip = 1; SPLIT.last = d;
+  enterRail(m, d < 0 ? RAILS.left : RAILS.right, 0, 12);
+}
+function railExit(m, rail) {
+  // returns true if the marble left the rail
+  switch (rail.name) {
+    case 'top': { const [x, y] = P(FUN.cx - FUN.rx + 1, FUN.rim); drop(m, x, y, enterFunnel, { T: 0.22 }); return true; }
+    case 'left': { enterHelix(m); return true; }
+    case 'right': { enterRail(m, RAILS.loop, 0, Math.max(m.v, 40)); return true; }
+    case 'loop': { enterRail(m, RAILS.right2, 0, m.v * 0.7); return true; }
+    case 'right2': {
+      for (let k = 0; k < WHEEL.n; k++) { if (WHEEL.pockets[k]) continue; const a = wrapA(WHEEL.a + k * TAU / WHEEL.n); if (Math.abs(angDiff(a, WHEEL.entry)) < 0.22) { WHEEL.pockets[k] = m; m.seg = { type: 'wheel', k }; return true; } }
+      return false;
+    }
+    case 'exitH': { const [x, y] = P(CHIMES[0][0], CHIMES[0][1]); drop(m, x, y, mm => chimeHit(mm, 0), { T: 0.3, h: 2 }); return true; }
+    case 'bottom': {
+      if (m.extra || m.kind === 'duck' || m.kind === 'ghost') return (m.gone = true);
+      if (LIFT.boardable && !LIFT.boardable.m && HAM.speed > 0.2) { LIFT.boardable.m = m; m.seg = { type: 'lift', b: LIFT.boardable }; return true; }
+      return false;
+    }
+  }
+  return false;
+}
+function chimeHit(m, i) {
+  world.flashBar[i] = 1;
+  const [bx, by] = P(CHIMES[i][0], CHIMES[i][1]);
+  if (m.kind !== 'ghost' && chance(0.45)) world.popups.push({ tiny: true, x: bx + (i % 2 ? -7 : 7) * SC, y: by, t: 0, col: CHIME_COLS[i] });
+  if (m.kind === 'duck' && i === 2) addPopup('SQUEAK', bx, by - 12, '#fff4a0');
+  if (i + 1 < CHIMES.length) { const [x, y] = P(CHIMES[i + 1][0], CHIMES[i + 1][1]); drop(m, x, y, mm => chimeHit(mm, i + 1), { T: 0.28, h: 3, arc: true }); }
+  else { const r = RAILS.bottom, s = sOnRail(r, X(118)); const p = r.at(s); drop(m, p.x, p.y, mm => { enterRail(mm, r, s, 16); lap(mm); }, { T: 0.3 }); }
+}
+function sOnRail(r, x) { let best = 0, bd = 1e9; for (let s = 0; s <= r.len; s += 1) { const d = Math.abs(r.at(s).x - x); if (d < bd) { bd = d; best = s; } } return best; }
+function lap(m) {
+  if (m.kind !== 'glass' && m.kind !== 'gold') return;
+  if (world.settling) return;
+  world.laps++; if (world.laps % 20 === 0) saveLaps();
+  world.odo = 1;
+  if (world.laps % 50 === 0) ringBell(world.laps % 500 === 0 ? 3 : 1);
+  if (m.kind === 'gold') { ringBell(2); for (let i = 0; i < 30; i++) addConfetti(m.x, m.y - 6); }
+}
+function ringBell(n = 1) { BELL.rings = (BELL.rings || 0) + n; }
+const wrapA = a => ((a % TAU) + TAU) % TAU;
+function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= TAU; while (d < -Math.PI) d += TAU; return d; }
+
+function liftPoint(p) {
+  const up = Y(LIFT.bot) - Y(LIFT.top), r = LIFT.r * SC, arc = Math.PI * r, L = up * 2 + arc * 2;
+  p = ((p % L) + L) % L;
+  const ux = X(LIFT.upX), dx = X(LIFT.downX), cx = X(LIFT.cx), ty = Y(LIFT.top), by = Y(LIFT.bot);
+  if (p < up) return { x: ux, y: by - p, a: 0, side: 'up' };
+  if (p < up + arc) { const a = (p - up) / r; return { x: cx + Math.cos(a) * (ux - cx), y: ty - Math.sin(a) * r, a, side: 'top' }; }
+  if (p < up * 2 + arc) return { x: dx, y: ty + (p - up - arc), a: Math.PI, side: 'down' };
+  const a = (p - up * 2 - arc) / r; return { x: cx - Math.cos(a) * (cx - dx), y: by + Math.sin(a) * r, a: Math.PI + a, side: 'bottom' };
+}
+function liftLen() { const up = Y(LIFT.bot) - Y(LIFT.top), r = LIFT.r * SC; return up * 2 + Math.PI * r * 2; }
+let buckets = [];
+function makeBuckets() { const L = liftLen(), n = Math.floor(L / (LIFT.spacing * SC)); buckets = Array.from({ length: n }, (_, k) => ({ k, p: k * L / n, m: null })); }
+
+function updateMarbles(dt) {
+  // rails: leaders first so followers can queue behind them
+  for (const rail of Object.values(RAILS)) {
+    const ms = marbles.filter(m => m.seg === rail).sort((a, b) => b.s - a.s);
+    let ahead = null;
+    for (const m of ms) {
+      if (m.stuck) { m.v = 0; ahead = m; continue; }
+      const p = rail.at(m.s);
+      m.v = clamp(m.v + (G * p.dy - rail.fric * m.v) * dt, rail.vmin * (m.slow || 1), rail.vmax);
+      if (m.kind === 'giant') m.v = Math.min(m.v, 26);
+      m.s += m.v * dt;
+      const gap = (ahead ? (ahead.r + m.r + 1) : 0);
+      if (ahead && m.s > ahead.s - gap) { m.s = Math.max(0, ahead.s - gap); m.v = Math.min(m.v, ahead.v); }
+      if (world.snail && world.snail.rail === rail && m.s < world.snail.s && m.s > world.snail.s - 7) { m.s = world.snail.s - 7; m.v = 0; }
+      if (m.s >= rail.len) { m.s = rail.len; if (!railExit(m, rail)) m.v = 0; }
+      if (m.seg === rail) { const q = rail.at(m.s); m.x = q.x; m.y = q.y; m.spin += m.v * dt / Math.max(1, m.r) * Math.sign(q.dx || 1); }
+      ahead = m;
+    }
+  }
+  for (const m of marbles) {
+    const sg = m.seg; if (!sg || sg.type === 'rail') continue;
+    if (sg.type === 'drop') {
+      sg.t += dt; const k = clamp(sg.t / sg.T, 0, 1);
+      m.x = lerp(sg.x0, sg.x1, k);
+      m.y = sg.arc ? lerp(sg.y0, sg.y1, k) - 4 * sg.h * SC * k * (1 - k) : sg.y0 + (sg.y1 - sg.y0) * k * k;
+      if (k >= 1) { const then = sg.then; m.seg = null; then(m); }
+    } else if (sg.type === 'funnel') {
+      m.fr -= dt * (m.kind === 'giant' ? 0.12 : 0.24); m.fa += dt * 2.6 / Math.max(0.22, m.fr);
+      const cx = X(FUN.cx), rim = Y(FUN.rim);
+      m.x = cx + Math.cos(m.fa) * FUN.rx * SC * AX * m.fr; m.y = rim + Math.sin(m.fa) * FUN.ry * SC * m.fr + (1 - m.fr) * FUN.depth * SC * 0.92;
+      m.front = Math.sin(m.fa) > 0.2 && m.fr > 0.3 ? 1 : 0;
+      if (m.kind === 'giant' && m.fr < 0.45) { m.fr = 0.45; m.seg = { type: 'stuckGiant' }; world.giantStuck = true; }
+      else if (m.fr < 0.1) { m.front = 0; m.x = cx; drop(m, X(SPLIT.x), Y(SPLIT.y), toSplitter, { T: 0.2 }); }
+    } else if (sg.type === 'helix') {
+      const others = marbles.filter(o => o !== m && o.seg && o.seg.type === 'helix' && o.ha > m.ha);
+      const lead = others.reduce((a, o) => Math.min(a, o.ha), 1e9);
+      const w = 3.4 + m.ha * 0.08;
+      m.ha = Math.min(m.ha + w * dt, lead - 0.75);
+      const A = m.ha, total = HEL.turns * TAU;
+      m.x = X(HEL.cx) + Math.cos(A) * HEL.r * SC * AX; m.y = Y(HEL.top) + (Y(HEL.bot) - Y(HEL.top)) * (A / total) + Math.sin(A) * 4 * SC;
+      m.front = Math.sin(A) > 0 ? 1 : 0;
+      if (A >= total) { m.front = 1; enterRail(m, RAILS.exitH, 0, 16); }
+    } else if (sg.type === 'wheel') {
+      const a = WHEEL.a + sg.k * TAU / WHEEL.n, rr = (WHEEL.r - 3) * SC;
+      m.x = X(WHEEL.cx) + Math.cos(a) * rr * AX; m.y = Y(WHEEL.cy) + Math.sin(a) * rr;
+      if (Math.abs(angDiff(wrapA(a), WHEEL.release)) < 0.1) {
+        WHEEL.pockets[sg.k] = null;
+        const i = SAW.cup.length, [cx, cy] = cupPos(i);
+        drop(m, cx, cy, mm => { mm.seg = { type: 'cup' }; if (!SAW.cup.includes(mm)) SAW.cup.push(mm); }, {});
+      }
+    } else if (sg.type === 'cup') {
+      const i = SAW.cup.indexOf(m); const [cx, cy] = cupPos(Math.max(0, i)); m.x = cx; m.y = cy;
+    } else if (sg.type === 'lift') {
+      const b = sg.b, q = liftPoint(b.p), off = 4 * SC;
+      const n = [Math.cos(q.a), -Math.sin(q.a)];
+      m.x = q.x + (q.side === 'up' ? off : n[0] * off); m.y = q.y - 1 * SC + (q.side === 'top' ? n[1] * off : 0);
+      if (q.side === 'top' && q.a > 0.85) { b.m = null; const [x, y] = P(33, 11); drop(m, x, y, mm => enterRail(mm, RAILS.top, 0, 10), { T: 0.25, arc: true, h: 2 }); }
+      if (q.side === 'down' || q.side === 'bottom') { b.m = null; m.seg = null; }
+    } else if (sg.type === 'fly') { sg.update(m, dt); }
+  }
+  marbles = marbles.filter(m => !m.gone);
+  // anything that lost its place (should not happen) rejoins at the bottom rail
+  for (const m of marbles) if (!m.seg) enterRail(m, RAILS.bottom, rand(40, 120), 10);
+}
+function cupPos(i) {
+  const a = SAW.a, ex = SAW.px + Math.cos(a) * SAW.half, ey = SAW.py + Math.sin(a) * SAW.half;
+  const off = [[-2, -3], [2, -3], [0, -6], [-2, -8], [2, -8]][Math.min(i, 4)];
+  return [X(ex + off[0] * 0.9), Y(ey + off[1] * 0.9)];
+}
+function updateMachine(dt) {
+  // hamster drives the lift
+  HAM.speed = lerp(HAM.speed, HAM.want, 1 - Math.exp(-dt * 2));
+  HAM.a += HAM.speed * dt * 2.6;
+  LIFT.speed = HAM.speed * (world.squeak ? 0.45 : 1);
+  const L = liftLen(), v = 15 * SC * LIFT.speed;
+  LIFT.boardable = null;
+  for (const b of buckets) {
+    b.p = (b.p + v * dt) % L;
+    if (b.p > 0 && b.p < 3.2 * SC && !b.m) LIFT.boardable = b;
+  }
+  WHEEL.a = wrapA(WHEEL.a + dt * 0.7);
+  // see-saw
+  SAW.t += dt;
+  if (SAW.st === 'rest') { SAW.a = lerp(SAW.a, -0.2 + SAW.cup.length * 0.03, 1 - Math.exp(-dt * 8)); if (SAW.cup.length >= 3 && SAW.cup.every(m => m.seg && m.seg.type === 'cup')) { SAW.st = 'tip'; SAW.t = 0; } }
+  else if (SAW.st === 'tip') { SAW.a = lerp(-0.14, 0.36, smooth(0, 0.35, SAW.t)); if (SAW.t > 0.4) { SAW.st = 'dump'; SAW.t = 0; addPopup('CLUNK', X(SAW.px + 20), Y(SAW.py + 2), '#ffe0a0'); } }
+  else if (SAW.st === 'dump') {
+    if (SAW.t > 0.14 && SAW.cup.length) {
+      SAW.t = 0; const m = SAW.cup.shift();
+      const r = RAILS.bottom; drop(m, r.pts[0][0], r.pts[0][1], mm => { enterRail(mm, r, 0, 18); lap(mm); }, { T: 0.3, arc: true, h: 2 });
+    }
+    if (!SAW.cup.length) { SAW.st = 'back'; SAW.t = 0; }
+  }
+  else if (SAW.st === 'back') { SAW.a = lerp(0.36, -0.2, smooth(0, 1, SAW.t)); if (SAW.t > 1) SAW.st = 'rest'; }
+  SPLIT.flip = Math.max(0, SPLIT.flip - dt * 4);
+  for (let i = 0; i < 5; i++) world.flashBar[i] = Math.max(0, world.flashBar[i] - dt * 2.5);
+  if (world.odo > 0) world.odo = Math.max(0, world.odo - dt * 3);
+  // bell
+  if (BELL.rings > 0 && BELL.swing <= 0) { BELL.rings--; BELL.swing = 1.2; addPopup('DING', X(BELL.x) - 2, Y(BELL.y) - 14, '#ffe070'); addPopupIcon('note', X(BELL.x) + 7, Y(BELL.y) - 6, '#ffe070'); }
+  BELL.swing = Math.max(0, BELL.swing - dt);
+}
+
+// ---------------------------------------------------------------- static art
+let bgCanvas, frontCanvas, helixFront, funnelBack, funnelFront;
+const WOOD = '#c89058', WOODD = '#9a6a3a', WOODL = '#e0b07a';
+const BRASS = '#e0b050', BRASSD = '#a8782a', BRASSL = '#fff0a8';
+const COPPER = '#d0784a', COPPERD = '#9a4a2a', COPPERL = '#f0b088';
+function beam(x0, y0, x1, y1, w) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0)) + 1, nx = -(y1 - y0) / n, ny = (x1 - x0) / n;
+  for (let i = 0; i <= n; i++) { const x = lerp(x0, x1, i / n), y = lerp(y0, y1, i / n); for (let k = -w / 2; k <= w / 2; k += 0.5) { const t = (k + w / 2) / w; px(x + nx * k, y + ny * k, t < 0.25 ? WOODL : t > 0.75 ? WOODD : WOOD); } }
+}
+function railArt(rail) {
+  const pts = rail.pts, off = 3 * SC;
+  for (let i = 1; i < pts.length; i++) {
+    const [ax, ay] = pts[i - 1], [bx, by] = pts[i], n = Math.ceil(Math.hypot(bx - ax, by - ay));
+    for (let k = 0; k <= n; k++) { const x = lerp(ax, bx, k / n), y = lerp(ay, by, k / n) + off; px(x, y, BRASSL); px(x, y + 1, BRASS); px(x, y + 2, BRASSD); }
+  }
+}
+function strut(x, y0, y1) { rect(x, y0, 1, y1 - y0, '#7a5a3a'); rect(x + 1, y0, 1, y1 - y0, '#5a3e28'); }
+function gearArt(cx, cy, r, teeth, a, col, dark) {
+  for (let i = 0; i < teeth; i++) { const t = a + i * TAU / teeth; const x = cx + Math.cos(t) * (r + 1), y = cy + Math.sin(t) * (r + 1); rect(x - 1, y - 1, 2, 2, dark); }
+  disc(cx, cy, r, dark); disc(cx, cy, r - 1, col);
+  for (let k = 0; k < 4; k++) { const t = a + k * Math.PI / 2; line(cx, cy, cx + Math.cos(t) * (r - 1.5), cy + Math.sin(t) * (r - 1.5), dark); }
+  disc(cx, cy, Math.max(1, r * 0.25), dark); px(cx, cy, col);
+}
+function bakeStatic() {
+  for (const r of Object.values(RAILS)) r.build();
+  bgCanvas = mk(W, H);
+  withCtx(bgCanvas, () => {
+    // workshop wall: warm planks
+    for (let x = 0; x < W; x++) {
+      const plank = Math.floor(x / (11 * SC)), edge = x % Math.round(11 * SC) === 0;
+      const base = mixRgb([84, 56, 42], [98, 66, 48], hash(plank * 3.1));
+      for (let y = 0; y < BENCH; y++) { let c = base; const n = hash2(x, Math.floor(y / 3)); if (n < 0.1) c = mixRgb(c, [66, 44, 32], 0.4); if (edge) c = [52, 34, 26]; ctx.fillStyle = rgbStr(c); ctx.fillRect(x, y, 1, 1); }
+    }
+    for (let i = 0; i < W / 8; i++) { const x = rand(0, W), y = rand(0, BENCH); px(x, y, '#4a3024'); }
+    // round window (sky drawn live), wall clock, shelf, pegboard
+    world.win = { x: X(236), y: Y(44), r: 17 * SC };
+    disc(world.win.x, world.win.y, world.win.r + 3 * SC, '#5a3e2a'); disc(world.win.x, world.win.y, world.win.r + 2 * SC, BRASSD); disc(world.win.x, world.win.y, world.win.r + 1, BRASS);
+    world.clock = { x: X(184), y: Y(22), r: 8 * SC };
+    disc(world.clock.x, world.clock.y, world.clock.r + 2, '#4a3020'); disc(world.clock.x, world.clock.y, world.clock.r + 1, BRASSD); disc(world.clock.x, world.clock.y, world.clock.r, '#f4ead0');
+    for (let i = 0; i < 12; i++) { const a = i * TAU / 12; px(world.clock.x + Math.cos(a) * (world.clock.r - 1.5), world.clock.y + Math.sin(a) * (world.clock.r - 1.5), '#6a5040'); }
+    // pegboard with tools behind the middle
+    const pbx = X(150), pby = Y(96), pbw = 70 * SC * AX, pbh = 34 * SC;
+    rect(pbx, pby, pbw, pbh, '#b89a70'); rect(pbx, pby + pbh - 1, pbw, 1, '#8a7050');
+    for (let y = pby + 3; y < pby + pbh - 2; y += 4 * SC) for (let x = pbx + 3; x < pbx + pbw - 2; x += 4 * SC) px(x, y, '#7a6040');
+    const tool = (x, y, kind) => {
+      if (kind === 'hammer') { rect(x, y, 2, 12 * SC, '#9a6a3a'); rect(x - 3, y - 2, 8, 3, '#8a8a96'); }
+      if (kind === 'wrench') { rect(x, y, 2, 12 * SC, '#a8a8b4'); rect(x - 1, y - 2, 4, 3, '#a8a8b4'); px(x + 0.5, y - 2, '#b89a70'); }
+      if (kind === 'saw') { for (let i = 0; i < 12 * SC; i++) rect(x - 2 + i * 0.1, y + i, 5 - i * 0.2, 1, '#c0c0cc'); rect(x - 2, y - 3, 5, 3, '#a8502a'); }
+      if (kind === 'driver') { rect(x, y, 2, 6 * SC, '#e04a3a'); rect(x + 0.5, y + 6 * SC, 1, 6 * SC, '#c0c0cc'); }
+    };
+    tool(pbx + pbw * 0.18, pby + 6, 'hammer'); tool(pbx + pbw * 0.38, pby + 6, 'wrench'); tool(pbx + pbw * 0.6, pby + 6, 'saw'); tool(pbx + pbw * 0.82, pby + 6, 'driver');
+    // blueprint pinned up
+    const bx = X(262), by = Y(68);
+    rect(bx, by, 22 * SC * AX, 16 * SC, '#3a6ab8'); for (let i = 0; i < 5; i++) rect(bx + 2, by + 2 + i * 3 * SC, (8 + hash(i) * 10) * SC * AX, 1, '#8ab0e8'); ring(bx + 16 * SC * AX, by + 9 * SC, 3 * SC, 3 * SC, '#c8dcf8'); px(bx + 11 * SC * AX, by + 1, '#e04040');
+    // shelf with marble jars (top right, above the see-saw)
+    const sy = Y(128), sx0 = X(268), sx1 = X(314);
+    rect(sx0, sy, sx1 - sx0, 2, WOOD); rect(sx0, sy + 2, sx1 - sx0, 1, WOODD);
+    for (let i = 0; i < 3; i++) { const jx = sx0 + 4 + i * 13 * SC * AX; rect(jx, sy - 9 * SC, 8 * SC, 9 * SC, '#b8d8e0'); rect(jx - 1, sy - 10 * SC, 8 * SC + 2, 2, '#c84a3a'); for (let k = 0; k < 9; k++) disc(jx + 2 + (k % 3) * 2 * SC, sy - 2 - Math.floor(k / 3) * 2 * SC, 1, pick(MCOLS)[0]); }
+    // machine frame: posts, top beam, cross braces
+    const L = X(4), R = X(314), T = Y(3);
+    beam(X(4), T, X(314), T, 4 * SC); beam(L, T, L, BENCH, 4 * SC); beam(R, T, R, BENCH, 4 * SC);
+    // a potted plant and a tool rack on little wall shelves
+    rect(X(40), Y(118), 22 * SC * AX, 2, WOODD); rect(X(40), Y(118), 22 * SC * AX, 1, WOODL);
+    { const px0 = X(46); rect(px0, Y(112), 8 * SC, 6 * SC, '#c86a3a'); rect(px0 - 1, Y(112), 8 * SC + 2, 2, '#e08050'); for (let i = 0; i < 7; i++) { const a = -Math.PI / 2 + (i - 3) * 0.35, l = (6 + hash(i) * 5) * SC; line(px0 + 4 * SC, Y(112), px0 + 4 * SC + Math.cos(a) * l, Y(112) + Math.sin(a) * l, i % 2 ? '#4a9a44' : '#6ab85a'); } }
+    // ladder on the right post
+    for (let y = T + 6; y < BENCH - 2; y += 6 * SC) rect(R - 5 * SC, y, 5 * SC, 1, '#8a5a30');
+    rect(R - 6 * SC, T, 1, BENCH - T, '#7a4a28');
+    // workbench
+    rect(0, BENCH, W, H - BENCH, '#8a5a34'); rect(0, BENCH, W, 2, '#b88450'); rect(0, BENCH + 2, W, 1, '#6a4428');
+    for (let x = 0; x < W; x += Math.round(24 * SC)) rect(x, BENCH + 3, 1, H - BENCH, '#5a3a24');
+    for (let i = 0; i < W / 6; i++) px(rand(0, W), rand(BENCH + 3, H), '#7a4e2c');
+    // struts holding the rails
+    for (const [x, y0, y1] of [[50, 16, 34], [96, 23, 34], [120, 70, 96], [182, 72, 96], [234, 100, 112], [120, 181, 190], [200, 178, 190], [280, 175, 190], [60, 183, 190]]) strut(X(x), Y(y0) + 3 * SC, Y(y1));
+    // helix pole + back half of the wire
+    const hx = X(HEL.cx), ht = Y(HEL.top) - 6 * SC, hb = Y(HEL.bot) + 6 * SC;
+    helixWire(-1);
+    // funnel: back interior
+    funnelArt(false);
+    // lift frame
+    rect(X(LIFT.downX) - 3 * SC, Y(LIFT.top) - 8 * SC, 1, Y(LIFT.bot) - Y(LIFT.top) + 16 * SC, '#5a3e28');
+    rect(X(LIFT.upX) + 7 * SC, Y(LIFT.top) - 2, 1, Y(LIFT.bot) - Y(LIFT.top), '#5a3e28');
+    // hamster wheel stand
+    const hcx = X(HAM.cx), hcy = Y(HAM.cy), hr = HAM.r * SC;
+    line(hcx, hcy, hcx - hr * 0.7, BENCH, WOODD, 2); line(hcx, hcy, hcx + hr * 0.7, BENCH, WOODD, 2);
+    // chimes frame
+    rect(X(107), Y(130), 1, Y(172) - Y(130), '#5a3e28'); rect(X(131), Y(130), 1, Y(172) - Y(130), '#5a3e28');
+    // rails
+    for (const r of Object.values(RAILS)) if (r.name !== 'loop') railArt(r);
+    loopArt();
+    // splitter housing
+    rect(X(SPLIT.x) - 4 * SC, Y(SPLIT.y) - 7 * SC, 8 * SC, 4 * SC, COPPERD); rect(X(SPLIT.x) - 3 * SC, Y(SPLIT.y) - 7 * SC, 6 * SC, 3 * SC, COPPER);
+    // funnel drop tube
+    rect(X(FUN.cx) - 1.5 * SC, Y(FUN.rim + FUN.depth) - 1, 3 * SC, Y(SPLIT.y) - Y(FUN.rim + FUN.depth) - 6 * SC, '#a8c8d0');
+    rect(X(FUN.cx) - 1.5 * SC, Y(FUN.rim + FUN.depth) - 1, 1, Y(SPLIT.y) - Y(FUN.rim + FUN.depth) - 6 * SC, '#e0f0f4');
+    // see-saw stand
+    const spx = X(SAW.px), spy = Y(SAW.py);
+    for (let k = 0; k < 10 * SC; k++) rect(spx - k * 0.5, spy + 2 + k, k + 1, 1, WOODD);
+    // counter plate
+    world.odoBox = { x: X(160), y: Y(142), w: 38 * SC * AX, h: 11 * SC };
+    const o = world.odoBox;
+    rect(o.x - 2, o.y - 2, o.w + 4, o.h + 4, '#5a3e28'); rect(o.x - 1, o.y - 1, o.w + 2, o.h + 2, BRASS); rect(o.x, o.y, o.w, o.h, '#2a2020');
+    text('LAPS', o.x + o.w / 2 - 7, o.y - 8 * SC, '#f0d890', '#2a1a14');
+  });
+  // front layers: funnel front wall, helix front wire + pole
+  funnelFront = mk(W, H); withCtx(funnelFront, () => funnelArt(true));
+  helixFront = mk(W, H); withCtx(helixFront, () => {
+    const hx = X(HEL.cx), ht = Y(HEL.top) - 6 * SC, hb = Y(HEL.bot) + 6 * SC;
+    rect(hx - 1, ht, 3, hb - ht, BRASSD); rect(hx - 1, ht, 1, hb - ht, BRASSL); rect(hx, ht, 1, hb - ht, BRASS);
+    disc(hx, ht, 2, BRASS); rect(hx - 3, hb, 7, 2, BRASSD);
+    helixWire(1);
+  });
+}
+function helixWire(side) {
+  const total = HEL.turns * TAU;
+  for (let A = -0.2; A <= total + 0.2; A += 0.02) {
+    const z = Math.sin(A); if ((side > 0) !== (z > 0)) continue;
+    const x = X(HEL.cx) + Math.cos(A) * HEL.r * SC * AX, y = Y(HEL.top) + (Y(HEL.bot) - Y(HEL.top)) * (A / total) + z * 4 * SC + 3 * SC;
+    if (side > 0) { px(x, y, BRASSL); px(x, y + 1, BRASS); px(x, y + 2, BRASSD); }
+    else { px(x, y + 1, '#8a6428'); px(x, y + 2, '#4a3218'); }
+  }
+}
+function funnelArt(front) {
+  const cx = X(FUN.cx), rim = Y(FUN.rim), rx = FUN.rx * SC * AX, ry = FUN.ry * SC, d = FUN.depth * SC;
+  if (!front) {
+    // looking down into the funnel: dark inside, lit far wall
+    for (let y = -ry; y <= ry; y++) { const hw = rx * Math.sqrt(Math.max(0, 1 - (y * y) / (ry * ry))); const k = (y + ry) / (2 * ry); rect(cx - hw, rim + y, hw * 2 + 1, 1, mixHex('#c86a3e', '#4a2214', k)); }
+    ellipse(cx, rim + ry * 0.35, rx * 0.18, ry * 0.25, '#1e0e08');
+    for (let a = Math.PI * 1.05; a < TAU - 0.05; a += 0.08) px(cx + Math.cos(a) * rx * 0.62, rim + Math.sin(a) * ry * 0.62 + 1, '#e08a5a');
+    return;
+  }
+  // outer cone below the rim (hides marbles once they sink into the funnel)
+  for (let x = -Math.floor(rx); x <= rx; x++) {
+    const t = x / rx, top = rim + ry * Math.sqrt(Math.max(0, 1 - t * t));
+    const k = Math.min(1, (1 - Math.abs(t)) / 0.86), bot = rim + ry * 0.15 + k * d;
+    if (bot <= top) continue;
+    ctx.fillStyle = t < -0.55 ? COPPERL : t < -0.2 ? '#e8946a' : t > 0.55 ? COPPERD : COPPER;
+    ctx.fillRect(Math.round(cx + x), Math.round(top), 1, Math.round(bot - top) + 1);
+    ctx.fillStyle = '#7a3a1e'; ctx.fillRect(Math.round(cx + x), Math.round(bot) + 1, 1, 1);
+  }
+  // front lip of the rim + back lip
+  for (let a = 0; a <= Math.PI; a += 0.02) { px(cx + Math.cos(a) * rx, rim + Math.sin(a) * ry, COPPERL); px(cx + Math.cos(a) * rx, rim + Math.sin(a) * ry + 1, COPPERD); }
+  for (let a = Math.PI; a <= TAU; a += 0.02) px(cx + Math.cos(a) * (rx + 0.5), rim + Math.sin(a) * (ry + 0.5), COPPERD);
+  // spout collar
+  rect(cx - 3 * SC, rim + ry * 0.1 + d * 0.95, 6 * SC + 1, 2 * SC, COPPERD); rect(cx - 3 * SC, rim + ry * 0.1 + d * 0.95, 6 * SC + 1, 1, COPPER);
+  // rivets
+  for (let k = -0.7; k <= 0.71; k += 0.35) px(cx + k * rx * 0.8, rim + ry + 3 * SC, '#ffd0a8');
+}
+function loopArt() {
+  const cx = X(205), cy = Y(78), r = 10 * SC, R = r + 3 * SC;
+  for (let a = 0; a < TAU; a += 0.02) { const x = cx + Math.cos(a) * R * AX, y = cy + Math.sin(a) * R; px(x, y, BRASS); px(cx + Math.cos(a) * (R + 1) * AX, cy + Math.sin(a) * (R + 1), BRASSD); }
+  for (let a = 0; a < TAU; a += 0.02) px(cx + Math.cos(a) * (R - 1) * AX, cy + Math.sin(a) * (R - 1), BRASSL);
+  strut(cx, cy + R + 1, Y(112)); rect(cx - 6, Y(112), 13, 2, WOODD);
+}
+
+// ---------------------------------------------------------------- dynamic machine art
+function drawGears() {
+  const a = HAM.a * 0.6;
+  gearArt(X(20), Y(18), 5 * SC, 10, a, BRASS, BRASSD);
+  gearArt(X(34), Y(30), 4 * SC, 8, -a * 1.25 + 0.3, '#b8b8c4', '#6a6a78');
+  gearArt(X(20), Y(180), 5 * SC, 10, a, BRASS, BRASSD);
+  gearArt(X(262), Y(113), 3 * SC, 8, WHEEL.a, BRASS, BRASSD);
+  gearArt(X(160), Y(16), 6 * SC, 12, a * 0.5, '#b8b8c4', '#6a6a78');
+  gearArt(X(173), Y(9), 4 * SC, 8, -a * 0.75 + 0.2, BRASS, BRASSD);
+}
+function drawLift() {
+  const L = liftLen();
+  // chain
+  for (let p = 0; p < L; p += 2) { const q = liftPoint(p - ((world.t * 15 * SC * LIFT.speed) % 2)); px(q.x, q.y, (Math.floor(p / 2) % 2) ? '#5a5a66' : '#8a8a98'); }
+  for (const b of buckets) {
+    const q = liftPoint(b.p), off = 4 * SC;
+    let bx = q.x, by = q.y, a = q.a;
+    if (q.side === 'up') { bx += off; }
+    else if (q.side === 'down') { bx -= off; }
+    else { bx += Math.cos(a) * off; by -= Math.sin(a) * off; }
+    ctx.save(); ctx.translate(Math.round(bx), Math.round(by)); ctx.rotate(q.side === 'up' ? 0 : q.side === 'down' ? Math.PI : q.side === 'top' ? -a : a);
+    ctx.fillStyle = '#3a2a22'; ctx.fillRect(-3, -1, 6, 4); ctx.fillStyle = WOOD; ctx.fillRect(-2, 0, 4, 2); ctx.fillStyle = WOODL; ctx.fillRect(-2, 0, 4, 1);
+    ctx.restore();
+    line(q.x, q.y, bx, by, '#5a5a66');
+  }
+}
+function drawHamster() {
+  const cx = X(HAM.cx), cy = Y(HAM.cy), r = HAM.r * SC;
+  // wheel back
+  ring(cx, cy, r, r, '#8a8a98'); ring(cx, cy, r - 1, r - 1, '#5a5a66');
+  for (let k = 0; k < 12; k++) { const a = HAM.a + k * TAU / 12; line(cx + Math.cos(a) * (r - 1), cy + Math.sin(a) * (r - 1), cx + Math.cos(a) * r, cy + Math.sin(a) * r, '#c8c8d4'); }
+  for (let k = 0; k < 6; k++) { const a = HAM.a * 1 + k * TAU / 6; line(cx, cy, cx + Math.cos(a) * (r - 2), cy + Math.sin(a) * (r - 2), '#6a6a78'); }
+  disc(cx, cy, 1.5, BRASS);
+  // hamster at the bottom of the wheel
+  const hy = cy + r - 2, run = HAM.speed > 0.3;
+  const ph = Math.floor(world.t * 12 * Math.max(0.3, HAM.speed)) % 2;
+  const s = spr('ham' + (HAM.state === 'eat' ? 'eat' : HAM.state === 'sleep' ? 'sleep' : run ? 'run' + ph : 'sit') + (world.party > 0 ? 'p' : ''), () => hamsterSpr(HAM.state === 'eat' ? 'eat' : HAM.state === 'sleep' ? 'sleep' : run ? 'run' + ph : 'sit'));
+  drawSpr(s, cx, hy + (run && ph ? -1 : 0), 1);
+  // belt to the lift
+  const bx0 = X(LIFT.cx), by0 = Y(LIFT.bot), t = world.t * 15 * SC * LIFT.speed;
+  for (const side of [-1, 1]) {
+    const x0 = bx0, y0 = by0 + side * 3 * SC, x1 = cx, y1 = cy + side * 1.5 * SC, n = Math.ceil(Math.hypot(x1 - x0, y1 - y0));
+    for (let i = 0; i <= n; i++) { const d = ((i + (side > 0 ? t : -t)) % 5 + 5) % 5; px(lerp(x0, x1, i / n), lerp(y0, y1, i / n), d < 1 ? '#6a4a3a' : '#3a2a22'); }
+  }
+  if (HAM.state === 'eat') { px(cx + 4, hy - 3, '#3a3a3a'); px(cx + 4, hy - 2, '#e8e0c8'); }
+}
+function drawWheel() {
+  const cx = X(WHEEL.cx), cy = Y(WHEEL.cy), r = WHEEL.r * SC;
+  disc(cx, cy, r + 1, '#5a3a22'); disc(cx, cy, r, '#a8703c');
+  disc(cx, cy, r - 3 * SC, '#7a4e2a');
+  for (let k = 0; k < WHEEL.n; k++) {
+    const a = WHEEL.a + k * TAU / WHEEL.n, a2 = a + TAU / WHEEL.n / 2;
+    line(cx + Math.cos(a2) * (r - 5 * SC), cy + Math.sin(a2) * (r - 5 * SC), cx + Math.cos(a2) * (r + 1), cy + Math.sin(a2) * (r + 1), '#5a3a22');
+    const px0 = cx + Math.cos(a) * (r - 3 * SC), py0 = cy + Math.sin(a) * (r - 3 * SC);
+    disc(px0, py0, 2 * SC, '#3e2616');
+  }
+  ring(cx, cy, r, r, WOODL, Math.PI * 1.1, Math.PI * 1.6);
+  gearArt(cx, cy, 3 * SC, 8, WHEEL.a, BRASS, BRASSD);
+}
+function drawSaw() {
+  const a = SAW.a, cx = X(SAW.px), cy = Y(SAW.py), h = SAW.half * SC;
+  const ex = Math.cos(a) * h * AX, ey = Math.sin(a) * h;
+  line(cx - ex, cy - ey, cx + ex, cy + ey, '#5a3a22', 3); line(cx - ex, cy - ey - 1, cx + ex, cy + ey - 1, WOODL);
+  // counterweight + cup
+  const lx = cx - ex, ly = cy - ey; rect(lx - 3, ly - 1, 6, 5, '#6a6a78'); rect(lx - 3, ly - 1, 6, 1, '#9a9aa8');
+  const rx = cx + ex, ry = cy + ey;
+  ctx.save(); ctx.translate(Math.round(rx), Math.round(ry)); ctx.rotate(a);
+  ctx.fillStyle = INK; ctx.fillRect(-6, -9, 13, 11); ctx.fillStyle = '#b8b8c8'; ctx.fillRect(-5, -8, 11, 9); ctx.fillStyle = '#8a8a9a'; ctx.fillRect(-5, -8, 11, 1); ctx.fillStyle = '#e0e0ea'; ctx.fillRect(-4, -7, 1, 7); ctx.fillStyle = '#6a6a7a'; ctx.fillRect(4, -7, 1, 7);
+  ctx.restore();
+  disc(cx, cy, 2, BRASS); px(cx, cy, BRASSD);
+}
+function drawSplitter() {
+  const x = X(SPLIT.x), y = Y(SPLIT.y), d = SPLIT.last || 1, k = SPLIT.flip;
+  const a = (d > 0 ? -0.5 : 0.5) * (1 - k * 0.6);
+  line(x, y - 4 * SC, x + Math.sin(a) * 6 * SC, y - 4 * SC + Math.cos(a) * 6 * SC, '#e8e0d0', 2);
+  disc(x, y - 4 * SC, 1.2, COPPERD);
+}
+function drawChimes() {
+  for (const [i, [cx, cy]] of CHIMES.entries()) {
+    const x = X(cx), y = Y(cy) + 3 * SC, s = i % 2 ? 1 : -1, f = world.flashBar[i];
+    const col = f > 0 ? mixHex(CHIME_COLS[i], '#ffffff', f * 0.6) : CHIME_COLS[i];
+    const hw = 5 * SC * AX;
+    for (let k = -hw; k <= hw; k++) { const yy = y + k * s * 0.3; px(x + k, yy - 1, INK); px(x + k, yy, col); px(x + k, yy + 1, mixHex(CHIME_COLS[i], '#000000', 0.35)); px(x + k, yy + 2, INK); }
+    px(x - hw + 1, y + 1 - hw * s * 0.3, '#e8e0d0'); px(x + hw - 1, y + 1 + hw * s * 0.3, '#e8e0d0');
+    if (f > 0.1) glowAt(x, y, 8 * SC, CHIME_COLS[i], f * 0.8, true);
+  }
+}
+function drawBell() {
+  const x = X(BELL.x), y = Y(BELL.y), sw = Math.sin(BELL.swing * 12) * BELL.swing * 0.4;
+  rect(x, Y(5), 1, y - Y(5) - 8, '#5a3e28');
+  ctx.save(); ctx.translate(Math.round(x), Math.round(y - 8)); ctx.rotate(sw);
+  const prof = [1.5, 2.5, 3, 3.2, 3.4, 3.6, 4, 4.6, 5.4, 6];
+  prof.forEach((w, k) => { ctx.fillStyle = INK; ctx.fillRect(Math.round(-w - 1), k, Math.round(w * 2 + 3), 1); });
+  prof.forEach((w, k) => { ctx.fillStyle = BRASS; ctx.fillRect(Math.round(-w), k, Math.round(w * 2 + 1), 1); ctx.fillStyle = BRASSL; ctx.fillRect(Math.round(-w + 1), k, 1, 1); ctx.fillStyle = BRASSD; ctx.fillRect(Math.round(w - 1), k, 1, 1); });
+  ctx.fillStyle = BRASSD; ctx.fillRect(-6, 10, 13, 1); ctx.fillStyle = '#5a3a1a'; ctx.fillRect(0, 11, 1, 1); ctx.fillRect(-1, 12, 3, 1);
+  ctx.restore();
+}
+function drawOdo() {
+  const o = world.odoBox, s = String(world.laps % 1000000).padStart(6, '0');
+  const dw = o.w / 6;
+  for (let i = 0; i < 6; i++) {
+    const x = o.x + i * dw, roll = i === 5 && world.odo > 0 ? Math.round(world.odo * 4) : 0;
+    rect(x + 1, o.y + 1, dw - 2, o.h - 2, '#f4ead0'); rect(x + 1, o.y + 1, dw - 2, 1, '#c8bca0');
+    text(s[i] === '0' ? 'O' : s[i], x + dw / 2 - 1.5, o.y + o.h / 2 - 2.5 - roll, '#2a2020');
+  }
+}
+function drawMarble(m) {
+  if (m.hidden) return;
+  const x = m.x, y = m.y - (m.r - 2) * 0;
+  if (m.kind === 'duck') { drawSpr(spr('duck', duckSpr), x, y + 2, (m.seg && m.seg.type === 'rail' && m.seg.at(m.s).dx < 0) ? -1 : 1); return; }
+  if (m.kind === 'cart') { drawCart(m); return; }
+  const r = m.r * (m.r > 2 ? 1 : SC > 1.4 ? 1.5 : 1);
+  if (m.kind === 'ghost') { ctx.globalAlpha = 0.55 + Math.sin(world.t * 5) * 0.2; disc(x, y, r + 0.5, '#e8f4ff'); ctx.globalAlpha = 1; glowAt(x, y, 10, '#a8d8ff', 0.8, true); return; }
+  if (m.kind === 'giant') { disc(x, y + 1, r, '#3a3a44'); disc(x, y, r, '#8a8a98'); disc(x - 1, y - 1, r - 1.5, '#b8b8c8'); px(x - 2, y - 2, '#ffffff'); px(x - 1, y - 3, '#f0f0ff'); return; }
+  const [c, l] = m.kind === 'gold' ? ['#e8b020', '#fff4a0'] : world.party > 0 ? [`hsl(${(world.t * 200 + m.spin * 30) % 360},90%,55%)`, '#ffffff'] : m.col;
+  disc(x, y, r, INK); disc(x, y, r - 0.5, c);
+  // swirl inside the glass, turning as it rolls
+  const sa = m.spin; px(x + Math.cos(sa) * (r - 1), y + Math.sin(sa) * (r - 1) * 0.8, l);
+  px(x - 1, y - 1, '#ffffff');
+  if (m.kind === 'gold' && Math.floor(world.t * 10) % 3 === 0) addPart(x + rand(-2, 2), y + rand(-2, 2), 0, -6, 0.5, '#fff4a0');
+  if (world.glowMode > 0 || m.kind === 'gold') glowAt(x, y, 6 * SC, m.kind === 'gold' ? '#ffd040' : c, (world.glowMode > 0 ? world.glowMode : 0.4), true);
+}
+
+// ---------------------------------------------------------------- characters
+function mouseSpr(pose) {
+  const b = new SB(16, 14), G1 = '#a8a2b4', GS = '#86809a', Pk = '#f4a8b8', Ap = '#4a7ad0', fy = 12;
+  const sit = pose === 'sit' || pose === 'sip' || pose === 'read' || pose === 'sleep' || pose === 'ride';
+  const cheer = pose === 'cheer' || pose === 'dance1' || pose === 'dance2';
+  if (pose === 'climb1' || pose === 'climb2') {   // back view on the ladder
+    const k = pose === 'climb1' ? 1 : -1;
+    b.ell(8, 7, 2.6, 3.2, G1, GS); b.ell(8, 3.2, 2.4, 2.1, G1, GS); b.ell(5.4, 1.6, 1.4, 1.4, G1); b.ell(10.6, 1.6, 1.4, 1.4, G1);
+    b.line(5.5, 6, 4.5, 4 + k, G1); b.line(10.5, 6, 11.5, 4 - k, G1); b.line(7, 10, 6.5, 12 - (k > 0 ? 1 : 0), GS); b.line(9, 10, 9.5, 12 - (k < 0 ? 1 : 0), GS);
+    b.line(8, 10, 8, 13, Pk); b.rect(6, 2.5, 5, 1, '#c89a3a');
+    return bake(b.outline(INK), 8, fy);
+  }
+  if (pose === 'sleep') {
+    b.ell(8, 10, 4.5, 2.2, G1, GS); b.ell(11.6, 9.4, 2.2, 1.8, G1, GS); b.ell(10.5, 7.6, 1.3, 1.1, G1); b.set(10.5, 7.6, Pk); b.set(12.4, 9.3, GS);
+    b.line(3.5, 11, 1, 10, Pk); b.ell(7.5, 8.5, 2.5, 0.8, '#e8e0f8');
+    return bake(b.outline(INK), 8, fy);
+  }
+  const by = sit ? 9.5 : 8.5;
+  // tail
+  b.line(4, by + 1, 1.5, by - 1, Pk); b.set(1, by - 2, Pk);
+  b.ell(7, by, 3, sit ? 2.4 : 2.6, G1, GS);
+  b.rect(6, by - 1, 3, 3, Ap); b.set(6, by + 2, Ap); b.set(8, by + 2, Ap);
+  if (!sit) { const w = pose === 'walk1' ? 1 : pose === 'walk2' ? -1 : 0; b.line(6 - w, by + 2, 6 - w, fy, GS); b.line(8 + w, by + 2, 8 + w, fy, GS); b.set(5 - w, fy, Pk); b.set(9 + w, fy, Pk); }
+  else { b.rect(8, by + 2, 3, 1, G1); b.set(11, by + 2, Pk); }
+  const hx = 10.3, hy = by - 3.8 + (pose === 'bonk2' ? 0.5 : 0);
+  b.ell(hx - 1.6, hy - 2.4, 1.7, 1.7, G1); b.set(hx - 1.6, hy - 2.4, Pk); b.set(hx - 1.2, hy - 2, Pk);
+  b.ell(hx, hy, 2.4, 2, G1, GS); b.ell(hx + 2.2, hy + 0.6, 1.2, 0.9, G1); b.set(hx + 3.4, hy + 0.4, '#e86a8a');
+  b.set(hx + 0.8, hy - 0.3, INK);
+  b.line(hx - 2, hy - 1.4, hx + 1, hy - 1.8, '#c89a3a'); b.set(hx + 0.2, hy - 2.1, '#8ae0f0');   // goggles pushed up
+  b.set(hx + 3, hy + 1.6, '#f0f0f0');
+  // arms
+  const arm = (tx, ty) => b.line(8.5, by - 1, tx, ty, G1);
+  switch (pose) {
+    case 'bonk1': arm(10, by - 6); b.line(10, by - 6, 13, by - 8, '#9a6a3a'); b.rect(12, by - 10, 3, 3, '#8a8a96'); break;
+    case 'bonk2': arm(12, by); b.line(12, by, 15, by - 1, '#9a6a3a'); b.rect(14, by - 3, 2, 3, '#8a8a96'); break;
+    case 'oil': arm(12, by - 2); b.rect(12, by - 3, 3, 3, '#c83a2a'); b.line(15, by - 3, 15, by - 5, '#c8c8d0'); break;
+    case 'sip': arm(11, by - 3); b.rect(11, by - 4, 2, 2, '#c8c8d8'); break;
+    case 'read': arm(12, by - 1); b.rect(11, by - 4, 4, 4, '#3a6ab8'); b.set(12, by - 3, '#c8dcf8'); break;
+    case 'carry': arm(11, by - 3); break;
+    case 'flag': arm(11, by - 6); b.line(11, by - 6, 11, by - 11, '#6a4a2a'); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) b.set(12 + i, by - 11 + j, (i + j) % 2 ? '#ffffff' : '#1a1a1a'); break;
+    case 'cheer': case 'dance1': arm(10, by - 6); b.line(6, by - 1, 4.5, by - 5, G1); break;
+    case 'dance2': arm(12, by - 2); b.line(6, by - 1, 4, by - 3, G1); break;
+    case 'push': arm(13, by - 1); break;
+    default: arm(9.5, by + 1.5);
+  }
+  return bake(b.outline(INK), 7, fy);
+}
+function hamsterSpr(pose) {
+  const b = new SB(14, 11), O = '#f0a860', OS = '#c88040', Wt = '#fbf4e8', fy = 9;
+  if (pose === 'sleep') { b.ell(7, 7, 4.5, 2.6, O, OS); b.ell(8, 8, 2.5, 1.4, Wt); b.set(10, 6, INK); b.set(4.5, 4.5, '#f8b8c0'); return bake(b.outline(INK), 7, fy); }
+  const eat = pose === 'eat', sit = pose === 'sit' || eat;
+  b.ell(6.5, sit ? 5.5 : 6, sit ? 3.4 : 4.2, sit ? 3.4 : 2.8, O, OS);
+  b.ell(7.5, sit ? 7 : 7.4, 2.4, 1.6, Wt);
+  const hx = sit ? 8.5 : 10, hy = sit ? 3 : 4.5;
+  b.ell(hx, hy, 2.2, 2, O, OS); b.ell(hx + 1.2, hy + 1, 1.3, eat ? 1.5 : 1, Wt); b.set(hx + 2.4, hy + 0.4, '#e86a8a');
+  b.set(hx + 0.6, hy - 0.4, INK); b.set(hx - 1.2, hy - 2.2, '#f8b8c0');
+  if (!sit) { const k = pose === 'run1' ? 1 : -1; b.line(4, 8, 3 - k, fy, OS); b.line(8.5, 8, 9.5 + k, fy, OS); }
+  else { b.set(5, fy, OS); b.set(8, fy, OS); if (eat) { b.set(hx + 2, hy + 2.4, '#3a3a3a'); } }
+  return bake(b.outline(INK), 7, fy);
+}
+function catPawSpr() {
+  const b = new SB(30, 16), G1 = '#9a9aa8', GS = '#7a7a88', St = '#5a5a68';
+  b.seg(29, 10, 12, 8, 4, G1, GS);
+  for (const x of [26, 22, 18]) b.line(x, 5, x - 1, 12, St);
+  b.ell(8, 8, 5, 4.4, G1, GS);
+  for (const [x, y] of [[4, 5.5], [3.5, 8.5], [5, 11]]) b.ell(x, y, 1.2, 1.1, '#f4b8c0');
+  b.ell(8.5, 9, 2, 1.8, '#f4b8c0');
+  return bake(b.outline('#2a2a34'), 15, 15);
+}
+function catHeadSpr(look) {
+  const b = new SB(34, 24), G1 = '#9a98a8', GS = '#7a788a', St = '#6a6878', Pk = '#f4a8b8';
+  b.ell(17, 15, 13, 9, G1, GS);
+  for (const s of [-1, 1]) { for (let k = 0; k < 7; k++) b.line(17 + s * (6 + k * 0.7), 8 - k, 17 + s * (12 - k * 0.2), 8 - k * 0.3, G1); b.set(17 + s * 8.5, 5, Pk); b.set(17 + s * 9, 6, Pk); }
+  for (const x of [14, 17, 20]) b.line(x, 6, x, 9, St);
+  for (const s of [-1, 1]) { const ex = 17 + s * 6; b.ell(ex, 13, 3, 2.6, '#e8f070'); b.rect(ex + look, 11, 1, 5, '#1a1a1a'); b.set(ex - 1 + look, 12, '#ffffff'); }
+  b.ell(17, 18, 1.4, 0.8, Pk); b.set(16, 19.5, INK); b.set(18, 19.5, INK); b.set(17, 19, INK);
+  for (const s of [-1, 1]) for (let k = 0; k < 3; k++) b.line(17 + s * 4, 18 + k, 17 + s * 12, 17 + k * 1.6, '#e8e8f0');
+  return bake(b.outline('#2a2a34'), 17, 23);
+}
+function duckSpr() {
+  const b = new SB(9, 8), Y1 = '#ffd83a', YS = '#e8b020';
+  b.ell(4, 5, 3.4, 2, Y1, YS); b.ell(6, 2.6, 1.8, 1.7, Y1, YS); b.line(7.5, 3, 8.5, 3.2, '#f07a2a'); b.set(6.4, 2.2, INK); b.set(2, 4, YS);
+  return bake(b.outline('#6a4a20'), 4, 7);
+}
+function snailSpr(p) {
+  const b = new SB(12, 9), S = '#c89a5a', SD = '#8a6030', Bd = '#b8c8a0';
+  b.line(1, 7, 10, 7, Bd); b.line(2, 6, 10, 6, Bd); b.line(9.5, 5, 10, 2 + p, Bd); b.line(10.5, 5, 11, 2.5, Bd); b.set(10, 1 + p, INK); b.set(11, 1.6, INK);
+  b.ell(5, 3.5, 3.2, 3, S, SD); b.set(5, 3.5, SD); b.set(6, 2.8, SD); b.set(4, 2.4, SD); b.set(3.8, 4.2, SD);
+  return bake(b.outline('#4a3420'), 6, 8);
+}
+const sprCache = new Map();
+function spr(key, fn) { let s = sprCache.get(key); if (!s) { s = fn(); sprCache.set(key, s); } return s; }
+
+// the inventor mouse walks on the bench, the right-hand ladder and the top beam
+class Mouse {
+  constructor() { this.x = X(210); this.y = BENCH; this.f = -1; this.pose = 'read'; this.anim = 0; this.emotes = []; this.brain = null; this.busy = false; this.walking = false; this.level = 'bench'; this.hidden = false; this.hop = 0; }
+  emote(n, d = 2) { this.emotes.push({ name: n, t: 0, dur: d }); }
+  update(dt) {
+    this.anim += dt; for (const m of this.emotes) m.t += dt; this.emotes = this.emotes.filter(m => m.t < m.dur);
+    if (this.brain) { let r; try { r = this.brain.next(dt); } catch (e) { console.error('mouse', e); r = { done: true }; } if (r.done) this.brain = null; }
+  }
+  sprite() { let p = this.pose; if (this.walking) p = this.level === 'ladder' ? (Math.floor(this.anim * 6) % 2 ? 'climb1' : 'climb2') : (Math.floor(this.anim * 8) % 2 ? 'walk1' : 'walk2'); return spr('mouse' + p, () => mouseSpr(p)); }
+  draw() { if (this.hidden) return; drawSpr(this.sprite(), this.x, this.y - this.hop, this.f); if (this.carry) this.carry(this.x, this.y - this.hop); }
+  drawEmotes() { if (this.hidden) return; for (const m of this.emotes) { const k = m.t / m.dur; if (k > 0.75 && Math.floor(world.t * 12) % 2) continue; drawSpr(ICONS[m.name], this.x, this.y - this.hop - 12 - Math.min(1, k * 3) * 4, 1); } }
+}
+let mouse;
+const LADDER_X = () => X(314) - 3 * SC, TOPY = () => Y(3) - 2 * SC;
+function* walkX(a, tx, spd = 22) { a.walking = true; while (Math.abs(a.x - tx) > 0.5) { const dt = yield, d = tx - a.x; a.f = Math.sign(d); a.x += Math.sign(d) * Math.min(Math.abs(d), spd * SC * dt); } a.walking = false; }
+function* climb(a, ty, spd = 18) { a.level = 'ladder'; a.walking = true; a.x = LADDER_X(); while (Math.abs(a.y - ty) > 0.5) { const dt = yield, d = ty - a.y; a.y += Math.sign(d) * Math.min(Math.abs(d), spd * SC * dt); } a.walking = false; }
+function* goTo(a, tx, level) {
+  // level: 'bench' or 'top'
+  if (a.level !== level) {
+    if (a.level === 'ladder') { /* continue on the ladder */ }
+    else yield* walkX(a, LADDER_X());
+    yield* climb(a, level === 'top' ? TOPY() : BENCH);
+    a.level = level; a.y = level === 'top' ? TOPY() : BENCH;
+  }
+  yield* walkX(a, tx);
+}
+const HOME = () => X(212);
+function* mouseAmbient() {
+  if (mouse.level !== 'bench' || Math.abs(mouse.x - HOME()) > 1) yield* goTo(mouse, HOME(), 'bench');
+  mouse.f = -1; mouse.pose = 'read';
+  let t = rand(18, 40); while (t > 0) { t -= yield; if (chance(0.003)) mouse.emote(pick(['bulb', 'note', 'q']), 2); }
+  const r = Math.random();
+  if (r < 0.3) { mouse.pose = 'stand'; yield* walkX(mouse, X(rand(80, 290))); mouse.pose = 'stand'; mouse.f = chance(0.5) ? 1 : -1; yield* wait(2); mouse.emote(pick(['heart', 'note', 'sparkle']), 2); yield* wait(2.5); }
+  else if (r < 0.5) { mouse.pose = 'stand'; yield* walkX(mouse, X(HAM.cx + 16)); mouse.f = -1; mouse.pose = 'stand'; yield* wait(1); mouse.emote('heart', 2); if (HAM.state === 'run') HAM.wave = 1.5; yield* wait(3); }
+  else if (r < 0.65) { mouse.pose = 'stand'; yield* goTo(mouse, X(rand(60, 290)), 'top'); mouse.f = chance(0.5) ? 1 : -1; mouse.pose = 'sit'; yield* wait(rand(8, 14)); mouse.pose = 'stand'; yield* goTo(mouse, HOME(), 'bench'); }
+  else { mouse.pose = 'sip'; yield* wait(0.5); for (let i = 0; i < 6; i++) { yield* wait(1); if (chance(0.5)) addPart(mouse.x + mouse.f * 4, mouse.y - 8, rand(-1, 1), -5, 1.2, '#f0f0f0', { steam: true }); } mouse.pose = 'read'; }
+}
+function takeMouse() { mouse.brain = null; mouse.busy = true; mouse.walking = false; return mouse; }
+
+// ---------------------------------------------------------------- particles
+function addPart(x, y, vx, vy, life, col, o = {}) { if (world.parts.length > 600) world.parts.splice(0, 60); world.parts.push(Object.assign({ x, y, vx, vy, life, max: life, col, grav: 0 }, o)); }
+function addPopup(str, x, y, col = '#fffbe8') { world.popups.push({ str, x, y, t: 0, col }); }
+function addPopupIcon(name, x, y, col) { world.popups.push({ icon: name, x, y, t: 0, col }); }
+function addConfetti(x, y) { world.confetti.push({ x, y, vx: rand(-40, 40), vy: rand(-70, -20), col: pick(['#ff5a5a', '#ffe060', '#5aa0ff', '#6ad06a', '#ff8ad8', '#ffffff']), life: rand(2, 3.5), a: rand(0, TAU) }); }
+const glowQ = [];
+function glowAt(x, y, r, col, a, always) { glowQ.push([x, y, r, col, a, always]); }
+function flushGlows() {
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  const nk = clamp(world.dark * 1.3, 0, 1);
+  for (const [x, y, r, col, a, always] of glowQ) { const k = always ? Math.max(0.35, nk) : nk; if (k * a < 0.02) continue; const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, col); g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.globalAlpha = clamp(a * k, 0, 1); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2); }
+  ctx.restore(); glowQ.length = 0;
+}
+
+// ---------------------------------------------------------------- events
+function* wait(s) { while (s > 0) s -= yield; }
+function* until(fn, max = 60) { while (!fn() && max > 0) max -= yield; }
+function* all(...gens) { const gs = gens.map(g => ({ g, done: false })); while (gs.some(x => !x.done)) { const dt = yield; for (const x of gs) if (!x.done) x.done = x.g.next(dt).done; } }
+function insertTop(m) { const r = RAILS.top; m.x = r.pts[0][0]; m.y = r.pts[0][1] - 10; drop(m, r.pts[0][0], r.pts[0][1], mm => enterRail(mm, r, 0, 8), { T: 0.3 }); }
+function* toTopStart(mm) { yield* goTo(mm, X(40), 'top'); mm.f = -1; }
+function* evGolden() {
+  const m = takeMouse();
+  m.pose = 'stand'; m.emote('bulb', 1.5); yield* wait(1.2);
+  yield* toTopStart(m);
+  m.pose = 'carry'; m.carry = (x, y) => { disc(x + m.f * 4, y - 9, 2, '#f0c030'); px(x + m.f * 4 - 1, y - 10, '#ffffff'); };
+  yield* wait(1);
+  const g = new Marble({ kind: 'gold', col: ['#e8b020', '#fff4a0'] }); g.x = X(38); marbles.push(g); insertTop(g);
+  m.carry = null; m.pose = 'cheer'; m.emote('sparkle', 2); yield* wait(1.5);
+  m.pose = 'stand'; yield* goTo(m, X(140), 'bench');
+  m.f = 1; m.pose = 'stand';
+  yield* until(() => !marbles.includes(g) || (g.seg && g.seg === RAILS.bottom), 90);
+  m.pose = 'cheer'; m.emote('heart', 2.5); yield* wait(2.5);
+  // the golden marble is kept in a little display stand
+  yield* until(() => g.seg === RAILS.bottom && g.x < X(150) || !marbles.includes(g), 40);
+  if (marbles.includes(g)) { g.gone = true; m.pose = 'carry'; yield* wait(1); world.goldOnShelf = 30; m.pose = 'stand'; }
+}
+function* evJam() {
+  const r = RAILS.bottom;
+  const cands = marbles.filter(q => q.seg === r && q.x > X(140) && q.x < X(290) && q.kind === 'glass');
+  const j = cands.length ? pick(cands) : null;
+  if (!j) { yield* wait(1); return; }
+  j.stuck = true; addPopup('CLICK', j.x - 8, j.y - 10, '#ffd0a0');
+  yield* wait(6);
+  const m = takeMouse();
+  m.pose = 'stand'; m.emote('bang', 1.5); yield* wait(1);
+  yield* walkX(m, j.x - 5 * SC);
+  m.f = 1; m.pose = 'stand'; m.emote('q', 1.5); yield* wait(1.5);
+  for (let i = 0; i < 3; i++) { m.pose = 'bonk1'; yield* wait(0.35); m.pose = 'bonk2'; addPopup(i < 2 ? 'BONK' : 'CLANG', j.x - 6, j.y - 12, '#ffffff'); for (let k = 0; k < 4; k++) addPart(j.x, j.y, rand(-20, 20), rand(-30, -10), 0.4, '#ffe080', { grav: 60 }); world.shake = 0.3; yield* wait(0.5); }
+  j.stuck = false; j.v = 30;
+  m.pose = 'cheer'; m.emote('sparkle', 2); yield* wait(2);
+}
+function* evFlood() {
+  const m = takeMouse();
+  m.pose = 'stand'; yield* toTopStart(m);
+  m.pose = 'carry'; m.carry = (x, y) => { rect(x + m.f * 3 - 2, y - 13, 6, 7, '#b8d8e0'); rect(x + m.f * 3 - 3, y - 14, 8, 2, '#c84a3a'); };
+  yield* wait(1); m.emote('bulb', 1);
+  for (let i = 0; i < 14; i++) { const e = new Marble({ extra: true }); e.x = X(38); marbles.push(e); insertTop(e); yield* wait(0.45); }
+  m.carry = null; m.pose = 'cheer'; yield* wait(1.5);
+  m.pose = 'stand'; yield* goTo(m, X(48), 'bench');
+  m.f = -1; m.pose = 'stand';
+  world.jar = true;
+  yield* until(() => !marbles.some(q => q.extra), 150);
+  world.jar = false;
+  m.pose = 'cheer'; m.emote('heart', 2); yield* wait(2);
+}
+function* evRace() {
+  const m = takeMouse();
+  m.pose = 'stand'; yield* toTopStart(m);
+  const red = new Marble({ col: ['#e8303a', '#ff9aa0'], route: -1, racer: 'RED' }), blue = new Marble({ col: ['#2a6ae8', '#9ac4ff'], route: 1, racer: 'BLUE' });
+  for (const q of [red, blue]) { q.x = X(38); marbles.push(q); insertTop(q); yield* wait(0.35); }
+  addPopup('GO!', X(34), Y(0) + 8, '#ffffff');
+  m.pose = 'stand'; yield* goTo(m, X(150), 'bench'); m.f = 1; m.pose = 'flag';
+  let winner = null;
+  yield* until(() => { for (const q of [red, blue]) if (!winner && q.seg === RAILS.bottom) winner = q; return winner; }, 80);
+  if (winner) { addPopup(winner.racer + ' WINS!', X(150) - 16, BENCH - 22, winner.col[1]); ringBell(1); for (let i = 0; i < 20; i++) addConfetti(X(150), BENCH - 16); }
+  m.pose = 'cheer'; m.emote('sparkle', 2); yield* wait(3);
+  red.route = blue.route = null;
+}
+function* evCat() {
+  world.cat = { x: W + 20, y: BENCH, t: 0, paw: 0, eyes: 0, st: 'peek' };
+  const c = world.cat;
+  let t = 0; while (t < 2) { const dt = yield; t += dt; c.eyes = smooth(0, 1.5, t); }
+  yield* wait(2.5);
+  const r = RAILS.bottom;
+  const target = marbles.filter(q => q.seg === r && q.x > X(220) && q.kind === 'glass').sort((a, b) => b.x - a.x)[0];
+  if (target) {
+    c.st = 'swipe'; t = 0; while (t < 0.5) { const dt = yield; t += dt; c.paw = smooth(0, 0.5, t); c.pawX = lerp(W + 10, target.x + 10, c.paw); c.pawY = lerp(BENCH, target.y + 2, c.paw); }
+    // the marble goes flying onto the bench
+    let vx = -rand(40, 70) * SC, vy = -50 * SC, x = target.x, y = target.y;
+    target.seg = { type: 'fly', update: (mm, dt) => { vy += G * dt; x += vx * dt; y += vy * dt; if (y > BENCH - 2) { y = BENCH - 2; vy = -vy * 0.45; vx *= 0.8; if (Math.abs(vy) < 8) vy = 0; } if (Math.abs(vx) < 3 && vy === 0) vx = 0; mm.x = x; mm.y = y; mm.spin += vx * dt / 2; } };
+    t = 0; while (t < 0.6) { const dt = yield; t += dt; c.paw = 1 - smooth(0, 0.6, t); c.pawX = lerp(W + 10, target.x + 10, c.paw); }
+    const m = takeMouse();
+    m.pose = 'stand'; m.emote('bang', 1.2); yield* wait(0.8);
+    m.f = 1; m.pose = 'stand'; m.emote('anger', 2); yield* wait(0.5);
+    c.st = 'leave';
+    yield* until(() => target.seg.type !== 'fly' || (Math.abs(vx) < 1 && vy === 0), 8);
+    yield* walkX(m, target.x - m.f * 4);
+    m.pose = 'carry'; target.hidden = true; m.carry = (x, y) => disc(x + m.f * 3, y - 10, 2, target.col[0]);
+    yield* walkX(m, X(44));
+    m.carry = null; m.pose = 'stand'; target.hidden = false; enterRail(target, r, Math.max(0, r.len - 30), 5);
+    m.emote('sweat', 1.5); yield* wait(1.5);
+  }
+  c.st = 'leave'; t = 0; while (t < 1.5) { const dt = yield; t += dt; c.eyes = 1 - smooth(0, 1.2, t); }
+  world.cat = null;
+}
+function* evOil() {
+  world.squeak = true;
+  let t = 0; while (t < 5) { const dt = yield; t += dt; if (chance(dt * 1.5)) addPopup('SQUEAK', X(20) + rand(-6, 6), Y(18) - 10, '#ffe0e0'); }
+  const m = takeMouse();
+  m.pose = 'stand'; m.emote('q', 1.5); yield* wait(1.2);
+  yield* goTo(m, X(30), 'top');
+  m.f = -1; m.pose = 'oil';
+  for (let i = 0; i < 6; i++) { addPart(X(24), Y(8), 0, 20, 0.5, '#3a2a10', { grav: 40 }); yield* wait(0.5); }
+  world.squeak = false; m.pose = 'cheer'; m.emote('sparkle', 2); yield* wait(2);
+}
+function* evSnack() {
+  HAM.want = 0; HAM.state = 'sit';
+  yield* until(() => HAM.speed < 0.1, 5);
+  HAM.state = 'eat';
+  let t = 0; while (t < 8) { const dt = yield; t += dt; if (chance(dt * 1.2)) addPopup('NOM', X(HAM.cx) + 4, Y(HAM.cy) + 2, '#ffe0c0'); }
+  HAM.state = chance(0.4) ? 'sleep' : 'sit';
+  if (HAM.state === 'sleep') { t = 0; while (t < 6) { const dt = yield; t += dt; if (chance(dt)) addPopupIcon('z', X(HAM.cx) + 3, Y(HAM.cy) + 6, '#8a9aff'); } const m = takeMouse(); yield* walkX(m, X(HAM.cx + 18)); m.f = -1; m.pose = 'stand'; m.emote('dots', 1.5); yield* wait(1.5); m.pose = 'push'; HAM.state = 'sit'; addPopupIcon('bang', X(HAM.cx) + 2, Y(HAM.cy) + 4, '#ff4a3a'); yield* wait(1); m.pose = 'stand'; }
+  HAM.state = 'run'; HAM.want = 1;
+  yield* wait(2);
+}
+function* evSnail() {
+  const r = RAILS.bottom;
+  world.snail = { rail: r, s: 4, v: 1.6 * SC };
+  const sn = world.snail;
+  let t = 0;
+  while (t < 22 && sn.s < r.len - 30) { const dt = yield; t += dt; sn.s += sn.v * dt; }
+  const m = takeMouse();
+  m.pose = 'stand'; m.emote('q', 1.5); yield* wait(1);
+  const p = r.at(sn.s); yield* walkX(m, p.x + 5 * SC);
+  m.f = -1; m.pose = 'carry'; world.snail = null;
+  m.carry = (x, y) => drawSpr(spr('snail0', () => snailSpr(0)), x + m.f * 3, y - 8, m.f);
+  yield* walkX(m, X(290));
+  m.carry = null; m.pose = 'stand'; world.snailRest = { x: X(296), y: BENCH, t: 40 };
+  m.emote('heart', 2); yield* wait(2);
+}
+function* evTea() {
+  const m = takeMouse();
+  if (Math.abs(m.x - HOME()) > 2 || m.level !== 'bench') yield* goTo(m, HOME(), 'bench');
+  m.f = -1; m.pose = 'sip';
+  for (let i = 0; i < 14; i++) { yield* wait(1); if (chance(0.7)) addPart(m.x + m.f * 5, m.y - 9, rand(-1, 1), -5, 1.4, '#f4f4f4', { steam: true }); if (i === 8) m.emote('heart', 2); }
+  m.pose = 'read';
+}
+function* evDomino() {
+  const m = takeMouse();
+  const x0 = X(72), n = 12, step = 4 * SC * AX;
+  world.dominoes = { x0, n: 0, step, fall: -1, t: 0, a: new Array(n).fill(0) };
+  const d = world.dominoes;
+  yield* walkX(m, x0 - 4);
+  for (let i = 0; i < n; i++) { yield* walkX(m, x0 + i * step - 3 * m.f, 26); m.f = 1; m.pose = 'carry'; yield* wait(0.35); d.n = i + 1; m.pose = 'stand'; }
+  yield* walkX(m, x0 - 7); m.f = 1; m.pose = 'push'; yield* wait(0.6);
+  d.fall = 0; m.pose = 'stand';
+  while (d.fall < n) { const dt = yield; d.t += dt; if (d.t > 0.12) { d.t = 0; addPopup('.', x0 + d.fall * step, BENCH - 9, '#ffffff'); d.fall++; } for (let i = 0; i < Math.min(d.fall, n); i++) d.a[i] = Math.min(1, d.a[i] + dt * 7); }
+  let t = 0; while (t < 0.5) { const dt = yield; t += dt; for (let i = 0; i < n; i++) d.a[i] = Math.min(1, d.a[i] + dt * 7); }
+  addPopup('TADA', x0 + n * step + 4, BENCH - 16, '#ffe070'); ringBell(1);
+  m.pose = 'cheer'; m.emote('sparkle', 2); yield* wait(3);
+  yield* walkX(m, x0 + n * step + 2); m.f = -1;
+  for (let i = n - 1; i >= 0; i--) { d.a[i] = 0; d.n = i; yield* wait(0.15); }
+  world.dominoes = null; m.pose = 'stand';
+}
+function* evGlow() {
+  const m = takeMouse();
+  yield* walkX(m, X(150) + 8); m.f = -1; m.pose = 'push'; yield* wait(0.5);
+  addPopup('CLICK', X(150), BENCH - 22, '#ffffff');
+  let t = 0; while (t < 30) { const dt = yield; t += dt; world.lampOff = smooth(0, 1, t) * (1 - smooth(28, 30, t)); world.glowMode = world.lampOff; if (t > 2 && t < 3) m.pose = 'cheer'; if (t > 3) m.pose = 'sit'; }
+  world.lampOff = 0; world.glowMode = 0; m.pose = 'stand';
+}
+function* evRide() {
+  const m = takeMouse();
+  m.pose = 'stand'; m.emote('bulb', 1.5); yield* wait(1);
+  yield* toTopStart(m);
+  m.pose = 'stand'; m.f = 1; yield* wait(0.8); m.emote('sparkle', 1.2); yield* wait(1);
+  const cart = new Marble({ kind: 'cart', r: 3 }); cart.x = X(38); marbles.push(cart); m.hidden = true; insertTop(cart);
+  yield* until(() => cart.seg === RAILS.bottom || !marbles.includes(cart), 120);
+  // hop off at the start of the bottom rail, dizzy
+  cart.gone = true; m.hidden = false; m.level = 'bench'; m.x = cart.x; m.y = BENCH;
+  m.pose = 'stand'; m.emote('swirl', 2.5); yield* wait(2.5);
+  m.pose = 'cheer'; m.emote('heart', 2); yield* wait(2);
+}
+function drawCart(m) {
+  // a thimble on tiny wheels with the mouse in it
+  const x = m.x, y = m.y, sg = m.seg;
+  const f = sg && sg.type === 'rail' ? (sg.at(m.s).dx >= 0 ? 1 : -1) : 1;
+  const dizzy = sg && sg.type === 'funnel';
+  drawSpr(spr('mousesit', () => mouseSpr('sit')), x - f, y - 2, dizzy ? (Math.floor(world.t * 8) % 2 ? 1 : -1) : f);
+  rect(x - 4, y - 3, 8, 4, '#c8c8d4'); rect(x - 4, y - 3, 8, 1, '#e8e8f4'); for (let i = -3; i < 4; i += 2) px(x + i, y - 1, '#9a9aa8');
+  disc(x - 2.5, y + 1.5, 1, '#3a3a44'); disc(x + 2.5, y + 1.5, 1, '#3a3a44');
+  if (dizzy && chance(0.1)) addPopupIcon('swirl', x, y - 12, '#b85aff');
+}
+function* evDuck() {
+  const m = takeMouse();
+  m.pose = 'stand'; yield* toTopStart(m);
+  const d = new Marble({ kind: 'duck', r: 3 }); d.x = X(38); marbles.push(d); insertTop(d);
+  addPopup('QUACK', X(40), Y(10), '#fff4a0');
+  m.emote('heart', 1.5); yield* wait(1.5);
+  m.pose = 'stand'; yield* goTo(m, X(290), 'bench'); m.f = 1;
+  yield* until(() => d.seg === RAILS.bottom || !marbles.includes(d), 100);
+  if (marbles.includes(d)) { d.gone = true; m.pose = 'carry'; m.carry = (x, y) => drawSpr(spr('duck', duckSpr), x + m.f * 4, y - 8, m.f); yield* wait(0.5); addPopup('QUACK', m.x, m.y - 22, '#fff4a0'); m.emote('heart', 2); yield* walkX(m, X(248)); m.carry = null; world.duckOnBench = { x: X(252) }; }
+  m.pose = 'stand'; yield* wait(1);
+}
+function* evParty() {
+  const m = takeMouse();
+  let t = 0;
+  yield* walkX(m, X(180));
+  while (t < 34) {
+    const dt = yield; t += dt;
+    world.party = smooth(0, 2, t) * (1 - smooth(31, 34, t));
+    m.pose = Math.floor(t * 3) % 2 ? 'dance1' : 'dance2'; m.f = Math.floor(t * 1.5) % 2 ? 1 : -1;
+    if (chance(dt * 2)) addPopupIcon('note', rand(X(20), X(300)), rand(Y(20), Y(150)), pick(CHIME_COLS));
+    if (Math.floor(t) % 4 === 0 && chance(dt * 3)) world.flashBar[randi(0, 4)] = 1;
+  }
+  world.party = 0; m.pose = 'stand';
+}
+function* evGhost() {
+  const g = new Marble({ kind: 'ghost', r: 2 }); marbles.push(g);
+  let t = 0;
+  g.seg = { type: 'fly', update: (mm, dt) => { mm.x = lerp(X(-10), X(330), t / 26); mm.y = Y(100) + Math.sin(t * 0.9) * Y(60); } };
+  const m = mouse;
+  let reacted = false;
+  while (t < 26) { const dt = yield; t += dt; if (!reacted && t > 8 && !m.busy) { reacted = true; takeMouse(); m.pose = 'stand'; m.emote('sweat', 2); m.f = g.x > m.x ? 1 : -1; } if (reacted && t > 11 && t < 12) m.emote('q', 2); }
+  g.gone = true;
+  if (reacted) { m.pose = 'stand'; yield* wait(1); m.emote('dots', 2); yield* wait(2); }
+}
+function* evGiant() {
+  const m = takeMouse();
+  m.pose = 'stand'; m.emote('bulb', 1.5); yield* wait(1);
+  yield* toTopStart(m);
+  const g = new Marble({ kind: 'giant', r: 5, col: ['#8a8a98', '#ffffff'] }); g.x = X(38); marbles.push(g); insertTop(g);
+  world.shake = 0.4; addPopup('THUD', X(40), Y(8), '#ffffff');
+  m.pose = 'cheer'; yield* wait(1);
+  m.pose = 'stand';
+  yield* until(() => world.giantStuck, 40);
+  addPopup('STUCK', X(FUN.cx) - 10, Y(FUN.rim) - 14, '#ffd0a0');
+  m.emote('bang', 1.5); yield* wait(1);
+  yield* goTo(m, X(FUN.cx + 8), 'top'); m.f = -1; m.pose = 'push';
+  // poke it through with a long stick
+  for (let i = 0; i < 3; i++) { m.pose = 'bonk1'; yield* wait(0.4); m.pose = 'bonk2'; world.shake = 0.25; addPopup('BONK', X(FUN.cx) - 8, Y(FUN.rim) - 12, '#ffffff'); yield* wait(0.5); }
+  world.giantStuck = false;
+  // it pops out and falls all the way to the bench
+  let vy = 0, x = g.x, y = g.y;
+  g.seg = { type: 'fly', update: (mm, dt) => { vy += G * dt; y += vy * dt; if (y > BENCH - 5) { y = BENCH - 5; if (vy > 30) { world.shake = 0.6; addPopup('THUD', x - 8, y - 14, '#ffffff'); } vy = -vy * 0.3; if (Math.abs(vy) < 10) vy = 0; } mm.x = x; mm.y = y; } };
+  m.emote('sweat', 2); yield* wait(3);
+  yield* goTo(m, x + 8, 'bench'); m.f = -1; m.pose = 'push';
+  let t = 0; while (t < 5) { const dt = yield; t += dt; g.x -= dt * 10 * SC; m.x -= dt * 10 * SC; g.spin -= dt * 2; }
+  g.gone = true; m.pose = 'stand'; m.emote('sweat', 1.5); yield* wait(1.5);
+}
+const COMMON = { golden: 1, jam: 1.1, flood: 0.9, race: 1, cat: 0.9, oil: 0.8, snack: 1, snail: 0.8, tea: 0.8, domino: 1, glow: 0.7 };
+const RARE = { ride: 1.2, duck: 1, party: 1, ghost: 0.8, giant: 1 };
+const FITS = { glow: () => world.night > 0.4, ghost: () => world.night > 0.5 };
+const EVENTS = { golden: evGolden, jam: evJam, flood: evFlood, race: evRace, cat: evCat, oil: evOil, snack: evSnack, snail: evSnail, tea: evTea, domino: evDomino, glow: evGlow, ride: evRide, duck: evDuck, party: evParty, ghost: evGhost, giant: evGiant };
+const director = { cur: null, name: '', cool: 6, last: '', idx: 0 };
+function runDirector(dt) {
+  if (director.cur) {
+    let r;
+    try { r = director.cur.next(dt); } catch (e) { console.error(director.name, e); r = { done: true }; }
+    if (r.done) { director.cur = null; director.name = ''; director.cool = FORCE ? 4 : rand(10, 22); cleanupEvent(); }
+  } else if ((director.cool -= dt) <= 0) {
+    const allEv = Object.keys(EVENTS);
+    let name;
+    if (FORCE) name = FORCE === 'all' ? allEv[director.idx++ % allEv.length] : FORCE;
+    else {
+      const fit = tbl => Object.fromEntries(Object.entries(tbl).map(([k, w]) => [k, (FITS[k] && !FITS[k]()) || k === director.last ? 0 : w]));
+      name = chance(0.14) ? weighted(fit(RARE)) : null;
+      if (!name) name = weighted(fit(COMMON));
+    }
+    if (!EVENTS[name]) { director.cool = 5; return; }
+    director.last = director.name = name;
+    director.cur = EVENTS[name]();
+    try { director.cur.next(0); } catch (e) { console.error(name, e); director.cur = null; cleanupEvent(); }
+  }
+}
+function cleanupEvent() {
+  for (const q of marbles) { q.stuck = false; q.route = null; if (q.kind !== 'glass' && q.kind !== 'gold') q.gone = true; if (q.seg && q.seg.type === 'fly') q.gone = true; if (q.hidden && q.kind === 'glass') { q.hidden = false; } }
+  marbles = marbles.filter(q => !q.gone || q.extra);
+  for (const b of buckets) if (b.m && !marbles.includes(b.m)) b.m = null;
+  for (let k = 0; k < WHEEL.n; k++) if (WHEEL.pockets[k] && !marbles.includes(WHEEL.pockets[k])) WHEEL.pockets[k] = null;
+  SAW.cup = SAW.cup.filter(q => marbles.includes(q));
+  world.snail = null; world.cat = null; world.squeak = false; world.lampOff = 0; world.glowMode = 0; world.party = 0; world.giantStuck = false; world.jar = false;
+  if (world.dominoes) world.dominoes = null;
+  HAM.want = 1; if (HAM.state !== 'run') HAM.state = 'run';
+  SPLIT.force = null;
+  if (mouse) { mouse.busy = false; mouse.brain = null; mouse.carry = null; mouse.hidden = false; mouse.hop = 0; }
+  const glass = marbles.filter(q => (q.kind === 'glass' || q.kind === 'gold') && !q.extra).length;
+  for (let i = glass; i < N_MARBLES; i++) { const q = new Marble(); marbles.push(q); enterRail(q, RAILS.bottom, rand(10, RAILS.bottom.len - 10), 10); }
+}
+
+// ---------------------------------------------------------------- update + render
+function update(dt) {
+  world.t += dt;
+  const h = localHour();
+  const day = smooth(5.5, 7.5, h) * (1 - smooth(18, 20, h));
+  world.night = 1 - day;
+  world.dusk = Math.max(Math.exp(-(((h - 6.5) / 0.8) ** 2)), Math.exp(-(((h - 19) / 0.8) ** 2)));
+  world.dark = clamp(world.night * 0.55 + world.lampOff * 0.75, 0, 1);
+  runDirector(dt);
+  if (!mouse.busy && !mouse.brain) mouse.brain = mouseAmbient();
+  mouse.update(dt);
+  updateMachine(dt);
+  updateMarbles(dt);
+  for (const p of world.parts) { p.life -= dt; p.vy += p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt; if (p.steam) p.x += Math.sin(world.t * 3 + p.y) * 0.05; }
+  world.parts = world.parts.filter(p => p.life > 0);
+  for (const c of world.confetti) { c.life -= dt; c.vy += 60 * dt; c.vx *= Math.pow(0.5, dt); c.x += c.vx * dt; c.y += c.vy * dt; c.a += dt * 6; if (c.y > BENCH) { c.y = BENCH; c.vx = 0; c.vy = 0; } }
+  world.confetti = world.confetti.filter(c => c.life > 0);
+  for (const p of world.popups) p.t += dt;
+  world.popups = world.popups.filter(p => p.t < 1.6);
+  world.shake = Math.max(0, world.shake - dt);
+  if (world.snailRest) { world.snailRest.t -= dt; if (world.snailRest.t <= 0) world.snailRest = null; }
+  if (world.goldOnShelf > 0) world.goldOnShelf -= dt;
+  if (world.jar) for (const q of marbles) if (q.extra && q.seg === RAILS.bottom && q.x < X(52) && !q.jarred) { q.jarred = true; const jx = X(50), jy = BENCH - 6; drop(q, jx, jy, mm => { mm.gone = true; world.jarFill = Math.min(14, (world.jarFill || 0) + 1); }, { T: 0.3 }); }
+  if (!world.jar && world.jarFill > 0 && !director.cur) world.jarFill = 0;
+}
+function drawWindowSky() {
+  const w = world.win, h = localHour();
+  const n = world.night, d = world.dusk;
+  ctx.save(); ctx.beginPath(); ctx.arc(w.x, w.y, w.r + 0.5, 0, TAU); ctx.clip();
+  let top = mixRgb([90, 160, 230], [12, 16, 44], n), bot = mixRgb([190, 226, 246], [34, 48, 90], n);
+  bot = mixRgb(bot, [250, 170, 120], d * 0.8);
+  for (let y = -w.r; y <= w.r; y++) { const hw = Math.floor(Math.sqrt(w.r * w.r - y * y)); ctx.fillStyle = rgbStr(mixRgb(top, bot, (y + w.r) / (2 * w.r))); ctx.fillRect(Math.round(w.x - hw), Math.round(w.y + y), hw * 2 + 1, 1); }
+  // sun or moon, a drifting cloud, rooftops
+  const p = (h - 6) / 12;
+  if (p > 0 && p < 1) disc(w.x - w.r * 0.8 + p * w.r * 1.6, w.y + w.r * 0.3 - Math.sin(Math.PI * p) * w.r * 0.8, 2.5 * SC, d > 0.3 ? '#ffc080' : '#fff4c0');
+  else { const q = ((h + 6) % 24) / 12; disc(w.x - w.r * 0.8 + q * w.r * 1.6, w.y + w.r * 0.2 - Math.sin(Math.PI * q) * w.r * 0.7, 2 * SC, '#f0ecd8'); for (let i = 0; i < 9; i++) if ((Math.sin(world.t + i * 3) > 0)) px(w.x + (hash(i) - 0.5) * w.r * 1.6, w.y + (hash(i + 9) - 0.8) * w.r, '#ffffff'); }
+  const cx = w.x - w.r + ((world.t * 1.5) % (w.r * 3)) - w.r * 0.5; ellipse(cx, w.y - w.r * 0.35, 4 * SC, 1.5 * SC, mixHex('#ffffff', '#3a4466', n));
+  for (let x = -w.r; x <= w.r; x++) { const bh = 3 + Math.floor(hash(Math.floor((x + 40) / 5)) * 6); const yy = w.y + w.r - bh * SC * 0.7; const hw = Math.sqrt(Math.max(0, w.r * w.r - (x) * (x))); const yb = w.y + hw; if (yy < yb) rect(w.x + x, yy, 1, yb - yy, mixHex('#6a7a8a', '#1a1e30', n)); if (n > 0.5 && hash(x * 7) < 0.08) px(w.x + x, yy + 2, '#ffd870'); }
+  ctx.restore();
+  // window cross bars
+  rect(w.x - w.r, w.y, w.r * 2, 1, BRASSD); rect(w.x, w.y - w.r, 1, w.r * 2, BRASSD);
+  // clock hands (real time)
+  const c = world.clock, hh = (h % 12) / 12 * TAU - Math.PI / 2, mm = (h % 1) * TAU - Math.PI / 2;
+  line(c.x, c.y, c.x + Math.cos(hh) * c.r * 0.5, c.y + Math.sin(hh) * c.r * 0.5, '#2a2020');
+  line(c.x, c.y, c.x + Math.cos(mm) * c.r * 0.8, c.y + Math.sin(mm) * c.r * 0.8, '#2a2020');
+  px(c.x, c.y, '#c83a2a');
+}
+function render() {
+  ctx = mainCtx;
+  ctx.save();
+  if (world.shake > 0) ctx.translate(Math.round(rand(-1, 1) * world.shake * 3), Math.round(rand(-1, 1) * world.shake * 2));
+  ctx.drawImage(bgCanvas, 0, 0);
+  drawWindowSky();
+  drawGears();
+  drawHamster();
+  drawLift();
+  // marbles behind things: back of the funnel, back of the helix
+  for (const m of marbles) if (m.seg && (m.seg.type === 'funnel' || (m.seg.type === 'helix' && !m.front))) drawMarble(m);
+  ctx.drawImage(funnelFront, 0, 0);
+  ctx.drawImage(helixFront, 0, 0);
+  drawWheel(); drawSaw(); drawSplitter(); drawChimes(); drawBell(); drawOdo();
+  for (const m of marbles) if (!(m.seg && (m.seg.type === 'funnel' || (m.seg.type === 'helix' && !m.front)))) drawMarble(m);
+  // funnel marbles on the near side are hidden by its wall; redraw the rim over them
+  // bench things
+  drawBench();
+  mouse.draw();
+  if (world.cat) drawCat();
+  for (const p of world.parts) { if (p.steam) { ctx.globalAlpha = clamp(p.life / p.max, 0, 0.8); px(p.x, p.y, p.col); ctx.globalAlpha = 1; continue; } px(p.x, p.y, p.col); }
+  for (const c of world.confetti) { rect(c.x, c.y, Math.abs(Math.cos(c.a)) > 0.5 ? 2 : 1, 1, c.col); }
+  // lighting: the room dims at night; a warm lamp on the bench lights the machine
+  if (world.dark > 0.02) {
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = rgbStr(mixRgb([255, 255, 255], [50, 46, 90], world.dark));
+    ctx.fillRect(-4, -4, W + 8, H + 8);
+    ctx.globalCompositeOperation = 'source-over';
+    const lamp = 1 - world.lampOff;
+    if (lamp > 0.05) glowAt(X(150), BENCH - 30 * SC, 150 * SC, '#ffb060', 0.55 * lamp);
+    glowAt(world.win.x, world.win.y, world.win.r * 1.6, world.night > 0.5 ? '#6070b0' : '#ffe0b0', 0.3);
+  }
+  if (world.party > 0) {
+    const t = world.t;
+    for (let i = 0; i < 6; i++) { const a = t * 0.8 + i, x = W / 2 + Math.cos(a) * W * 0.4, y = H * 0.45 + Math.sin(a * 1.3) * H * 0.35; glowAt(x, y, 30 * SC, CHIME_COLS[i % 5], world.party * 0.5, true); }
+    const bx = X(160), by = lerp(-10, Y(40), world.party); rect(bx, 0, 1, by, '#8a8a98'); disc(bx, by + 5, 5, '#b8b8c8'); for (let k = 0; k < 10; k++) px(bx + rand(-4, 4), by + 5 + rand(-4, 4), Math.random() < 0.5 ? '#ffffff' : '#6a6a78');
+  }
+  flushGlows();
+  if (world.dusk > 0.05) { ctx.globalCompositeOperation = 'soft-light'; ctx.globalAlpha = world.dusk * 0.25; rect(-4, -4, W + 8, H + 8, '#ff9a5a'); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+  mouse.drawEmotes();
+  for (const p of world.popups) {
+    const k = p.t / 1.6; if (k > 0.7 && Math.floor(world.t * 10) % 2) continue;
+    if (p.icon) { drawSpr(ICONS[p.icon], p.x, p.y - k * 10, 1); continue; }
+    if (p.tiny) { const yy = p.y - k * 12; ctx.fillStyle = p.col; ctx.fillRect(Math.round(p.x), Math.round(yy), 2, 2); ctx.fillRect(Math.round(p.x) + 1, Math.round(yy) - 3, 1, 3); ctx.fillRect(Math.round(p.x) + 2, Math.round(yy) - 3, 1, 1); continue; }
+    text(p.str, p.x - textW(p.str) / 2, p.y - k * 6, p.col, '#00000080');
+  }
+  ctx.restore();
+  if (DEBUG) text(`${director.name || '-'} M${marbles.length} L${world.laps}`, 3, H - 8, '#ffffff', '#000000');
+}
+function drawBench() {
+  // desk lamp, spool seat, matchbox bed, jar
+  const lx = X(150), by = BENCH;
+  rect(lx - 5, by - 2, 10, 2, '#3a3a44'); line(lx, by - 2, lx + 6 * SC, by - 18 * SC, '#5a5a66', 2); line(lx + 6 * SC, by - 18 * SC, lx - 2 * SC, by - 28 * SC, '#5a5a66', 2);
+  const hx = lx - 2 * SC, hy = by - 28 * SC;
+  for (let k = 0; k < 6; k++) rect(hx - 2 - k * 0.7, hy + k, 5 + k * 1.4, 1, k < 1 ? '#6ab0a0' : '#4a9080');
+  if (world.lampOff < 0.5) rect(hx - 5, hy + 6, 11, 1, '#fff0c0');
+  // spool the mouse sits on
+  const sx = HOME() + 1;
+  rect(sx - 4, by - 6, 9, 1, WOODD); rect(sx - 3, by - 5, 7, 4, '#d85a5a'); rect(sx - 3, by - 4, 7, 1, '#f08080'); rect(sx - 4, by - 1, 9, 1, WOODD);
+  // matchbox bed
+  const mx = X(234);
+  rect(mx - 7, by - 4, 14, 4, '#e8c060'); rect(mx - 7, by - 4, 14, 1, '#f4d890'); rect(mx - 5, by - 3, 10, 2, '#c83a2a'); rect(mx - 6, by - 5, 3, 2, '#ffffff');
+  // marble jar (flood event)
+  if (world.jar || world.jarFill) { const jx = X(50); rect(jx - 4, by - 9, 9, 9, '#b8d8e0'); rect(jx - 5, by - 10, 11, 1, '#c84a3a'); for (let i = 0; i < world.jarFill; i++) px(jx - 3 + (i % 6) * 1.3, by - 2 - Math.floor(i / 6) * 2, MCOLS[i % MCOLS.length][0]); }
+  if (world.dominoes) {
+    const d = world.dominoes;
+    for (let i = 0; i < d.n; i++) { const x = d.x0 + i * d.step, a = d.a[i] * 1.2; ctx.save(); ctx.translate(Math.round(x), by); ctx.rotate(a); ctx.fillStyle = '#1a1a1a'; ctx.fillRect(0, -7, 2, 7); ctx.fillStyle = '#f0f0f0'; ctx.fillRect(1, -6, 1, 1); ctx.fillRect(1, -3, 1, 1); ctx.restore(); }
+  }
+  if (world.snail) { const p = world.snail.rail.at(world.snail.s); drawSpr(spr('snail' + (Math.floor(world.t * 2) % 2), () => snailSpr(Math.floor(world.t * 2) % 2)), p.x, p.y + 3, -1); }
+  if (world.snailRest) drawSpr(spr('snail0', () => snailSpr(0)), world.snailRest.x, world.snailRest.y, -1);
+  if (world.duckOnBench) drawSpr(spr('duck', duckSpr), world.duckOnBench.x, by, -1);
+  if (world.goldOnShelf > 0) { const gx = X(222); rect(gx - 2, by - 2, 5, 2, BRASSD); disc(gx, by - 4, 2, '#e8b020'); px(gx - 1, by - 5, '#ffffff'); if (Math.floor(world.t * 4) % 3 === 0) px(gx + rand(-3, 3), by - 4 + rand(-3, 2), '#fff4a0'); }
+}
+function drawCat() {
+  const c = world.cat;
+  if (c.eyes > 0) {
+    const x = W - 20 * SC, y = BENCH + 24 - c.eyes * 16;
+    const tgt = marbles.filter(m => m.seg === RAILS.bottom).sort((a, b) => b.x - a.x)[0];
+    const look = tgt ? (tgt.x < x - 30 ? -1 : 0) : 0;
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, BENCH + 1); ctx.clip();
+    drawSpr(spr('cathead' + look, () => catHeadSpr(look)), x, y, 1);
+    ctx.restore();
+  }
+  if (c.paw > 0.01) drawSpr(spr('paw', catPawSpr), c.pawX, c.pawY, 1);
+}
+// ---------------------------------------------------------------- setup + main loop
+function resize() {
+  H = ROWS; W = Math.max(120, Math.round((ROWS * innerWidth) / Math.max(1, innerHeight)));
+  canvas.width = W; canvas.height = H;
+  mainCtx.imageSmoothingEnabled = false;
+  layout();
+  bakeStatic();
+  makeBuckets();
+  WHEEL.pockets = new Array(WHEEL.n).fill(null);
+  SAW.cup = []; SAW.st = 'rest';
+  marbles = [];
+  mouse = new Mouse();
+  director.cur = null; director.cool = FORCE ? 3 : 6;
+  world.parts = []; world.popups = []; world.confetti = [];
+  cleanupEvent();
+  // spread the marbles around the machine
+  world.settling = true;
+  for (let i = 0; i < 60 * 30; i++) update(1 / 30);
+  world.settling = false;
+  director.cur = null; director.cool = FORCE ? 2 : 6; cleanupEvent();
+}
+addEventListener('resize', resize);
+resize();
+addEventListener('beforeunload', saveLaps);
+setInterval(saveLaps, 30000);
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 1) return;
+  const dt = Math.min(0.1, (now - last) / 1000) * TIME_SCALE;
+  last = now;
+  try { const steps = Math.ceil(dt / 0.05); for (let i = 0; i < steps; i++) update(dt / steps); render(); } catch (e) { console.error(e); }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
