@@ -231,7 +231,8 @@ final class Store {
         set { settings["paused"] = newValue; save() }
     }
     var pauseWhenCovered: Bool { settings["pauseWhenCovered"] as? Bool ?? true }
-    var pauseOnBattery: Bool { settings["pauseOnBattery"] as? Bool ?? true }
+    /// Off unless the user turns it on (1.0's "pauseOnBattery" defaulted to on and is ignored).
+    var freezeOnBattery: Bool { settings["freezeOnBattery"] as? Bool ?? false }
     var autoUpdateCheck: Bool { settings["autoUpdateCheck"] as? Bool ?? true }
 
     func hash(for wallpaper: String) -> String {

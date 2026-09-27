@@ -152,8 +152,8 @@
       <div class="row"><label class="l" for="g-login">Start at login</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-login"><span></span></label></div></div>
       <div class="row"><label class="l" for="g-covered">Pause when covered</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-covered"><span></span></label></div>
         <div class="help">Stops animating while a maximized or full-screen window hides the wallpaper.</div></div>
-      <div class="row"><label class="l" for="g-battery">Pause on battery</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-battery"><span></span></label></div>
-        <div class="help">Freezes the wallpaper on its last frame while the computer is unplugged.</div></div>
+      <div class="row"><label class="l" for="g-battery">Freeze on battery</label><div class="ctl"><label class="switch"><input type="checkbox" id="g-battery"><span></span></label></div>
+        <div class="help">Freezes the wallpaper on its last frame while the computer is unplugged, to save battery. Off by default.</div></div>
     </div>
     <div class="card" id="updates">
       <h3>Updates</h3>
@@ -296,7 +296,10 @@ function normalizeSettings(s) {
   if (!s.screens || typeof s.screens !== 'object') s.screens = {};
   if (!s.params || typeof s.params !== 'object') s.params = {};
   // Native code may round-trip booleans as 1/0.
-  for (const k of ['pauseWhenCovered', 'pauseOnBattery', 'autoUpdateCheck']) s[k] = typeof s[k] === 'number' ? !!s[k] : typeof s[k] === 'boolean' ? s[k] : true;
+  for (const k of ['pauseWhenCovered', 'autoUpdateCheck']) s[k] = typeof s[k] === 'number' ? !!s[k] : typeof s[k] === 'boolean' ? s[k] : true;
+  // Off unless turned on. (Replaces 1.0's "pauseOnBattery", which was on by default and is ignored.)
+  s.freezeOnBattery = typeof s.freezeOnBattery === 'number' ? !!s.freezeOnBattery : s.freezeOnBattery === true;
+  delete s.pauseOnBattery;
   s.paused = !!s.paused;
   if (s.wallpaper === undefined) s.wallpaper = null;
   return s;
@@ -336,7 +339,7 @@ function renderHeader() {
   const s = settings(), st = $('#status');
   let text = 'Playing', cls = 'ok';
   if (s.paused) { text = 'Paused'; cls = 'warn'; }
-  else if (s.pauseOnBattery && S.onBattery) { text = 'Paused on battery'; cls = 'warn'; }
+  else if (s.freezeOnBattery && S.onBattery) { text = 'Frozen on battery'; cls = 'warn'; }
   const any = S.screens.some(sc => screenWallpaper(sc.id));
   if (!any) { text = 'No wallpaper chosen'; cls = ''; }
   st.textContent = text; st.className = 'pill ' + cls;
@@ -517,7 +520,7 @@ function renderGeneral() {
   }
   $('#g-login').checked = !!S.launchAtLogin;
   $('#g-covered').checked = s.pauseWhenCovered;
-  $('#g-battery').checked = s.pauseOnBattery;
+  $('#g-battery').checked = s.freezeOnBattery;
   $('#folder').textContent = S.folder || '';
   $('#folder').title = S.folder || '';
   $('#version').textContent = 'Backgrounds ' + (S.version || '') + ' · ' + (S.platform === 'mac' ? 'macOS' : S.platform === 'windows' ? 'Windows' : S.platform || '');
@@ -585,7 +588,7 @@ for (const b of $('#arrangement').children) b.addEventListener('click', () => {
 });
 $('#pause').onclick = () => { settings().paused = !settings().paused; save(); renderHeader(); };
 $('#g-covered').onchange = e => { settings().pauseWhenCovered = e.target.checked; save(); };
-$('#g-battery').onchange = e => { settings().pauseOnBattery = e.target.checked; save(); renderHeader(); };
+$('#g-battery').onchange = e => { settings().freezeOnBattery = e.target.checked; save(); renderHeader(); };
 $('#g-login').onchange = e => Bridge.call('setLaunchAtLogin', { enabled: e.target.checked })
   .then(r => { S.launchAtLogin = !!(r && r.enabled); e.target.checked = S.launchAtLogin; if (r && r.message) toast(r.message); })
   .catch(err => { e.target.checked = !e.target.checked; fail(err); });

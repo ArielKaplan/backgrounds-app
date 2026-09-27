@@ -160,7 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let pauseTitle: String
         if store.paused { pauseTitle = "Resume" }
-        else if WallpaperManager.shared.pausedByBattery { pauseTitle = "Pause (paused on battery)" }
+        else if WallpaperManager.shared.pausedByBattery { pauseTitle = "Pause (frozen on battery)" }
         else { pauseTitle = "Pause" }
         menu.addItem(withTitle: pauseTitle, action: #selector(togglePause), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Reload", action: #selector(reload), keyEquivalent: "r").target = self

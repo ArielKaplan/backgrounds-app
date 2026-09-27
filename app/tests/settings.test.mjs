@@ -43,7 +43,7 @@ for (const scheme of ['light', 'dark']) {
       platform: 'mac', version: '1.0.0', folder: '/Users/test/Pictures/Backgrounds', onBattery: false, launchAtLogin: false,
       screens: [{ id: 'A', name: 'Built-in Display', primary: true, width: 1512, height: 982 }, { id: 'B', name: 'LG UltraFine', primary: false, width: 2560, height: 1440 }],
       update: { current: '1.1.0', status: 'upToDate', latest: '1.1.0', notes: '', progress: 0, lastCheck: new Date(Date.now() - 3 * 3600e3).toISOString() },
-      wallpapers, settings: { arrangement: 'same', wallpaper: 'Aquarium', screens: {}, params: {}, paused: false, pauseWhenCovered: true, pauseOnBattery: true },
+      wallpapers, settings: { arrangement: 'same', wallpaper: 'Aquarium', screens: {}, params: {}, paused: false, pauseWhenCovered: true, pauseOnBattery: true },   // a 1.0 config: pauseOnBattery must be ignored
     };
     window.__calls = [];
     window.__bridgeMock = msg => {
@@ -164,10 +164,11 @@ for (const scheme of ['light', 'dark']) {
   await page.check('#g-login', { force: true });
   await wait(100);
   ok(await page.evaluate(() => window.__state.launchAtLogin === true), 'launch at login calls native');
-  await page.uncheck('#g-battery', { force: true });
+  ok(!(await page.isChecked('#g-battery')), 'freeze on battery is off by default (old pauseOnBattery ignored)');
+  await page.check('#g-battery', { force: true });
   await wait(100);
   s = await lastSet();
-  ok(s.pauseOnBattery === false, 'pause-on-battery toggle saved');
+  ok(s.freezeOnBattery === true && !('pauseOnBattery' in s), 'freeze-on-battery toggle saved, old key dropped');
   await page.click('#pause');
   await wait(100);
   s = await lastSet();

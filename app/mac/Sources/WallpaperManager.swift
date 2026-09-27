@@ -46,7 +46,7 @@ final class WallpaperManager {
         return String(did)
     }
 
-    var pausedByBattery: Bool { Store.shared.pauseOnBattery && onBattery }
+    var pausedByBattery: Bool { Store.shared.freezeOnBattery && onBattery }
 
     func apply(force: Bool = false, only wallpaperID: String? = nil) {
         let store = Store.shared

@@ -46,7 +46,7 @@ It needs the Microsoft Edge WebView2 Runtime, which Windows 11 and up-to-date Wi
 - **Settings → General:**
   - *Show wallpapers on:* all screens (same wallpaper), each screen separately, or the main screen only.
   - *Start at login*, *Pause when covered* (stops animating while a maximized/full-screen window hides it),
-    *Pause on battery* (freezes on the last frame while unplugged). Pause also happens while the screen is
+    *Freeze on battery* (off by default; freezes on the last frame while unplugged). Pause also happens while the screen is
     locked. macOS additionally throttles any wallpaper it knows is hidden.
   - *Wallpapers folder* (default **Pictures/Backgrounds**): open it, change it, restore the built-in
     wallpapers, reload.

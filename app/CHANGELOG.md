@@ -7,6 +7,9 @@ so write it for users. Add a new section at the top before tagging a release.
 - Backgrounds can now update itself: it checks once a day and asks before installing. You can also use
   "Check for Updates" in the menu or in Settings › General.
 - Built-in wallpapers you haven't edited are refreshed when the app updates; your edited ones are left alone.
+- "Pause on battery" is now "Freeze on battery" and is off by default: wallpapers keep animating when
+  your laptop is unplugged unless you turn it on in Settings › General.
+- The Train wallpaper has been redrawn: detailed engine with working wheels and rods, new coaches and scenery.
 
 ## 1.0.0
 - First version: animated HTML wallpapers on macOS and Windows, with a settings window for each wallpaper.

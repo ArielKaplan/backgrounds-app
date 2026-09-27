@@ -276,7 +276,8 @@ namespace Backgrounds
             set { Settings["paused"] = value; Save(); }
         }
         public bool PauseWhenCovered => Bool("pauseWhenCovered", true);
-        public bool PauseOnBattery => Bool("pauseOnBattery", true);
+        /// Off unless the user turns it on (1.0's "pauseOnBattery" defaulted to on and is ignored).
+        public bool FreezeOnBattery => Bool("freezeOnBattery", false);
         public bool AutoUpdateCheck => Bool("autoUpdateCheck", true);
 
         bool Bool(string key, bool dflt)

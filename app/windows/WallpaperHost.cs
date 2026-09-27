@@ -186,7 +186,7 @@ namespace Backgrounds
         // ---- pausing
 
         /// Freeze: keep the last frame on screen and hide the page (a hidden WebView2 stops rendering and
-        /// animation frames). Used for "Pause" and "Pause on battery".
+        /// animation frames). Used for "Pause" and "Freeze on battery".
         public void SetFrozen(bool on)
         {
             if (on == frozen) return;

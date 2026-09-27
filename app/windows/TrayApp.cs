@@ -109,7 +109,7 @@ namespace Backgrounds
             return digits.Length > 0 ? digits : null;
         }
 
-        public bool PausedByBattery => Store.Shared.PauseOnBattery && OnBattery;
+        public bool PausedByBattery => Store.Shared.FreezeOnBattery && OnBattery;
 
         /// Creates/updates/removes wallpaper windows to match the settings.
         public void Apply(bool force = false, string only = null)
@@ -279,7 +279,7 @@ namespace Backgrounds
                 foreach (var s in screens) menu.Items.Add(List(s.Name + (s.Primary ? " (main)" : ""), s));
             else menu.Items.Add(List("Wallpaper", null));
             menu.Items.Add(new ToolStripSeparator());
-            string pause = store.Paused ? "Resume" : PausedByBattery ? "Pause (paused on battery)" : "Pause";
+            string pause = store.Paused ? "Resume" : PausedByBattery ? "Pause (frozen on battery)" : "Pause";
             menu.Items.Add(pause, null, (s, e) => { store.Paused = !store.Paused; Changed(); });
             menu.Items.Add("Reload", null, (s, e) => { Apply(force: true); });
             menu.Items.Add(new ToolStripSeparator());
